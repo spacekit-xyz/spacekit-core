@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "SpaceKit Pattern Compression - Rust port of SpaceKit Compressor for high-performance text compression"
 license = "MIT"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-compressor"
 [lib]
 name = "spacekit_compressor"
 path = "src/lib.rs"

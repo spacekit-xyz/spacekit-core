@@ -56,9 +56,9 @@ editorial consolidation. The sole canonical narrative is
 
 ## Public/private boundary
 
-The proprietary storage-node implementation is not part of the public
-monorepo. Public documents may describe its interoperable API boundary but must
-not imply its source is published or covered by the public support policy.
+The storage-node source is included in the repository and covered by the
+security-reporting policy, while retaining the package-specific proprietary
+license declared in its manifest.
 
 Private websites, website APIs, consumer apps, and unpublished product
 contracts keep their own documentation outside this repository.

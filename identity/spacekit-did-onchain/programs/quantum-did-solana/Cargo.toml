@@ -3,7 +3,8 @@ name = "quantum-did-solana"
 version = "0.1.0"
 description = "Quantum-resistant DID management program for Solana"
 edition = "2021"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/identity/spacekit-did-onchain/programs/quantum-did-solana"
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "quantum_did_solana"

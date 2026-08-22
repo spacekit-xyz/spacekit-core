@@ -4,8 +4,8 @@ This is the operational reference for the profile-driven `spacekit network`
 implementation. Run `spacekit <command> --help` before copying commands from
 older documents.
 
-> The public monorepo excludes the proprietary storage-node implementation.
-> A full network requires an authorized storage binary supplied separately
+> The storage-node source is included under package-specific proprietary terms.
+> Build it from `infra/spacekit-storage-node`, or select an existing binary
 > through `SPACEKIT_STORAGE_BIN`.
 
 ## Prerequisites

@@ -2,7 +2,8 @@
 name = "spacekit-gateway"
 version = "0.1.0"
 edition = "2021"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/infra/spacekit-gateway"
 [[bin]]
 name = "spacekit-gateway"
 path = "src/main.rs"

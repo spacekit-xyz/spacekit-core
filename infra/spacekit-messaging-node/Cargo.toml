@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "SpaceKit Network Messaging Node - Quantum-resistant P2P messaging services"
 license = "MIT"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/infra/spacekit-messaging-node"
 [lib]
 name = "spacekit_messaging_node"
 path = "src/lib.rs"
@@ -22,7 +23,7 @@ required-features = ["standalone"]
 
 [dependencies]
 # Core SpaceKit functionality
-spacekit-primitives = { path = "../spacekit-primitives" }
+spacekit-primitives = { path = "../../foundation/spacekit-primitives" }
 
 # Alloy primitives
 alloy-primitives = { version = "1.4.1", features = ["serde"] }
@@ -82,7 +83,7 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
-spacekit-compressor = { version = "0.1.0", path = "../spacekit-ai/spacekit-compressor" }
+spacekit-compressor = { version = "0.1.0", path = "../../data/spacekit-compressor" }
 
 [features]
 default = []

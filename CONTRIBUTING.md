@@ -20,8 +20,9 @@ Public infrastructure belongs in this repository. Websites, website APIs,
 consumer applications, certificate material, and unpublished product contracts
 remain in their private repositories.
 
-`infra/spacekit-storage-node` is proprietary and excluded from the public
-monorepo. Do not copy it, its generated state, or its keys into a contribution.
+`infra/spacekit-storage-node` is part of the public monorepo. Its generated
+state, uploaded content, databases, credentials, and keys must never be
+committed.
 
 ## Change requirements
 

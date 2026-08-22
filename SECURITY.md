@@ -26,9 +26,9 @@ supported public surface. Archived documents, incubator contracts, generated
 artifacts, private applications, and compatibility simulators are not
 production security claims.
 
-`infra/spacekit-storage-node` is proprietary and intentionally excluded from
-this public repository. Its presence in a local migration workspace does not
-make it part of the public support or disclosure scope.
+`infra/spacekit-storage-node` is part of the supported public source surface.
+Reports involving storage authorization, encryption, persistence, federation,
+or content isolation must follow the private disclosure process above.
 
 ## Repository safety
 

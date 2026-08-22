@@ -83,9 +83,9 @@ Confirm at minimum:
 | `SPACEKIT_MIN_VALIDATOR_STAKE_UNITS` | reviewed against Sybil cost |
 | listener bind addresses | loopback or protected private interfaces |
 
-The proprietary storage-node implementation has a separate private security
-scope. Public interfaces and integration assumptions still belong in the
-network threat model.
+The storage-node source is included in the repository under proprietary terms.
+Its authorization, encryption, persistence, and integration assumptions belong
+in the repository security scope and network threat model.
 
 ## Known verification gaps
 

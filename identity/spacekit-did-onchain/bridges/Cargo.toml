@@ -5,9 +5,9 @@ edition = "2021"
 authors = ["SpaceKit Team"]
 description = "EVM and Solana off-chain bridge helpers for SpaceKit quantum DIDs"
 license = "Apache-2.0"
-repository = "https://github.com/spacekit-xyz/spacekit/tree/main/spacekit-did-onchain"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
 readme = "../README.md"
-
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/identity/spacekit-did-onchain/bridges"
 [lib]
 name = "spacekit_did_bridges"
 path = "src/lib.rs"

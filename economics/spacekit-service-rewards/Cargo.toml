@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "SpaceKit Service Reward Accumulator — emission schedule and per-epoch CREDIT computation"
 license = "AGPL-3.0-or-later"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/economics/spacekit-service-rewards"
 [dependencies]
-spacekit-primitives = { path = "../spacekit-primitives" }
-spacekit-log = { path = "../spacekit-log" }
+spacekit-primitives = { path = "../../foundation/spacekit-primitives" }
+spacekit-log = { path = "../../observability/spacekit-log" }
 
 [dev-dependencies]

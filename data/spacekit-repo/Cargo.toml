@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "SpaceKit repository protocol types and FactPackage helpers for CAS-backed commits"
 license = "Apache-2.0"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-repo"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
 sha2 = "0.10"
 spacekit-diff = { path = "../spacekit-diff" }
-spacekit-primitives = { path = "../spacekit-primitives", features = ["quantum"] }
+spacekit-primitives = { path = "../../foundation/spacekit-primitives", features = ["quantum"] }
 thiserror = "1.0"

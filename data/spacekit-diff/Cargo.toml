@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure-computation diff and three-way merge for SpaceKit tree snapshots and blobs"
 license = "Apache-2.0"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-diff"
 [lib]
 path = "lib.rs"
 # Pure rlib — library lives at crate root (not src/).

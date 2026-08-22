@@ -94,9 +94,9 @@ Property and malformed-envelope tests run with `cargo test -p
 spacekit-compressor`. Compile the fuzz target with:
 
 ```bash
-cargo check --manifest-path spacekit-ai/spacekit-compressor/fuzz/Cargo.toml
+cargo check --manifest-path data/spacekit-compressor/fuzz/Cargo.toml
 # With cargo-fuzz installed:
-cd spacekit-ai/spacekit-compressor
+cd data/spacekit-compressor
 cargo fuzz run adaptive_envelope
 ```
 
@@ -104,11 +104,10 @@ cargo fuzz run adaptive_envelope
 
 ```toml
 [dependencies]
-spacekit-compressor = { path = "../spacekit-ai/spacekit-compressor" }
+spacekit-compressor = { git = "https://github.com/spacekit-xyz/spacekit-core" }
 ```
 
-Adjust the path for the consuming workspace. Growformer currently enables this
-crate through its optional `brain-compression` Cargo feature.
+Packages inside this monorepo should use a relative path and compatible version.
 
 ## Status
 

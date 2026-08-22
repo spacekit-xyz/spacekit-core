@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transaction mempool for the SpaceKit network. Single ingress, drain on propose, requeue on fraud-proof rollback, pluggable priority and visibility strategies."
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-mempool"
 [features]
 default = ["std", "serde"]
 std = []

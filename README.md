@@ -2,35 +2,25 @@
 
 SpaceKit Core is the public infrastructure monorepo for the SpaceKit network. It
 contains the reusable protocols, runtimes, nodes, SDKs, smart contracts, machine
-learning libraries, command-line tools, and operational documentation required
-to build and operate SpaceKit networks.
+learning integrations, command-line tools, and operational documentation
+required to build and operate SpaceKit networks.
 
-> **Status:** migration in progress. The directory structure is established,
-> but projects are being moved and validated from the leaves of the dependency
-> graph upward.
->
-> **Public boundary:** `infra/spacekit-storage-node` is proprietary and is
-> excluded from the public monorepo. It may exist in a local migration
-> workspace, but it is not a public package or supported source release.
+> **Status:** monorepo migration and validation are in progress. Package
+> metadata and dependency paths target this repository; release guarantees
+> remain package-specific until CI is green.
 
 ## Repository organization
 
 ```text
 spacekit-core/
-├── ai/
-│   ├── growformer/
-│   ├── growformer-llm/
-│   └── growformer-ledger/
 ├── consensus/
 │   ├── spacekit-spacetime-consensus/
 │   └── spacekit-unified-consensus/
-├── contracts/
-│   ├── spacekit-contract-sdk/
-│   ├── spacekit-standard-library/
-│   └── kit-protocol/
 ├── data/
 │   ├── spacekit-compressor/
 │   ├── spacekit-diff/
+│   ├── spacekit-mempool/
+│   ├── spacekit-memsearcher/
 │   ├── spacekit-quantum-verkle/
 │   └── spacekit-repo/
 ├── economics/
@@ -38,25 +28,29 @@ spacekit-core/
 │   ├── spacekit-payments/
 │   └── spacekit-service-rewards/
 ├── foundation/
+│   ├── spacekit-contract-language/
 │   └── spacekit-primitives/
 ├── identity/
+│   ├── spacekit-behavioral/
 │   ├── spacekit-did/
 │   ├── spacekit-did-onchain/
+│   ├── spacekit-recovery/
 │   └── wasm-did/
 ├── infra/
 │   ├── spacekit-compute-node/
 │   ├── spacekit-gateway/
 │   ├── spacekit-keymaster/
 │   ├── spacekit-messaging-node/
-│   └── (storage integration interfaces; implementation remains private)
+│   └── spacekit-storage-node/
 ├── observability/
 │   └── spacekit-log/
 ├── operations/
 │   └── spacekit-runbook/
 ├── runtimes/
 │   └── spacekit-js/
-├── sdk/
-│   └── spacekit-sdk/
+├── sdks/
+│   ├── spacekit-contract-sdk/
+│   └── spacekit-standard-library/
 ├── tools/
 │   └── spacekit-cli/
 └── docs/
@@ -76,47 +70,34 @@ in the relevant domain directory.
 - `consensus` owns consensus algorithms and extensions, not node process wiring.
 - `economics` owns payment, routing, accounting, and reward policy.
 - `observability` owns structured protocol and operational event logging.
-- `contracts` owns the contract SDK, reusable contracts, and protocol contracts.
 - `infra` contains binaries and process-level integration for network services.
-  The proprietary storage-node implementation is maintained outside the public
-  repository.
 - `runtimes` executes SpaceKit contracts in non-node environments.
-- `sdk` exposes stable developer-facing integration APIs.
+- `sdks` owns the contract SDK, reusable contracts, and stable developer-facing
+  integration APIs.
 - `tools` contains operator and developer control-plane applications.
 - `operations` contains runbooks, incident procedures, and operational fixtures.
 
 ## AI and machine learning
 
-The public AI libraries live under `ai/`, with explicit boundaries:
-
-- `growformer` is the deterministic promote-freeze neural substrate and local
-  inference/training library. It is the only Growformer dependency required by
-  the SpaceKit CLI and optional compute-node inference.
-- `growformer-llm` is the small-domain language-model and chatbot layer. It may
-  use Growformer brain memory, but it is not required by the CLI or core network.
-- `growformer-ledger` is the append-only experiment and evaluation ledger used
-  by `growformer-llm`.
+Public AI libraries live in the separate
+[SpaceKit AI monorepo](https://github.com/spacekit-xyz/spacekit-ai).
+`spacekit-core` consumes Growformer as a pinned Git dependency for CLI and
+optional compute-node inference; it does not duplicate AI source.
 
 `spacekit-compressor` remains under `data/` because compression is shared
 infrastructure used by storage, messaging, and AI rather than an AI-only concern.
 
-The CLI's Growformer integration should be feature-gated:
+Growformer dependencies must identify the SpaceKit AI repository and a tested
+revision:
 
 ```toml
-[features]
-default = []
-growformer = ["dep:growformer"]
-
 [dependencies]
 growformer = {
-  path = "../../ai/growformer",
-  optional = true,
+  git = "https://github.com/spacekit-xyz/spacekit-ai",
+  rev = "d2afc97406fa04f4e5662717afd3e36465e3e5a6",
   default-features = false
 }
 ```
-
-This keeps the default CLI build small and allows networking, identity, storage,
-and contract workflows to compile without the machine-learning toolchain.
 
 Model checkpoints, trained brain files, corpora, and generated experiment
 artifacts are release assets or external datasets; they should not be committed
@@ -129,11 +110,11 @@ The intended build direction is:
 ```text
 foundation
   ├── data / identity / observability
-  │     ├── consensus / economics / contracts / ai
+  │     ├── consensus / economics / sdks
   │     │     └── infra
   │     │           └── tools
   │     └── runtimes
-  └─────────────────────└── sdk
+  └─────────────────────└── sdks
 ```
 
 Higher layers may depend on lower layers. Foundation and reusable domain crates
@@ -147,9 +128,9 @@ Projects are moved and made green in dependency waves:
 1. **Leaves:** primitives, diff, compressor, DID, quantum Verkle, contract SDK,
    log, payments, gateway, and RouteKit.
 2. **First-level libraries:** repo, messaging, service rewards, spacetime
-   consensus, DID bridges, Growformer, and WASM DID.
-3. **Compositions:** storage, unified consensus, standard library, kit protocol,
-   Growformer ledger, and Growformer LLM.
+   consensus, DID bridges, and WASM DID.
+3. **Compositions:** storage, unified consensus, standard library, and protocol
+   contracts.
 4. **Infrastructure:** compute node, keymaster, and remaining network services.
 5. **Control plane:** SpaceKit CLI and operational runbook.
 6. **JavaScript distribution:** SpaceKit JS runtime, then SpaceKit SDK.
@@ -160,12 +141,10 @@ and release guarantees.
 
 ## Workspaces
 
-The repository should expose:
-
-- one root Cargo workspace for Rust crates and binaries;
-- one root npm workspace for JavaScript packages;
-- a single lockfile per package ecosystem where practical;
-- path-filtered CI so unrelated projects do not rebuild on every change.
+Rust projects currently use package-level and domain-level Cargo workspaces.
+The standard library has its own workspace; node, data, consensus, identity,
+and tooling crates can be checked with `--manifest-path`. The JavaScript runtime
+maintains its own package workspace.
 
 During migration, internal dependencies should use monorepo-relative paths.
 Published packages should also declare repository metadata and compatible
@@ -182,17 +161,17 @@ Expected baseline tooling:
 - npm or the package manager selected by the root workspace;
 - `wasm-pack` for browser identity and selected runtime artifacts.
 
-Once the root workspaces are established, the baseline checks should be:
+Run checks for the package or domain being changed:
 
 ```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --manifest-path path/to/Cargo.toml --check
+cargo check --manifest-path path/to/Cargo.toml
+cargo test --manifest-path path/to/Cargo.toml
 
+cd runtimes/spacekit-js
 npm install
-npm run build --workspaces --if-present
-npm test --workspaces --if-present
+npm run build --if-present
+npm test --if-present
 ```
 
 Feature-heavy crates such as storage, compute, and Growformer should also have
@@ -220,10 +199,9 @@ Before the first push:
 1. scan source and history for credentials and private keys;
 2. exclude `.env`, local node state, model artifacts, and build output;
 3. rotate any credentials that have appeared in the migration workspace;
-4. verify the proprietary storage-node tree is excluded;
-5. follow the vulnerability reporting process in `SECURITY.md`;
-6. add branch protection and required CI checks;
-7. add `CODEOWNERS` for domain-level maintainership.
+4. follow the vulnerability reporting process in `SECURITY.md`;
+5. add branch protection and required CI checks;
+6. add `CODEOWNERS` for domain-level maintainership.
 
 ## Contributing
 

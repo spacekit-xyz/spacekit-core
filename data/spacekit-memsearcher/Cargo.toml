@@ -5,7 +5,8 @@ edition = "2021"
 authors = ["SWTCH Labs <info@spacekit.xyz>"]
 description = "Efficient LLM agent with compact memory management inspired by MemSearcher"
 license = "MIT"
-
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-memsearcher"
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
