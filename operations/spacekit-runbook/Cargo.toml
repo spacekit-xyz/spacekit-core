@@ -1,0 +1,23 @@
+[package]
+name = "spacekit-runbook"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Runbook tooling for SpaceKit. Consumes scenario YAML files and spacekit-log JSONL files; produces SpacetimeConsensusAgent training corpora and validation reports."
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/operations/spacekit-runbook"
+[[bin]]
+name = "spacekit-runbook"
+path = "main.rs"
+
+[dependencies]
+spacekit-log = { path = "../../observability/spacekit-log", features = ["serde"] }
+alloy-primitives = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+sha3 = "0.10"
+walkdir = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }

@@ -1,0 +1,33 @@
+scenario_id: S-017
+version: 1
+summary: An identity or network-manifest signing key is rotated under operator control.
+severity_floor: Notice
+event_queries:
+  - kind: {Service: KeyResolved}
+    min_severity: Notice
+    field_predicates:
+      - Exists: [rotation_id]
+diagnosis_steps:
+  - title: Identify the key domain
+    commands:
+      - "spacekit did list --owned-by-me --detailed"
+      - "spacekit network config show"
+    expected_outputs:
+      - "Operator distinguishes identity rotation from manifest-authority rotation"
+procedures:
+  - id: P-05
+    name: Controlled key rotation
+    note: "Run procedures/P-05-key-rotation.md."
+recommended_agent_classification:
+  domain: policy_regime_recommendation
+  intent: secure
+  target: identity.key_rotation
+  reasoning: >
+    Rotation requires explicit review, out-of-band trust distribution, and
+    post-rotation verification. It is not an automatic network-wide action.
+escalation:
+  - condition: "Old-key revocation or new-key ownership cannot be independently verified"
+    action: "Pause distribution and escalate to the security owner."
+agent_must_not:
+  - "Delete the old key before the approved recovery window"
+  - "Claim that the CLI distributed or revoked keys automatically"

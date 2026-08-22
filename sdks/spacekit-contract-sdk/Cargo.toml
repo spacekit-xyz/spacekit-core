@@ -1,0 +1,21 @@
+[workspace]
+members = [".", "contract-lang"]
+resolver = "2"
+
+[package]
+name = "spacekit-contract-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal no_std SDK for SpaceKit WASM smart contracts (Host ABI: env, spacekit_llm, spacekit_storage). Workspace includes the SKCL compiler (`contract-lang`)."
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-contract-sdk"
+keywords = ["spacekit", "wasm", "smart-contract", "no_std"]
+categories = ["no-std", "cryptography"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+

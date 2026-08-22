@@ -1,0 +1,68 @@
+scenario_id: S-002
+version: 2
+summary: No new blocks finalized for longer than 10× expected block time.
+severity_floor: Alert
+
+# Detection: extended absence of BlockSoftFinalized events.
+event_queries:
+  # The strongest single signal: QuorumFailed repeating.
+  - kind: {Consensus: QuorumFailed}
+    min_severity: Critical
+    field_predicates:
+      - FloatAtMost: [weight, 0.66]
+  # Or: ViewChange storming.
+  - kind: {Consensus: ViewChange}
+    min_severity: Warning
+
+diagnosis_steps:
+  - title: Confirm the stall
+    commands:
+      - "spacekit network status --detailed"
+      - "spacekit network logs --service compute --lines 300"
+    expected_outputs:
+      - "Live compute status/log evidence shows finality is not advancing"
+    on_failure:
+      - "If the deployed compute endpoint exposes no finality evidence, escalate rather than inferring a stall."
+
+  - title: Check local health and peer reachability
+    commands:
+      - "spacekit network doctor"
+      - "spacekit network peers --detailed"
+    expected_outputs:
+      - "Configured endpoints respond and expected peers are visible"
+    on_failure:
+      - "Follow procedures/P-02-peer-partition.md."
+
+procedures:
+  - id: P-02
+    name: Network partition diagnosis
+    steps:
+      - "Run procedures/P-02-peer-partition.md on each affected node"
+
+  - id: P-08
+    name: Controlled deployment rollback
+    note: "Use procedures/P-08-rollback.md only for a diagnosed binary/config regression; it is not consensus-state rollback."
+
+# This is one of the most serious operational scenarios. The agent's
+# correct response is NOT to act — consensus stall recovery is
+# operator-coordinated, not agent-driven.
+recommended_agent_classification:
+  domain: policy_regime_recommendation
+  intent: secure
+  target: network.policy_regime
+  reasoning: >
+    A confirmed consensus stall warrants immediate transition to SECURE
+    regime as a precaution. The agent should NOT attempt to remediate
+    the stall itself — operator intervention is required — but should
+    block any further loosening proposals during the recovery window.
+
+escalation:
+  - condition: "Stall persists more than 60 seconds"
+    action: "Page primary AND secondary on-call. Activate incident response."
+  - condition: "Stall persists more than 5 minutes"
+    action: "Public network status post; coordinate with major operators."
+
+agent_must_not:
+  - "Submit any new ratification proposal until consensus recovers"
+  - "Auto-issue rollback proposals (operator-only during stalls)"
+  - "Mark stall participants as malicious without evidence"

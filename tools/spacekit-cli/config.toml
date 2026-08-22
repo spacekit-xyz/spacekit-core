@@ -1,0 +1,283 @@
+[identity]
+did = "did:spacekit:compute:node"
+private_key_path = "~/.spacekit/keys/private_key.hex"
+public_key_path = "~/.spacekit/keys/public_key.hex"
+quantum_algorithm = "Kyber1024"
+
+[compute]
+node_did = "did:swtch:node:default"
+max_concurrent_tasks = 10
+max_memory_mb = 8192
+max_cpu_cores = 8
+gpu_enabled = false
+quantum_security_enabled = true
+network_timeout_seconds = 30
+stake_amount = 1000
+allow_private_tasks = false
+enable_cross_chain = true
+supported_runtimes = [
+    "wasm",
+    "python",
+    "javascript",
+]
+quantum_algorithms = [
+    "Kyber512",
+    "Dilithium2",
+]
+chain_id = "spacekit-local"
+
+[compute.storage_config]
+enable_storage_integration = true
+default_storage_type = "QuantumSafe"
+storage_data_dir = "./swx/compute_storage"
+auto_store_results = true
+auto_store_inputs = true
+quantum_algorithm = "Kyber1024"
+cipher_suite = "AES256"
+
+[compute.layerzero_bridge_config]
+enabled = true
+spacekit_endpoint_id = 40000
+use_oft = false
+mock_chain_transactions = false
+
+[compute.layerzero_bridge_config.bridge_contracts]
+Ethereum = "0x1234567890abcdef1234567890abcdef12345678"
+Arbitrum = "0xabcdef1234567890abcdef1234567890abcdef12"
+Polygon = "0x567890abcdef1234567890abcdef1234567890ab"
+
+[compute.layerzero_bridge_config.token_mappings.Polygon]
+astra_token = "0xASTRA_POLY_ADDRESS"
+wrapped_astra = "0xWASTRA_POLY_ADDRESS"
+usdc_token = "0x3c499c542cEF5E3811e1192ce70d8cC03e5B963c"
+
+[compute.layerzero_bridge_config.token_mappings.Polygon.supported_tokens]
+
+[compute.layerzero_bridge_config.token_mappings.Arbitrum]
+astra_token = "0xASTRA_ARB_ADDRESS"
+wrapped_astra = "0xWASTRA_ARB_ADDRESS"
+usdc_token = "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+[compute.layerzero_bridge_config.token_mappings.Arbitrum.supported_tokens]
+
+[compute.layerzero_bridge_config.token_mappings.Avalanche]
+astra_token = "0xASTRA_AVAX_ADDRESS"
+wrapped_astra = "0xWASTRA_AVAX_ADDRESS"
+usdc_token = "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"
+
+[compute.layerzero_bridge_config.token_mappings.Avalanche.supported_tokens]
+
+[compute.layerzero_bridge_config.token_mappings.Ethereum]
+astra_token = "0xASTRA_ETH_ADDRESS"
+wrapped_astra = "0xWASTRA_ETH_ADDRESS"
+usdc_token = "0xA0b86a33E6441B8C8A4C6a62Bd2f1b6B5C4D4E5F"
+
+[compute.layerzero_bridge_config.token_mappings.Ethereum.supported_tokens]
+USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+
+[compute.layerzero_bridge_config.gas_limits]
+bridge_token = 200000
+execute_task = 500000
+distribute_reward = 150000
+status_update = 100000
+
+[compute.layerzero_bridge_config.bridge_fees]
+base_fee_percentage = 0.001
+message_fee_buffer = 0.1
+minimum_bridge_amount = "1000000000000000000"
+maximum_bridge_amount = "1000000000000000000000000"
+
+[compute.layerzero_bridge_config.cross_chain_execution]
+enabled = true
+max_execution_time = 3600
+supported_runtimes = [
+    "wasm",
+    "gpu",
+    "hybrid",
+]
+auto_retry = true
+max_retries = 3
+
+[compute.layerzero_bridge_config.oft_contracts]
+Arbitrum = "0xOFT_ARB_ADDRESS"
+Ethereum = "0xOFT_ETH_ADDRESS"
+
+[compute.layerzero_bridge_config.rpc_endpoints]
+Polygon = "https://polygon-rpc.com"
+Ethereum = "https://eth.llamarpc.com"
+Arbitrum = "https://arb1.arbitrum.io/rpc"
+Base = "https://mainnet.base.org"
+
+[compute.production_metrics_config]
+enabled = true
+collection_interval_seconds = 30
+prometheus_port = 9190
+enable_network_stats = true
+enable_performance_analytics = true
+enable_alerting = true
+enable_cost_analysis = true
+data_retention_days = 30
+
+[compute.production_metrics_config.alert_thresholds]
+cpu_usage_threshold = 80.0
+memory_usage_threshold = 85.0
+network_latency_threshold = 1000.0
+error_rate_threshold = 5.0
+cost_threshold = 10.0
+
+[compute.metrics_consensus_config]
+min_consensus_nodes = 3
+max_byzantine_nodes = 1
+consensus_timeout_seconds = 30
+min_reputation_threshold = 0.5
+outlier_threshold = 2.0
+manipulation_sensitivity = 0.7
+enable_vpos_attestation = true
+enable_bft_aggregation = true
+enable_manipulation_detection = true
+
+[compute.consensus_config]
+min_consensus_participants = 3
+max_consensus_participants = 100
+byzantine_fault_tolerance = 0.33
+quantum_resistance_level = 5
+
+[compute.consensus_config.task_consensus_config]
+enabled = true
+min_validators = 3
+consensus_threshold = 0.67
+result_comparison_threshold = 0.95
+enable_deterministic_validation = true
+
+[compute.consensus_config.task_consensus_config.execution_timeout]
+secs = 120
+nanos = 0
+
+[compute.consensus_config.validation_consensus_config]
+enabled = true
+min_validators = 3
+validation_rounds = 2
+cross_validation_threshold = 0.75
+enable_reputation_weighting = true
+
+[compute.consensus_config.validation_consensus_config.validation_timeout]
+secs = 60
+nanos = 0
+
+[compute.consensus_config.reputation_consensus_config]
+enabled = true
+min_reputation_score = 0.5
+reputation_decay_rate = 0.01
+reputation_weight_factor = 2.0
+enable_reputation_staking = true
+
+[compute.consensus_config.reputation_consensus_config.reputation_update_interval]
+secs = 3600
+nanos = 0
+
+[compute.consensus_config.economic_consensus_config]
+enabled = true
+fee_consensus_threshold = 0.6
+reward_distribution_threshold = 0.7
+economic_attack_detection = true
+cost_adjustment_factor = 1.2
+enable_dynamic_pricing = true
+
+[compute.consensus_config.governance_consensus_config]
+enabled = true
+proposal_submission_stake = 1000
+quorum_threshold = 0.4
+approval_threshold = 0.6
+enable_quadratic_voting = false
+
+[compute.consensus_config.governance_consensus_config.voting_period]
+secs = 604800
+nanos = 0
+
+[compute.consensus_config.governance_consensus_config.execution_delay]
+secs = 172800
+nanos = 0
+
+[compute.consensus_config.global_consensus_timeout]
+secs = 300
+nanos = 0
+
+[compute.token_reward_config]
+base_reward_per_unit = 0.001
+gpu_multiplier = 2.0
+hybrid_multiplier = 1.5
+cpu_multiplier = 1.0
+quantum_bonus = 1.2
+max_efficiency_bonus = 2.0
+min_efficiency_penalty = 0.5
+max_daily_rewards = "100000000000000000000"
+enable_token_minting = true
+
+[compute.sra_config]
+enabled = false
+genesis_timestamp_secs = 1700000000
+apply_credits_onchain = true
+astra_rewards_contract = "0x0000000000000000000000000000000000000003"
+sra_admin_address = "0x0000000000000000000000000000000000000001"
+
+[compute.sigmoid_bonding_curve]
+enabled = true
+scaling_constant = 10.0
+steepness = 5.0
+min_price = 0.1
+max_price = 10.0
+price_update_interval = 300
+price_smoothing_factor = 0.2
+
+[compute.sigmoid_bonding_curve.utilization_weights]
+gpu_weight = 0.3
+storage_weight = 0.2
+network_weight = 0.2
+compute_weight = 0.2
+memory_weight = 0.1
+
+[compute.quarterly_reward_config]
+enabled = true
+distribution_frequency_days = 90
+minimum_batch_amount = "1000000000000000000"
+maximum_batch_amount = "100000000000000000000"
+distribution_dates = [
+    15,
+    15,
+    15,
+    15,
+]
+claim_grace_period_days = 30
+auto_distribute = true
+
+[network]
+name = "spacekit-testnet"
+endpoint = "wss://testnet.spacekit.xyz"
+p2p_port = 9000
+rpc_port = 8080
+bootstrap_nodes = [
+    "wss://bootstrap1.spacekit.xyz",
+    "wss://bootstrap2.spacekit.xyz",
+]
+enable_http_api = true
+dev_mode = false
+allow_single_validator_finalize = false
+
+[security]
+quantum_encryption = true
+supported_algorithms = [
+    "Kyber512",
+    "Kyber768",
+    "Kyber1024",
+    "NtruPrimeSntrup761",
+    "FrodoKem1344Aes",
+]
+default_algorithm = "Kyber768"
+secure_enclaves = false
+
+[token]
+contract_address = "0x1234567890123456789012345678901234567890"
+minimum_stake = 1000
+service_fee_percent = 2.5
+settlement_interval_seconds = 3600

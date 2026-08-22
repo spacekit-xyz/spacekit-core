@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "network_id": "spacekit-private-dev-3",
+  "profile": "private",
+  "chain_id": 31337,
+  "protocol": {
+    "name": "spacekit",
+    "version": 1
+  },
+  "genesis": {
+    "hash": "cf43aade69284c531151990b6ca3d632e3afd39bccc1bcd88933214bf0e06e8f",
+    "document": {
+      "accounts": [],
+      "contracts": []
+    }
+  },
+  "bootstrap": {
+    "p2p": [
+      "/ip4/127.0.0.1/tcp/7100"
+    ],
+    "rpc": [
+      "http://127.0.0.1:9000"
+    ]
+  },
+  "roles": [
+    "operator",
+    "validator"
+  ],
+  "members": [
+    {
+      "did": "did:spacekit:private:node-a",
+      "roles": [
+        "operator",
+        "validator"
+      ]
+    },
+    {
+      "did": "did:spacekit:private:node-b",
+      "roles": [
+        "operator",
+        "validator"
+      ]
+    },
+    {
+      "did": "did:spacekit:private:node-c",
+      "roles": [
+        "operator",
+        "validator"
+      ]
+    }
+  ]
+}

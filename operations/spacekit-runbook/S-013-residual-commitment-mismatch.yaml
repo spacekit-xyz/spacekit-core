@@ -1,0 +1,76 @@
+scenario_id: S-013
+version: 1
+summary: A validator's claimed residual_commitment doesn't match what the validating node independently computes. The v2 wire-format attack surface fix in action.
+severity_floor: Critical
+
+event_queries:
+  - kind: {Spacetime: ResidualMismatch}
+    min_severity: Critical
+
+diagnosis_steps:
+  - title: Confirm the mismatch is genuine
+    commands:
+      - "spacekit-cli spacetime verify-transition --tx-id <id>"
+    expected_outputs:
+      - "Local recomputation produces residual_commitment != claimed_commit"
+    on_failure:
+      - "If local recomputation agrees with claim: local node has a bug. Do NOT proceed to slash."
+      - "Investigate local VM determinism issue; report to maintainers."
+
+  - title: Check if other validators saw the same mismatch
+    commands:
+      - "spacekit-cli p2p residual-attestations --tx-id <id>"
+    expected_outputs:
+      - "Majority of validators report the same mismatch"
+    interpretation:
+      - "Majority agrees mismatch exists: confirmed fraud — proceed to slash"
+      - "Mixed: at least one VM is non-deterministic. Investigate before slashing."
+      - "Only this node sees mismatch: local bug. Do not slash."
+
+  - title: Classify the mismatch severity
+    commands:
+      - "spacekit-cli spacetime residual-delta --tx-id <id>"
+    expected_outputs:
+      - "Magnitude of |claimed_commit - computed_commit|"
+    interpretation:
+      - "Small (~1e-6 to 1e-4): could be floating-point drift across VMs. ISOLATED_BUG class."
+      - "Large (>1e-2): deliberately fabricated. MINORITY_ATTACK class."
+      - "Near full-payload magnitude (~1.0+): residual-channel attack we built v2 against."
+
+  - title: Submit fraud proof if mismatch confirmed
+    commands:
+      - "spacekit-cli fraud submit --type sandwich_mismatch --tx-id <id>"
+    expected_outputs:
+      - "ProofSubmitted event; will be processed at next finalization"
+
+# Categorize severity per delta magnitude.
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: minority_attack  # default for residual mismatch
+  target: residual_channel
+  reasoning: >
+    A confirmed residual_commitment mismatch is the v2 attack-surface
+    fix in action — the validator submitted a transition where the
+    residual claim doesn't match what they actually applied. Default
+    classification is minority_attack; agent re-classifies as
+    isolated_bug only if (a) the delta is small (<1e-4) AND (b) the
+    validator has no prior fraud history. The agent re-classifies as
+    network_attack if multiple residual mismatches are seen in the
+    same round from correlated validators.
+
+followup_scenarios:
+  - "S-003 if fraud proof is accepted"
+  - "S-009 if multiple validators show residual mismatches in the same round (coordinated residual-channel attack)"
+
+escalation:
+  - condition: "Single residual mismatch with small delta from new validator"
+    action: "No escalation; treat as isolated_bug, partial slash"
+  - condition: "Single residual mismatch with large delta from high-rep validator"
+    action: "Standard fraud-proof flow; full slash; flag operator"
+  - condition: "Multiple residual mismatches in same round"
+    action: "Activate S-009 protocol; this is coordinated residual-channel attack"
+
+agent_must_not:
+  - "Treat residual mismatches as honest disagreement (they are deterministic)"
+  - "Reduce severity of residual mismatch due to good rotor agreement (the v2 fix exists precisely because the rotor can lie about innocence)"
+  - "Auto-resolve without independent recomputation by multiple validators"

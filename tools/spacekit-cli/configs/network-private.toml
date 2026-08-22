@@ -1,0 +1,29 @@
+# Permissioned network with shared genesis and explicit admission.
+version = 3
+profile = "private"
+role = "operator"
+mode = "embedded"
+bind_host = "0.0.0.0"
+manifest = "configs/network-private.manifest.json"
+
+[admission]
+allowlist = ["did:spacekit:alice", "did:spacekit:bob"]
+shared_genesis_hash = "cf43aade69284c531151990b6ca3d632e3afd39bccc1bcd88933214bf0e06e8f"
+faucet_enabled = false
+require_signed_manifest = false
+
+[messaging]
+listen_addr = "0.0.0.0:7100"
+bootstrap_peers = ["/dns4/bootstrap.private.example/tcp/7000"]
+
+[runtime]
+enable_p2p = true
+
+[blockchain]
+enabled = true
+persist_state = true
+
+[blockchain.validators]
+self_validate = false
+peers = ["did:spacekit:alice"]
+min_validators = 1

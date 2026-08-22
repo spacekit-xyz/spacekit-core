@@ -1,0 +1,50 @@
+# SpaceKit Model Configuration
+# Configure which LLMs to load and where to find them
+
+models_dir: ./models  # Directory containing model weights
+
+enabled_models:
+  # BitNet b1.58-2B - Efficient text generation
+  - model_id: bitnet-b1.58-2b
+    model_name: microsoft/bitnet-b1.58-2B-4T
+    model_path: bitnet-b1.58-2b-q8.gguf
+    model_type: llama
+    quantization: Q8_0
+    context_size: 2048
+    enabled: true  # Set to true after downloading
+  
+  # Phi-2 - Mathematical and logical reasoning
+  - model_id: phi-2
+    model_name: microsoft/phi-2
+    model_path: phi-2-q8.gguf
+    model_type: phi
+    quantization: Q8_0
+    context_size: 2048
+    enabled: true  # Set to true after downloading
+  
+  # Qwen 1.5 1.8B - Multilingual chat
+  - model_id: qwen-1.5-1.8b
+    model_name: Qwen/Qwen1.5-1.8B-Chat
+    model_path: qwen-1.5-1.8b-q8.gguf
+    model_type: qwen
+    quantization: Q8_0
+    context_size: 32768
+    enabled: true  # Set to true after downloading
+  
+  # Mistral 7B - General purpose (larger)
+  - model_id: mistral-7b
+    model_name: mistralai/Mistral-7B-Instruct-v0.2
+    model_path: mistral-7b-q4.gguf
+    model_type: mistral
+    quantization: Q4_K_M
+    context_size: 8192
+    enabled: false  # Optional - enable if you have 6GB+ RAM
+  
+  # TinyLlama 1.1B - Lightweight
+  - model_id: tinyllama-1.1b
+    model_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    model_path: tinyllama-1.1b-q8.gguf
+    model_type: llama
+    quantization: Q8_0
+    context_size: 2048
+    enabled: false  # Optional - ultra-lightweight

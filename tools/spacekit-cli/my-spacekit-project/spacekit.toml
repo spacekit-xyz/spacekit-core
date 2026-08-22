@@ -1,0 +1,11 @@
+name = "my-spacekit-project"
+version = "0.1.0"
+did = "did:spacekit:user:95cfbe56-0df8-4aa8-af2a-046ddf8a3312"
+
+[networks]
+mainnet = "wss://mainnet-rpc.spacekit.xyz"
+localhost = "ws://localhost:9944"
+testnet = "wss://testnet-rpc.spacekit.xyz"
+
+[dependencies]
+spacekit-primitives = "latest"

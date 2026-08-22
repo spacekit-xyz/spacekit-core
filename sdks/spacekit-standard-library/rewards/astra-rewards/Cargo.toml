@@ -1,0 +1,23 @@
+[package]
+name = "astra-rewards"
+version = "0.1.0"
+edition = "2021"
+description = "SpaceKit AstraRewards SKCL contract — per-DID balances, SRA credits, 2B cap"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/rewards/astra-rewards"
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wee_alloc = "0.4.5"
+spacekit-contract-sdk = { path = "../../../spacekit-contract-sdk" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

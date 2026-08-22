@@ -1,0 +1,106 @@
+# Google Cloud Deployment Manager configuration for SpaceKit Storage Node
+# Deploys a Compute Engine VM with the storage node
+
+resources:
+  # Compute Engine Instance
+  - name: spacekit-storage-node
+    type: compute.v1.instance
+    properties:
+      zone: us-central1-a
+      machineType: zones/us-central1-a/machineTypes/e2-medium
+      disks:
+      - deviceName: boot
+        type: PERSISTENT
+        boot: true
+        autoDelete: true
+        initializeParams:
+          sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+          diskSizeGb: 50
+          diskType: pd-standard
+      networkInterfaces:
+      - network: global/networks/default
+        accessConfigs:
+        - name: External NAT
+          type: ONE_TO_ONE_NAT
+      metadata:
+        items:
+        - key: startup-script
+          value: |
+            #!/bin/bash
+            set -e
+            
+            # Update system
+            apt-get update
+            apt-get upgrade -y
+            
+            # Install dependencies
+            apt-get install -y curl wget unzip
+            
+            # Download and deploy SpaceKit Storage Node
+            # (Binary should be uploaded to Cloud Storage first)
+            # gsutil cp gs://your-bucket/spacekit-storage-node /opt/spacekit-storage-node/bin/
+            
+            # Create systemd service
+            cat > /etc/systemd/system/spacekit-storage-node.service << 'EOF'
+            [Unit]
+            Description=SpaceKit Storage Node
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=spacekit
+            Group=spacekit
+            WorkingDirectory=/opt/spacekit-storage-node
+            ExecStart=/opt/spacekit-storage-node/bin/spacekit-storage-node \
+                --config /opt/spacekit-storage-node/config/config.toml \
+                --data-dir /opt/spacekit-storage-node/data
+            Restart=always
+            RestartSec=10
+            StandardOutput=journal
+            StandardError=journal
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Create user and directories
+            useradd -r -s /bin/false -d /opt/spacekit-storage-node spacekit || true
+            mkdir -p /opt/spacekit-storage-node/{bin,config,data,logs}
+            chown -R spacekit:spacekit /opt/spacekit-storage-node
+            
+            # Enable and start service
+            systemctl daemon-reload
+            systemctl enable spacekit-storage-node
+            systemctl start spacekit-storage-node
+      tags:
+        items:
+        - spacekit-storage-node
+      serviceAccounts:
+      - email: default
+        scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+
+  # Firewall Rule
+  - name: allow-spacekit-storage-node
+    type: compute.v1.firewall
+    properties:
+      network: global/networks/default
+      sourceRanges:
+      - 0.0.0.0/0
+      allowed:
+      - IPProtocol: TCP
+        ports:
+        - "3030"  # API
+        - "4001"  # P2P
+      targetTags:
+      - spacekit-storage-node
+      description: Allow SpaceKit Storage Node traffic
+
+outputs:
+  - name: instance-name
+    value: $(ref.spacekit-storage-node.name)
+  - name: instance-ip
+    value: $(ref.spacekit-storage-node.networkInterfaces[0].accessConfigs[0].natIP)
+  - name: instance-zone
+    value: us-central1-a
+

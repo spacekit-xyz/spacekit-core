@@ -1,0 +1,3 @@
+# Alloy 1.8+ requires rustc >= 1.91.
+[toolchain]
+channel = "1.91"

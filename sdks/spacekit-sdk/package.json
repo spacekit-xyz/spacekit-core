@@ -1,0 +1,132 @@
+{
+  "name": "@spacekit/sdk",
+  "version": "1.0.0",
+  "description": "SpaceKit SDK - React integration, token adapters, encoding utilities, and Kyber encryption for SpaceKit-JS decentralized applications",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./client": {
+      "import": "./dist/SpacekitClient.js",
+      "types": "./dist/SpacekitClient.d.ts"
+    },
+    "./crypto": {
+      "import": "./dist/crypto.js",
+      "types": "./dist/crypto.d.ts"
+    },
+    "./kyber": {
+      "import": "./dist/kyber.js",
+      "types": "./dist/kyber.d.ts"
+    },
+    "./tokens": {
+      "import": "./dist/tokens.js",
+      "types": "./dist/tokens.d.ts"
+    },
+    "./encoding": {
+      "import": "./dist/encoding.js",
+      "types": "./dist/encoding.d.ts"
+    },
+    "./errors": {
+      "import": "./dist/errors.js",
+      "types": "./dist/errors.d.ts"
+    },
+    "./validation": {
+      "import": "./dist/validation.js",
+      "types": "./dist/validation.d.ts"
+    },
+    "./react": {
+      "import": "./dist/spacekit-sdk/index.js",
+      "types": "./dist/spacekit-sdk/index.d.ts"
+    },
+    "./react/hooks": {
+      "import": "./dist/react.js",
+      "types": "./dist/react.d.ts"
+    },
+    "./react/client": {
+      "import": "./dist/SpacekitClient.js",
+      "types": "./dist/SpacekitClient.d.ts"
+    },
+    "./react/types": {
+      "import": "./dist/spacekit-sdk/types.js",
+      "types": "./dist/spacekit-sdk/types.d.ts"
+    },
+    "./embed": {
+      "import": "./dist/embed/index.js",
+      "types": "./dist/embed/index.d.ts"
+    },
+    "./react/embed": {
+      "import": "./dist/react/embed/index.js",
+      "types": "./dist/react/embed/index.d.ts"
+    },
+    "./styles": "./dist/spacekit-sdk/spacekit-sdk.css"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && npm run copy:assets",
+    "copy:assets": "mkdir -p dist/spacekit-sdk && cp -R lib/wasm dist/wasm && cp lib/spacekit-sdk/spacekit-sdk.css dist/spacekit-sdk/spacekit-sdk.css",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint lib --ext .ts,.tsx",
+    "test": "echo \"Tests pending\" && exit 0"
+  },
+  "keywords": [
+    "spacekit",
+    "blockchain",
+    "wasm",
+    "smart-contracts",
+    "react",
+    "sdk",
+    "web3",
+    "decentralized",
+    "kyber",
+    "post-quantum",
+    "encryption"
+  ],
+  "author": "SpaceKit Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spacekit-xyz/spacekit-sdk"
+  },
+  "homepage": "https://spacekit.xyz",
+  "bugs": {
+    "url": "https://github.com/spacekit-xyz/spacekit-sdk/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "@spacekit/spacekit-js": "*",
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@spacekit/spacekit-js": {
+      "optional": false
+    },
+    "react": {
+      "optional": false
+    },
+    "react-dom": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "~5.9.3",
+    "@spacekit/spacekit-js": "git+https://github.com/spacekit-xyz/spacekit-js.git#main"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
+}

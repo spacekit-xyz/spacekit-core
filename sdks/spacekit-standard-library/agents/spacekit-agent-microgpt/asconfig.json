@@ -1,0 +1,25 @@
+{
+  "extends": "./node_modules/assemblyscript/std/assembly.json",
+  "entries": ["./assembly/index.ts"],
+  "include": ["assembly/**/*.ts"],
+  "options": {
+    "path": ["../../../spacekit-assembly-sdk/assembly", "./node_modules"],
+    "outFile": "build/spacekit_agent_microgpt.wasm",
+    "textFile": "build/spacekit_agent_microgpt.wat",
+    "optimize": true,
+    "noAssert": true
+  },
+  "targets": {
+    "release": {
+      "outFile": "build/spacekit_agent_microgpt.wasm",
+      "textFile": "build/spacekit_agent_microgpt.wat",
+      "optimize": true,
+      "noAssert": true
+    },
+    "debug": {
+      "outFile": "build/spacekit_agent_microgpt.debug.wasm",
+      "textFile": "build/spacekit_agent_microgpt.debug.wat",
+      "debug": true
+    }
+  }
+}

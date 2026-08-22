@@ -1,0 +1,19 @@
+[package]
+name = "spacekit-quantum-verkle-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-quantum-verkle/fuzz"
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.7"
+spacekit-quantum-verkle = { path = ".." }
+
+[[bin]]
+name = "proof_deserialize"
+path = "fuzz_targets/proof_deserialize.rs"
+test = false
+doc = false

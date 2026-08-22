@@ -1,0 +1,78 @@
+scenario_id: S-001
+version: 1
+summary: Node refuses to start or panics within seconds of startup.
+severity_floor: Critical
+
+# How spacekit-log detects this scenario.
+event_queries:
+  # Either: BrainHashMismatch at startup, with no successful BrainLoaded afterward.
+  - kind: {Agent: BrainHashMismatch}
+    min_severity: Critical
+  # Or: BrainLoaded never fires after BrainFetched.
+  - kind: {Agent: BrainFetched}
+    min_severity: Info
+    field_predicates:
+      - Exists: size_bytes
+  # The absence-of-followup signal is detected by the runbook tooling
+  # post-hoc, not by a single event match.
+
+# What the operator does at 3am.
+diagnosis_steps:
+  - title: Confirm the symptom
+    commands:
+      - "spacekit network status --detailed"
+      - "spacekit network logs --lines 200"
+    expected_outputs:
+      - "Supervisor stopped, service probe failure, or startup error in logs"
+
+  - title: Validate profile and admission
+    commands:
+      - "spacekit network config show"
+      - "spacekit network doctor"
+    expected_outputs:
+      - "Profile parses and configured service probes pass"
+    on_failure:
+      - "Follow procedures/P-01-startup-triage.md; do not reset data."
+
+  - title: Verify configured manifest when present
+    commands:
+      - "spacekit network manifest verify /absolute/path/to/manifest.json"
+    expected_outputs:
+      - "Manifest, genesis, protocol, and signature verify"
+    on_failure:
+      - "Stop and follow procedures/P-04-manifest-integrity.md."
+
+# What to do at each diagnostic outcome.
+procedures:
+  - id: P-01
+    name: Startup triage
+    steps:
+      - "Run procedures/P-01-startup-triage.md"
+      - "Correct only the diagnosed problem"
+      - "Restart with spacekit network up -d and verify detailed status"
+
+# What the agent SHOULD classify when seeing this scenario.
+# This is the training label.
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: isolated_bug
+  target: node.startup
+  reasoning: >
+    Node startup failure is per-node, not network-wide unless multiple
+    nodes hit the same failure simultaneously. Default classification is
+    isolated_bug (operator action needed on this node), not network_attack.
+    The runbook handles the operator-level diagnosis; the agent's role is
+    to NOT escalate this to network-wide alert prematurely.
+
+# When to wake someone up.
+escalation:
+  - condition: "Three or more nodes hit BrainHashMismatch in a 10-minute window"
+    action: "Upgrade severity from S-001 (Critical) to S-005 + S-015 (combined network event)"
+  - condition: "Single-node failure unresolved after 30 minutes of diagnostic procedures"
+    action: "Page secondary on-call to assist; node may be running tampered software"
+
+# What the agent does NOT do in this scenario.
+agent_must_not:
+  - "Auto-issue any parameter change proposal"
+  - "Auto-trigger regime change"
+  - "Mark the node's operator as malicious"

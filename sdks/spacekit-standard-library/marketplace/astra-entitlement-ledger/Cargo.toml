@@ -1,0 +1,22 @@
+[package]
+name = "astra-entitlement-ledger"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/marketplace/astra-entitlement-ledger"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wee_alloc = "0.4.5"
+spacekit-contract-sdk = { version = "0.1.0", path = "../../../spacekit-contract-sdk" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

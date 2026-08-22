@@ -1,0 +1,176 @@
+# WCVM REST API Specification (OpenAPI 3.0)
+openapi: 3.0.3
+info:
+  title: WCVM (WebAssembly Compute Virtual Machine) API
+  description: |
+    REST API for deploying and executing WebAssembly compute contracts with GPU acceleration.
+    Similar to Ethereum JSON-RPC but optimized for computational workloads.
+  version: 1.0.0
+  contact:
+    name: WCVM Team
+    url: https://wcvm.io
+    email: developers@wcvm.io
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.wcvm.io/v1
+    description: WCVM Mainnet
+  - url: https://testnet-api.wcvm.io/v1
+    description: WCVM Testnet
+  - url: http://localhost:8080/v1
+    description: Local development node
+
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
+paths:
+  # Account endpoints
+  /accounts/{address}:
+    get:
+      summary: Get account information
+      description: Retrieve account balance, nonce, and metadata
+      tags: [Accounts]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{40}$'
+          example: '0x742d35cc6663c5c3e7b8b4c5f58c7d9cf5b5a5a5'
+      responses:
+        '200':
+          description: Account information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '404':
+          description: Account not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{address}/balance:
+    get:
+      summary: Get account balance
+      tags: [Accounts]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{40}$'
+      responses:
+        '200':
+          description: Account balance in wei
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balance:
+                    type: string
+                    description: Balance in wei (as hex string)
+                    example: '0x1bc16d674ec80000'
+
+  /accounts/{address}/nonce:
+    get:
+      summary: Get account nonce
+      tags: [Accounts]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Account nonce
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nonce:
+                    type: integer
+                    example: 42
+
+  # Transaction endpoints
+  /transactions:
+    post:
+      summary: Submit a transaction
+      description: Submit a signed transaction to the network
+      tags: [Transactions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitTransactionRequest'
+      responses:
+        '200':
+          description: Transaction submitted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  txHash:
+                    type: string
+                    example: '0x1234567890abcdef...'
+
+  /transactions/{hash}:
+    get:
+      summary: Get transaction by hash
+      tags: [Transactions]
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^0x[a-fA-F0-9]{64}$'
+      responses:
+        '200':
+          description: Transaction details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '404':
+          description: Transaction not found
+
+  /transactions/{hash}/receipt:
+    get:
+      summary: Get transaction receipt
+      tags: [Transactions]
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transaction receipt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionReceipt'
+
+  /transactions/estimate-gas:
+    post:
+      summary: Estimate gas for transaction
+      tags: [Transactions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EstimateGasRequest'

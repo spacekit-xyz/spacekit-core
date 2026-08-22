@@ -1,0 +1,157 @@
+[package]
+name = "spacekit-compute-node"
+version = "0.2.0"
+edition = "2021"
+description = "SpaceKit Compute Node - Quantum-secure distributed computing services"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/infra/spacekit-compute-node"
+[lib]
+name = "spacekit_compute_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spacekit-compute-node"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]
+
+[[example]]
+name = "simple_demo"
+path = "examples/simple_demo.rs"
+
+[[example]]
+name = "gpu_demo"
+path = "examples/gpu_demo.rs"
+
+[dependencies]
+# SpaceKit Platform integration
+spacekit-primitives = { path = "../../foundation/spacekit-primitives", features = ["quantum"] }
+spacekit-did = { path = "../../identity/spacekit-did" }
+spacekit-did-bridges = { path = "../../identity/spacekit-did-onchain/bridges" }
+spacekit-quantum-verkle-tree = { path = "../../data/spacekit-quantum-verkle", default-features = false, features = ["std"] }
+spacekit-storage-node = { path = "../spacekit-storage-node", features = ["wcvm-integration"], optional = true } 
+spacekit-messaging-node = { path = "../spacekit-messaging-node" }
+spacekit-payments = { path = "../../economics/spacekit-payments" }
+spacekit-service-rewards = { path = "../../economics/spacekit-service-rewards" }
+spacekit-log = { path = "../../observability/spacekit-log" }
+spacekit-spacetime-consensus = { path = "../../consensus/spacekit-spacetime-consensus", optional = true, default-features = false, features = ["std", "serde", "pq-signatures", "verkle"] }
+spacekit-unified-consensus = { path = "../../consensus/spacekit-unified-consensus", optional = true, default-features = false, features = ["std", "serde", "spacetime"] }
+rayon = { version = "1.10", optional = true }
+
+# Core async runtime and utilities
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = { version = "0.9", optional = true }
+toml = { version = "0.8", optional = true }
+
+# WebAssembly runtime
+wasmtime = { version = "25.0", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "25.0.0"
+wat = "1.0"
+
+# Cryptography and security (aligned with storage node)
+sha2 = "0.10.8"
+sha3 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+jsonwebtoken = "9.3"
+blake3 = "1.0"  # For enhanced storage integration
+aes-gcm = "0.10.3"
+ed25519-dalek = "2.1.1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+ring = "0.17"
+chacha20poly1305 = "0.10.1"
+subtle = "2.6"                # constant-time secret comparison
+hkdf = "0.12"                 # escrow key derivation from operator secret
+
+# Networking
+warp = "0.3"
+hyper = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+serde_urlencoded = "0.7"
+
+# GPU compute (optional)
+wgpu = { version = "25.0.2", optional = true }
+futures-intrusive = "0.5"
+bincode = "1.3"
+bytes = "1"
+
+# Configuration and CLI
+clap = { version = "4.0", features = ["derive"], optional = true }
+config = "0.13"
+
+# Python integration for compression service
+pyo3 = { version = "0.20", features = ["auto-initialize"], optional = true }
+
+# Metrics and monitoring
+prometheus = "0.13"
+metrics = "0.22"
+sysinfo = "0.32"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Alloy - Ethereum/EVM integration for LayerZero bridge (required)
+alloy-primitives = "1.0"
+alloy-sol-types = "1.0"
+alloy-consensus = "1.0"
+alloy-provider = "1.0"
+alloy-network = "1.0"
+alloy-rpc-types = "1.0"
+alloy-signer = "1.0"
+alloy-signer-local = "1.0"
+alloy-transport-http = "1.0"
+alloy-contract = "1.0"
+
+# Native Growformer inference (same `growformer::runtime::Runtime` as spacekit-cli / simulator).
+growformer = { git = "https://github.com/spacekit-xyz/spacekit-ai", rev = "d2afc97406fa04f4e5662717afd3e36465e3e5a6", default-features = false, optional = true }
+
+# Testing utilities (needed for mock database)
+tempfile = "3.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Table formatting
+tabled = "0.15"
+
+# P2P and networking
+libp2p = { version = "0.54", features = ["tcp", "mdns", "noise", "yamux", "identify", "gossipsub"] }
+flate2 = "1.1.5"
+
+[features]
+default = ["storage-integration", "gpu"]
+standalone = ["clap", "tracing-subscriber", "toml", "serde_yaml", "storage-integration", "spacetime-consensus"]
+gpu = ["wgpu"]
+storage-integration = ["spacekit-storage-node"]  # Enhanced storage integration (no SQL)
+python-compression = ["pyo3"]  # Enable Python SpaceKit Compressor bridge
+# Links neurokit `growformer` for `agent_growformer_*` inference on the Rust VM (larger build).
+growformer-inference = ["dep:growformer"]
+# Cl(1,3) rotor / causal extension for unified consensus (optional sidecar on [`BlockData`]).
+spacetime-consensus = ["dep:spacekit-spacetime-consensus", "dep:spacekit-unified-consensus", "dep:rayon"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"
+criterion = "0.5" 
+
+# NOTE: release hardening (overflow-checks) lives in the workspace root
+# Cargo.toml — profiles declared in a workspace member are ignored by cargo.
+
+# Pin yamux to a stable version to avoid unstable feature issues
+# [patch.crates-io]
+# yamux = "=0.12.1"

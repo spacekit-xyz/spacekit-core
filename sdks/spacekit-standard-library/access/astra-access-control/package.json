@@ -1,0 +1,17 @@
+{
+  "name": "astra-access-control-as",
+  "version": "0.1.0",
+  "description": "Astra Access Control (AssemblyScript) – build to WASM like the Rust crate",
+  "scripts": {
+    "build": "npm run build:release",
+    "build:release": "asc --config asconfig.json --target release",
+    "build:debug": "asc --config asconfig.json --target debug",
+    "clean": "rm -rf build"
+  },
+  "dependencies": {
+    "spacekit-assembly-sdk": "file:../../../spacekit-assembly-sdk"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  }
+}

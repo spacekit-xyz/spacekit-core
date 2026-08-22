@@ -1,0 +1,19 @@
+[package]
+name = "ausd-stablecoin-contract"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/infra/spacekit-compute-node/contracts/ausd-stablecoin"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wee_alloc = "0.4.5"
+spacekit-contract-sdk = { path = "../../../../sdks/spacekit-contract-sdk" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

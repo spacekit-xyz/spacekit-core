@@ -1,0 +1,22 @@
+[package]
+name = "spacekit-sphincs-wasm"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/foundation/spacekit-primitives/wasm-sphincs"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+base64 = "0.22"
+pqcrypto-sphincsplus = "0.7.2"
+pqcrypto-traits = "0.3.5"
+serde-wasm-bindgen = "0.6"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+
+[patch.crates-io]
+pqcrypto-internals = { path = "../vendor/pqcrypto-internals" }
+pqcrypto-sphincsplus = { path = "../vendor/pqcrypto-sphincsplus" }

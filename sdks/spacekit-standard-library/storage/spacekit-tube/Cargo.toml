@@ -1,0 +1,12 @@
+[package]
+name = "spacekit-tube"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/storage/spacekit-tube"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacekit-contract-sdk = { version = "0.1.0", path = "../../../spacekit-contract-sdk" }
+wee_alloc = "0.4"

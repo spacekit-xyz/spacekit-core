@@ -1,0 +1,172 @@
+[package]
+name = "spacekit-storage-node"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceKit Network Storage Node - Quantum-resistant distributed storage services"
+license = "Proprietary"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/infra/spacekit-storage-node"
+[lib]
+name = "spacekit_storage_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spacekit-storage-node"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]
+
+[[example]]
+name = "enhanced_persistence_demo"
+path = "examples/enhanced_persistence_demo.rs"
+required-features = ["database"]
+
+[[example]]
+name = "storage_node_complete_demo"
+path = "examples/storage_node_complete_demo.rs"
+required-features = ["database", "api-server", "p2p"]
+
+[[example]]
+name = "backup_operations_demo"
+path = "examples/backup_operations_demo.rs"
+required-features = ["database"]
+
+[[example]]
+name = "p2p_network_demo"
+path = "examples/p2p_network_demo.rs"
+required-features = ["database", "p2p"]
+
+[[example]]
+name = "connection_diagnostics_test"
+path = "examples/connection_diagnostics_test.rs"
+required-features = ["database", "p2p"]
+
+[[example]]
+name = "pqcrypto_kem_tool"
+path = "examples/pqcrypto_kem_tool.rs"
+required-features = ["quantum"]
+
+[[example]]
+name = "agentic_client_demo"
+path = "examples/agentic_client_demo.rs"
+required-features = ["api-server", "standalone"]
+
+[[example]]
+name = "hybrid_auth_soak"
+path = "examples/hybrid_auth_soak.rs"
+required-features = ["api-server", "standalone"]
+
+[[example]]
+name = "strict_auth_soak"
+path = "examples/strict_auth_soak.rs"
+required-features = ["api-server", "standalone", "quantum"]
+
+[[example]]
+name = "migration_auth_soak"
+path = "examples/migration_auth_soak.rs"
+required-features = ["api-server", "standalone"]
+
+[dependencies]
+spacekit-primitives = { path = "../../foundation/spacekit-primitives", features = ["quantum"] }
+spacekit-repo = { path = "../../data/spacekit-repo" }
+
+# Async and networking
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# P2P networking (optional dependencies)
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "dns", "kad", "mdns", "noise", "macros", "tcp", "yamux", "identify", "ping", "gossipsub"], optional = true }
+
+# HTTP API server (optional dependencies)
+warp = { version = "0.3.7", optional = true }
+bytes = { version = "1.7", optional = true }
+percent-encoding = { version = "2", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rusqlite = { version = "0.32", optional = true }
+# Used by agentic_routes::run_idempotent to collect SSE/response bodies. warp 0.3 ships hyper 0.14 internally, so we pin to the same major.
+hyper = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+futures-core = { version = "0.3", optional = true }
+
+# In-process MCP server (optional, gated behind the "mcp" feature)
+rmcp = { version = "0.5", default-features = false, features = ["server", "transport-io", "macros", "base64"], optional = true }
+schemars = { version = "0.8", optional = true }
+zstd = "0.13"
+lz4_flex = "0.11"
+brotli = "6.0"
+
+# Embedded blob store (lazy mmap reads + bounded cache)
+redb = "2.4"
+moka = { version = "0.12", features = ["sync"] }
+
+# Serialization
+bincode = { version = "2.0.1", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Storage and hashing
+blake3 = "1.0"
+hex = "0.4"
+sha2 = "0.10.9"
+
+# Classical encryption bridge (optional)
+ecies = { version = "0.2.7", optional = true }
+
+# Authentication (optional)
+jsonwebtoken = { version = "9.3", optional = true }
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3.20"
+
+# AWS SDK for Secrets Manager (optional, for production key storage)
+aws-config = { version = "1.0", optional = true }
+aws-sdk-secretsmanager = { version = "1.0", optional = true }
+base64 = "0.22"
+
+# AES-GCM for symmetric encryption (using shared secret from KEM)
+aes-gcm = { version = "0.10", features = ["std"], optional = true }
+
+# OQS (Open Quantum Safe) for real KEM encryption
+oqs = { version = "0.9.0", features = ["vendored", "kyber"], optional = true }
+
+# pqcrypto-kyber for browser-compatible KEM (same implementation as the WASM Kyber module)
+pqcrypto-kyber = { path = "../../foundation/spacekit-primitives/vendor/pqcrypto-kyber", optional = true }
+pqcrypto-traits = { version = "0.3.5", optional = true }
+
+# Async trait support
+async-trait = "0.1"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+spacekit-compressor = { version = "0.1.0", path = "../../data/spacekit-compressor" }
+
+# Configuration and utilities
+# (uuid and chrono already defined above)
+
+[features]
+default = ["api-server", "database", "p2p", "quantum"]
+standalone = ["clap", "api-server", "database", "p2p", "quantum", "reqwest"]
+api-server = ["warp", "bytes", "percent-encoding", "ecies", "jsonwebtoken", "reqwest", "hyper", "tokio-stream", "tokio-util", "futures-core"]  # Bundle API server dependencies
+mcp = ["api-server", "rmcp", "schemars"]  # In-process MCP server (Phase 5)
+database = [] # Feature flag for custom internal storage support
+p2p = ["libp2p"] # Feature flag for P2P networking
+wcvm-integration = ["api-server", "database", "p2p"] # Feature flag for WCVM integration
+aws-secrets = ["aws-config", "aws-sdk-secretsmanager"] # Feature flag for AWS Secrets Manager integration
+quantum = ["aes-gcm", "oqs", "pqcrypto-kyber", "pqcrypto-traits"] # Real quantum KEM encryption (OQS + pqcrypto for browser compat)
+rate-limit-spacekit = ["reqwest"] # Feature flag for SpaceKit-backed distributed rate limiting
+sqlite = ["rusqlite"] # Optional SQLite backend for analytics (disabled by default)
+# CLI dependency alias; real apply is a runtime flag (`enable_real_transactions` / env).
+enable-real-transactions = []
+
+[dependencies.clap]
+version = "4.0"
+features = ["derive"]
+optional = true
+
+[dev-dependencies]
+tempfile = "3.0"
+tracing-subscriber = "0.3.20"
+futures-util = "0.3"

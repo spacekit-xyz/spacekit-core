@@ -1,0 +1,13 @@
+.DS_Store
+
+/swx
+compute_storage/
+target/
+temp_blockchain_storage/
+
+# Local secrets and overrides (never commit real keys or RPC URLs)
+config.local.toml
+secrets/
+*.pem
+.env
+.env.*

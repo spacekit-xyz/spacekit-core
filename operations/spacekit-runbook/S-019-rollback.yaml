@@ -1,0 +1,37 @@
+scenario_id: S-019
+version: 1
+summary: Operators roll back a diagnosed binary or profile regression using approved artifacts.
+severity_floor: Critical
+event_queries:
+  - kind: {Consensus: BlockReverted}
+    min_severity: Critical
+  - kind: {Fraud: RollbackInitiated}
+    min_severity: Critical
+  - kind: {Fraud: RollbackCompleted}
+    min_severity: Notice
+diagnosis_steps:
+  - title: Separate deployment rollback from consensus rollback
+    commands:
+      - "spacekit network status --detailed"
+      - "spacekit network logs --lines 300"
+      - "spacekit network config show"
+    expected_outputs:
+      - "The diagnosed scope and approved restore point are recorded"
+procedures:
+  - id: P-08
+    name: Controlled deployment rollback
+    note: "Run procedures/P-08-rollback.md; it does not revert consensus state."
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: isolated_bug
+  target: node.deployment
+  reasoning: >
+    Roll back binaries or configuration only when evidence identifies a
+    deployment regression. Consensus-state reversion requires separate
+    protocol/operator procedures that this CLI does not automate.
+escalation:
+  - condition: "Finalized state differs across nodes after deployment rollback"
+    action: "Stop rollout and escalate as a consensus integrity incident."
+agent_must_not:
+  - "Use network reset as rollback"
+  - "Claim finalized blocks were reverted by restoring a binary"

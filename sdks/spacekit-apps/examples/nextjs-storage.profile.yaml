@@ -1,0 +1,70 @@
+# nextjs-storage: Spacekit target profile
+# Conforms to: Spacekit Target Profile v0.2 (+ storage/media realization blocks)
+# Realizes gallery.app.yaml on Next.js + Postgres + S3 + sharp/Mux + Inngest.
+
+spacekit-profile: "0.2"
+name: nextjs-storage
+spec: ./gallery.app.yaml
+
+# --- relational metadata store: realizes `entities` ----------------------
+data:
+  store: postgres
+  orm: prisma
+  identity: uuid
+  relations: referenced
+  migrations: true
+
+# --- object storage: realizes the spec's `storage` buckets (NEW axis) ----
+# Maps each logical bucket to a provider + how `access` is enforced.
+storage:
+  originals:                         # access: private  ->  presigned URLs, no public read
+    provider: s3                     # s3 | r2 | gcs | vercel-blob | supabase
+    region: us-east-1
+    access: presigned                # direct client upload via presigned PUT
+  derivatives:                       # access: public  ->  CDN-served
+    provider: s3
+    cdn: cloudfront
+
+# --- media processing: realizes the workflow's rendition steps -----------
+media:
+  images: { engine: sharp }          # thumb/preview/full generation (sharp | imgix | cloudinary)
+  video:  { engine: mux }            # poster + HLS transcode (mux | mediaconvert | none)
+
+# --- business: capabilities + the ProcessMedia saga ----------------------
+business:
+  language: typescript
+  binding: compile
+  transport: server-actions          # Next.js server actions
+  architecture: hexagonal
+  workflows:
+    engine: inngest                  # background media processing (durable, retried)
+    retries: 3
+
+# --- view: Next.js -------------------------------------------------------
+view:
+  framework: nextjs
+  router: app-router
+  data_fetching: rsc
+  rendering:
+    images: next-image               # next/image optimization for tiles/lightbox
+  styling: tailwind
+  overrides:
+    AlbumView:
+      data_fetching: react-query     # cursor pagination / infinite scroll is client-driven
+
+# --- generator mechanics --------------------------------------------------
+output:
+  dir: ./generated
+  packageName: gallery
+  fileNaming: kebab-case
+
+# --- environment layering -------------------------------------------------
+environments:
+  dev:
+    storage:
+      originals:   { provider: local-fs, access: direct }   # no presign locally
+      derivatives: { provider: local-fs, cdn: none }
+    media:    { video: { engine: none } }                   # skip transcode in dev
+    business: { workflows: { engine: in-process } }
+  prod:
+    business: { workflows: { engine: inngest, retries: 5 } }

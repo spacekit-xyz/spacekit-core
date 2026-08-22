@@ -1,0 +1,18 @@
+# Copyright (c) 2026 SWTCH Labs LLC
+# SPDX-License-Identifier: Apache-2.0
+
+contract AstraToken
+
+storage:
+  total_supply: u64
+  symbol: string
+
+events:
+  Transfer(from: address, to: address, amount: u64)
+
+functions:
+  mint(to: address, amount: u64) -> bool @opcode 1 emit Transfer require did
+  balance_of(owner: address) -> u64 @opcode 2
+  total_supply() -> u64 @opcode 3
+
+# v1 example

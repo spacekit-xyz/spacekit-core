@@ -1,0 +1,9 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "link-arg=-s",           # Strip debug symbols
+  "-C", "opt-level=z",            # Optimize for size
+]
+

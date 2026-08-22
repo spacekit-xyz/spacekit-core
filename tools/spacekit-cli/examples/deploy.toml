@@ -1,0 +1,40 @@
+# Agent deploy manifest for `spacekit storage deploy --package deploy.toml`
+# Paths are relative to this file unless absolute.
+
+[artifacts]
+wasm = "target/wasm32-unknown-unknown/release/my_agent.wasm"
+bin = "agent-data/my-agent/my-agent-causal.bin"
+
+[agent]
+id = "my-agent-001"
+# owner_did = "did:spacekit:..."  # optional; defaults to `spacekit init` identity
+
+[project]
+# Optional: read growformer.brain_storage_key when [hub].brain_key is omitted
+gf_toml = "my-agent.gf.toml"
+
+[storage]
+# url = "http://127.0.0.1:3030"
+# owner_key_algorithm = "Kyber1024"
+
+[receipt]
+path = "deploy-receipt.json"
+
+[hub]
+brain_key = "my_agent_brain"
+capabilities = ["Market tone", "Risk phrasing"]
+tag_label = "FINANCE"
+tag_color = "#34d399"
+hub_response_format = "growformer" # growformer | plain
+thinking_label = "Thinking"
+# op = 1
+# input_format = "string_only"     # string_only | op_string
+
+[marketplace]
+publish = true
+title = "My Agent"
+description = "Growformer-backed agent for Agent Hub test drive."
+category = "ai"
+access = "public"
+price = "0.002" # pay-per-use aUSD; use "free" for no charge
+marketplace_id = "default"

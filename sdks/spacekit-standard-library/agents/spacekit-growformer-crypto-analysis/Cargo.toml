@@ -1,0 +1,21 @@
+[package]
+name = "spacekit-growformer-crypto-analysis"
+version = "0.1.0"
+edition = "2021"
+description = "SpaceKit Growformer crypto tone / risk phrasing contract — same host path as sentiment, different VM storage key for crypto-brain.bin"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/agents/spacekit-growformer-crypto-analysis"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacekit-contract-sdk = { version = "0.1.0", path = "../../../spacekit-contract-sdk" }
+wee_alloc = "0.4"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

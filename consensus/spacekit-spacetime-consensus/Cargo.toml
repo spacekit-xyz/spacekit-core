@@ -1,0 +1,47 @@
+[package]
+name = "spacekit-spacetime-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Spacetime-algebra (Cl(1,3)) extension to SpaceKit Unified Consensus. Adds rotor-valued state transitions, causal-set ordering, and Fréchet-mean vote aggregation on Spin(1,3). Plugs into ReputationWeightedConsensus without replacing PBFT-style finality."
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/consensus/spacekit-spacetime-consensus"
+[lib]
+name = "spacekit_spacetime_consensus"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "serde"]
+std = ["alloy-primitives/std", "serde?/std", "postcard?/use-std"]
+verkle = ["dep:spacekit-quantum-verkle"]
+serde = ["dep:serde", "dep:postcard"]
+# Dilithium2 inner votes + SPHINCS+ outer block envelope (see `pq_envelope.rs`).
+pq-signatures = [
+    "dep:pqcrypto-dilithium",
+    "dep:pqcrypto-sphincsplus",
+    "dep:pqcrypto-traits",
+]
+kyber-aux = ["dep:pqcrypto-kyber"]  # seal hiding-mode aux randomness
+# `growformer-hook` exposes optimization tuples for the existing
+# GrowformerConsensusOptimizer without pulling in the model itself.
+growformer-hook = []
+
+[dependencies]
+alloy-primitives = { version = "1.0", default-features = false, features = ["serde"] }
+# Path dep keeps `Address` / `U256` on the same `alloy-primitives` as this crate (git pin pulled 0.8.x).
+spacekit-quantum-verkle = { package = "spacekit-quantum-verkle-tree", path = "../../data/spacekit-quantum-verkle", optional = true, default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+postcard = { version = "1", default-features = false, optional = true }
+pqcrypto-kyber = { version = "0.7", default-features = false, optional = true }
+pqcrypto-dilithium = { version = "0.5", default-features = false, optional = true }
+pqcrypto-sphincsplus = { version = "0.7.1", default-features = false, optional = true }
+pqcrypto-traits = { version = "0.3.5", default-features = false, optional = true }
+# libm is used for sqrt/sin/cos/exp/log in no_std builds.
+libm = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+
+[[test]]
+name = "e2e_cli_http_finalize"
+path = "e2e_cli_http_finalize.rs"

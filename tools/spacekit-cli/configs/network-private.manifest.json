@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "network_id": "spacekit-private-example",
+  "profile": "private",
+  "chain_id": 31338,
+  "protocol": {
+    "name": "spacekit",
+    "version": 1
+  },
+  "genesis": {
+    "hash": "cf43aade69284c531151990b6ca3d632e3afd39bccc1bcd88933214bf0e06e8f",
+    "uri": "https://bootstrap.private.example/genesis.json",
+    "document": {
+      "accounts": [],
+      "contracts": []
+    }
+  },
+  "bootstrap": {
+    "p2p": ["/dns4/bootstrap.private.example/tcp/7000"],
+    "rpc": ["https://rpc.private.example"]
+  },
+  "roles": ["operator", "validator"],
+  "members": [
+    {
+      "did": "did:spacekit:alice",
+      "roles": ["operator", "validator"]
+    },
+    {
+      "did": "did:spacekit:bob",
+      "roles": ["operator"]
+    }
+  ]
+}

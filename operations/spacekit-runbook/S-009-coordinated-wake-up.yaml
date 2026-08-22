@@ -1,0 +1,98 @@
+scenario_id: S-009
+version: 1
+summary: Multiple high-reputation, long-tenure validators simultaneously show strong fingerprint anomalies. Classic coordinated-sleeper signature.
+severity_floor: Alert
+
+event_queries:
+  # Trigger 1: clique detection with high coordination score on high-rep
+  # validators.
+  - kind: {Spacetime: CliqueDetected}
+    min_severity: Warning
+    field_predicates:
+      - FloatAtLeast: [coordination_score, 5.0]
+      - FloatAtLeast: [validator_count, 3]
+  # Trigger 2: multiple FingerprintAnomalyStrong events within ~10 blocks
+  # from validators with reputation >= 0.85. The temporal-clustering check
+  # is done by the runbook tooling, not by a single event match — the
+  # match here gates the "multiple events" rule.
+  - kind: {Spacetime: FingerprintAnomalyStrong}
+    min_severity: Warning
+
+diagnosis_steps:
+  - title: Confirm the pattern is coordinated, not coincidental
+    commands:
+      - "spacekit-cli clique recent --window 20"
+      - "spacekit-cli anomalies recent --rep-min 0.85 --window 20"
+    expected_outputs:
+      - "3+ validators flagged in the same 20-block window"
+      - "Their pairwise rotor distances are below the typical-honest band"
+    interpretation:
+      - "Yes coordinated: proceed to validator profile check"
+      - "Possibly coincidental (different rotor distances): downgrade to S-008 per-validator handling"
+
+  - title: Profile the flagged validators
+    commands:
+      - "spacekit-cli validator profile --did <each_flagged>"
+    expected_outputs:
+      - "Reputations, age, hosting provider, geographic distribution"
+    interpretation:
+      - "All high-rep, long-tenure, varied geography: sleeper quorum — proceed to FULL response"
+      - "Mixed-tenure or single-region: still serious but may not be sleeper attack"
+      - "All recently admitted (<60 days): see S-014 (admission compromise)"
+
+  - title: Check geometric median behavior
+    commands:
+      - "spacekit-cli aggregation last-round"
+    expected_outputs:
+      - "Median converged AND max_divergence is bounded"
+    on_failure:
+      - "Median diverged or max_divergence very high: the clique is large enough to threaten aggregation. URGENT escalation."
+
+  - title: Submit fingerprint-attestation fraud proofs
+    commands:
+      - "spacekit-cli fraud submit --type attestation_mismatch --validators <flagged>"
+    expected_outputs:
+      - "ProofSubmitted events for each flagged validator"
+
+procedures:
+  - id: P-04-ref
+    name: Emergency regime change to Secure
+    note: "See procedures/P-04-emergency-regime-change.md. Required for coordinated wake-up detection."
+
+  - id: P-12
+    name: Coordinated-clique slashing flow
+    steps:
+      - "For each validator in the confirmed clique, submit fingerprint-attestation-mismatch fraud proof"
+      - "Confirm fraud proofs accepted (S-003 procedures)"
+      - "Apply Full slashing severity (coordinated, not isolated)"
+      - "Eject from validator set"
+      - "Pause new admissions for at least one challenge window"
+
+recommended_agent_classification:
+  domain: clique_assessment
+  intent: coordinated
+  target: clique_subset
+  reasoning: >
+    Multiple high-reputation long-tenure validators simultaneously breaking
+    from their established fingerprints is the canonical coordinated-sleeper
+    signature. Even if individual rotor anomalies look mild, the pattern
+    is overwhelming. Agent escalates clique_assessment to 'coordinated'
+    and triggers downstream regime change recommendation.
+
+# Critical: this scenario triggers parallel scenarios.
+followup_scenarios:
+  - "S-003 (fraud proof acceptance) for each slashing"
+  - "S-010 (regime transition stuck) if Secure transition fails"
+
+escalation:
+  - condition: "3+ high-rep long-tenure validators flagged"
+    action: "Page primary AND secondary on-call. Activate incident response."
+  - condition: "Geometric median divergence exceeds 0.5"
+    action: "Network safety at risk. Activate emergency network coordinator hotline."
+  - condition: "Confirmed sleeper quorum with >1/3 weight"
+    action: "Public network status post. Coordinate immediate response with major operators."
+
+agent_must_not:
+  - "Auto-loosen any parameters during the response window"
+  - "Permit any ratification proposals to activate during incident response"
+  - "Mark the operator who first detected the clique as suspicious"

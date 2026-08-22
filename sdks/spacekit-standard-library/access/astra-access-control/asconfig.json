@@ -1,0 +1,25 @@
+{
+  "extends": "./node_modules/assemblyscript/std/assembly.json",
+  "entries": ["./assembly/index.ts"],
+  "include": ["assembly/**/*.ts"],
+  "options": {
+    "path": ["../../../spacekit-assembly-sdk/assembly", "./node_modules"],
+    "outFile": "build/astra_access_control.wasm",
+    "textFile": "build/astra_access_control.wat",
+    "optimize": true,
+    "noAssert": true
+  },
+  "targets": {
+    "release": {
+      "outFile": "build/astra_access_control.wasm",
+      "textFile": "build/astra_access_control.wat",
+      "optimize": true,
+      "noAssert": true
+    },
+    "debug": {
+      "outFile": "build/astra_access_control.debug.wasm",
+      "textFile": "build/astra_access_control.debug.wat",
+      "debug": true
+    }
+  }
+}

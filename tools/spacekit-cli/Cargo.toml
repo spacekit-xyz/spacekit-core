@@ -1,0 +1,62 @@
+[package]
+name = "spacekit"
+version = "0.1.0"
+description = "SpaceKit Command Line Interface."
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/tools/spacekit-cli"
+[[bin]]
+name = "spacekit"
+path = "src/main.rs"
+
+[features]
+# Optional: storage-node HTTP API banner (see `full_client`); declare so `check-cfg` is satisfied.
+api-server = []
+# Kept empty for any scripts that still pass `--features full`; same as default build.
+full = []
+# Enables `spacetime_transition` on block proposals (see `spacekit-compute-node` `spacetime-consensus`).
+spacetime-consensus = ["spacekit-compute-node/spacetime-consensus"]
+default = []
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.39", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+anyhow = "1.0"
+tracing = "0.1"
+hex = "0.4"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+blake3 = "1.5"
+dirs = "5.0"
+percent-encoding = "2"
+
+spacekit-did = { path = "../../identity/spacekit-did" }
+spacekit-primitives = { path = "../../foundation/spacekit-primitives" }
+spacekit-compute-node = { path = "../../infra/spacekit-compute-node" }
+spacekit-storage-node = { path = "../../infra/spacekit-storage-node", features = ["api-server", "database", "p2p", "quantum", "standalone", "enable-real-transactions"] }
+spacekit-messaging-node = { path = "../../infra/spacekit-messaging-node" }
+spacekit-repo = { path = "../../data/spacekit-repo" }
+spacekit-diff = { path = "../../data/spacekit-diff" }
+
+growformer = { git = "https://github.com/spacekit-xyz/spacekit-ai", rev = "d2afc97406fa04f4e5662717afd3e36465e3e5a6", default-features = false, features = ["cli", "parallel", "training", "categorical"] }
+
+aes-gcm = { version = "0.10.3" }
+chacha20poly1305 = { version = "0.10.1" }
+ecies = { version = "0.2.7" }
+alloy = { version = "1.0", features = ["providers", "network", "contract", "sol-types", "signers", "signer-local", "rpc-types"] }
+ring = { version = "0.17.8" }
+sha2 = { version = "0.10" }
+sha3 = { version = "0.10" }
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+colored = { version = "2.1.0" }
+bincode = { version = "2.0.1" }
+thiserror = { version = "1.0" }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+base64 = "0.22"
+wat = "1.256.0"

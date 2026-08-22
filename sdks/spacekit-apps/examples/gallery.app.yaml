@@ -1,0 +1,209 @@
+# Gallery: Spacekit app specification (complete example)
+# Conforms to: Spacekit Specification v0.2 (+ a small storage convention, see `storage:`)
+# A media gallery: users upload photos/videos into albums; originals live in a
+# private bucket, derivatives (thumbnails/renditions) in a public CDN bucket.
+
+spacekit: "0.2"
+
+app:
+  name: Gallery
+  version: 1.0.0
+  description: A media gallery with albums, uploads, and a lightbox.
+
+# ---------------------------------------------------------------------------
+# Storage: logical buckets. The DB holds metadata; buckets hold bytes.
+# `access` is the *intent*; the profile realizes it (signed URLs, CDN, etc.).
+# ---------------------------------------------------------------------------
+storage:
+  originals:   { access: private }   # raw uploads — never served directly
+  derivatives: { access: public }    # thumbnails/renditions — CDN-served
+
+# ---------------------------------------------------------------------------
+# Data layer: metadata only. File fields *reference* a bucket.
+# ---------------------------------------------------------------------------
+entities:
+  User:
+    identity: id
+    fields:
+      id:          { type: id, generated: true }
+      email:       { type: email, required: true, unique: true }
+      displayName: { type: text }
+
+  Album:
+    identity: id
+    fields:
+      id:          { type: id, generated: true }
+      title:       { type: text, required: true, rules: { minLength: 1, maxLength: 120 } }
+      description: { type: longtext }
+      visibility:  { type: enum, values: [private, unlisted, public], default: private }
+      createdAt:   { type: timestamp, generated: true }
+    relations:
+      owner: { belongsTo: User }
+      media: { hasMany: Media }
+      cover: { hasOne: Media }
+
+  Media:
+    identity: id
+    fields:
+      id:        { type: id, generated: true }
+      kind:      { type: enum, values: [image, video], required: true }
+      file:      { type: file, bucket: originals }          # reference into a bucket, not a column
+      width:     { type: integer }
+      height:    { type: integer }
+      duration:  { type: decimal }                          # seconds, for video
+      takenAt:   { type: timestamp }
+      status:    { type: enum, values: [uploading, processing, ready, failed], default: uploading }
+      uploadedAt:{ type: timestamp, generated: true }
+    relations:
+      album:      { belongsTo: Album }
+      uploader:   { belongsTo: User }
+      renditions: { hasMany: Rendition }
+
+  Rendition:
+    identity: id
+    fields:
+      id:     { type: id, generated: true }
+      role:   { type: enum, values: [thumb, preview, full, poster, hls], required: true }
+      file:   { type: file, bucket: derivatives }
+      width:  { type: integer }
+      height: { type: integer }
+      format: { type: text }
+    relations:
+      media: { belongsTo: Media }
+
+# ---------------------------------------------------------------------------
+# Business layer
+# ---------------------------------------------------------------------------
+capabilities:
+  ListAlbums:
+    kind: read
+    output: { albums: { list: @Album } }
+    reads: [Album]
+    policy: authenticated
+
+  ListMedia:
+    kind: read
+    input:  { albumId: { type: id, required: true }, cursor: { type: text } }   # cursor = pagination
+    output: { media: { list: @Media }, nextCursor: { type: text } }
+    reads: [Media]
+    policy: @MediaVisible
+
+  CreateAlbum:
+    input: { title: { type: text, required: true }, visibility: { type: enum, values: [private, unlisted, public] } }
+    output: { album: @Album }
+    writes: [{ creates: Album }]
+    policy: authenticated
+
+  RequestUpload:
+    kind: upload                      # lifecycle capability (see note below)
+    bucket: @storage.originals
+    input:  { albumId: { type: id, required: true }, filename: { type: text }, contentType: { type: text }, size: { type: integer } }
+    output: { media: @Media }         # created in status: uploading + a presigned target (realization)
+    writes: [{ creates: Media }]
+    emits:  [MediaUploaded]           # fired when the byte upload completes (status -> processing)
+    policy: @OwnsAlbum
+
+  # processing steps (background jobs invoked by the ProcessMedia workflow)
+  ExtractMetadata:   { kind: offchain, input: { mediaId: { type: id } }, writes: [{ updates: Media }] }
+  GenerateRenditions:{ kind: offchain, input: { mediaId: { type: id } }, writes: [{ creates: Rendition }] }   # thumbs/preview/poster/hls
+  DeleteRenditions:  { kind: offchain, input: { mediaId: { type: id } }, writes: [{ deletes: Rendition }] }
+  DeleteMedia:       { input: { mediaId: { type: id } }, writes: [{ deletes: Media }], policy: @OwnsAlbum }
+
+# ---------------------------------------------------------------------------
+# Upload lifecycle (kind: upload):
+#   requested -> uploading -> stored -> processing -> ready | failed
+# The presign / direct-upload / finalize mechanics are realization (profile).
+# ---------------------------------------------------------------------------
+
+events:
+  MediaUploaded: { payload: { media: @Media } }
+  MediaReady:    { payload: { media: @Media } }
+  MediaFailed:   { payload: { media: @Media, reason: { type: text } } }
+
+workflows:
+  ProcessMedia:
+    summary: Derive metadata and renditions after a byte upload; clean up on failure.
+    on: MediaUploaded
+    steps:
+      - { do: ExtractMetadata,    with: { mediaId: event.media.id } }
+      - { do: GenerateRenditions, with: { mediaId: event.media.id }, compensate: DeleteRenditions }
+    onComplete: { emit: MediaReady }     # sets Media.status -> ready
+    onFailure:  { emit: MediaFailed }    # compensations delete partial renditions; status -> failed
+
+# ---------------------------------------------------------------------------
+# Access rules
+# ---------------------------------------------------------------------------
+policies:
+  OwnsAlbum:     "actor.id == resource.owner.id"
+  MediaVisible:  "resource.album.visibility == 'public' || actor.id == resource.album.owner.id"
+
+# ---------------------------------------------------------------------------
+# View layer
+# ---------------------------------------------------------------------------
+widgets:
+  Spinner:     { props: {} }
+  EmptyState:  { props: { message: { type: text } } }
+  AlbumCard:   { props: { album: @Album } }
+  MediaTile:   { props: { media: @Media } }          # shows thumb rendition; spinner while processing
+  Lightbox:    { props: { media: @Media } }          # shows full/preview rendition
+  Dropzone:    { props: {} }
+  UploadItem:  { props: { media: @Media } }           # per-file progress + state
+
+views:
+  Gallery:
+    route: /
+    data: { albums: { from: @ListAlbums } }
+    states:
+      loading: @Spinner
+      empty:   { when: "albums.length == 0", show: @EmptyState, props: { message: "No albums yet." } }
+    layout:
+      - repeat: album in albums
+        widget: @AlbumCard
+        props: { album: album }
+        on: { tap: -> @AlbumView(id: album.id) }
+    transitions: [{ to: @AlbumView }, { to: @Upload, label: "Upload" }]
+
+  AlbumView:
+    route: /albums/:id
+    params: { id: { type: id, required: true } }
+    data:   { media: { from: @ListMedia, with: { albumId: params.id, cursor: params.cursor } } }
+    policy: @MediaVisible
+    states:
+      loading: @Spinner
+      empty:   { when: "media.length == 0", show: @EmptyState, props: { message: "This album is empty." } }
+    layout:
+      - repeat: item in media                # masonry/grid is a realization detail
+        widget: @MediaTile
+        props: { media: item }
+        on: { tap: -> @MediaDetail(id: item.id) }
+    transitions: [{ to: @MediaDetail }, { to: @Gallery, label: "All albums" }]
+
+  MediaDetail:
+    route: /media/:id
+    params: { id: { type: id, required: true } }
+    data:   { item: { from: @Media, where: "id == params.id" } }
+    policy: @MediaVisible
+    layout:
+      - widget: @Lightbox
+        props: { media: item }
+
+  Upload:
+    route: /albums/:albumId/upload
+    requires: authenticated
+    params: { albumId: { type: id, required: true } }
+    actions:
+      add:
+        invokes: @RequestUpload
+        with: { albumId: params.albumId }
+        # per-file lifecycle: uploading -> processing -> ready | failed
+        onReady:  -> @AlbumView(id: params.albumId)
+        onFailed: stay
+    layout:
+      - widget: @Dropzone
+      - repeat: m in uploads                 # local upload queue
+        widget: @UploadItem
+        props: { media: m }
+    states:
+      uploading:  @Spinner                   # bytes in flight
+      processing: @Spinner                   # renditions being generated
+      failed:     { show: @EmptyState, props: { message: "Upload failed." } }

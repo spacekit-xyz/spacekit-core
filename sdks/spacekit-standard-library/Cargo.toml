@@ -1,0 +1,39 @@
+# Workspace for SpaceKit Standard Library contracts.
+# Member crates use the sibling `../spacekit-contract-sdk` from this monorepo.
+
+[workspace]
+resolver = "3"
+members = [
+  "access/astra-access-control",
+  "agents/spacekit-agent",
+  "agents/spacekit-agent-microgpt",
+  "agents/spacekit-growformer-agent",
+  "agents/spacekit-growformer-sentiment-analysis",
+  "agents/spacekit-growformer-crypto-analysis",
+  "agents/spacekit-growformer-fintech-analysis",
+  "agents/spacekit-agent-inference-market",
+  "agents/spacekit-inference-mesh",
+  "agents/spacekit-intent-classifier",
+  "agents/spacekit-spacetime",
+  "app-store",
+  "app-store/app-license-nft",
+  "payments/astra-escrow",
+  "payments/astra-payment-router",
+  "payments/payable-demo",
+  "payments/spacekit-paymaster",
+  "reputation/spacekit-reputation",
+  "services/compression-service",
+  "storage/spacekit-box",
+  "storage/spacekit-tube",
+  "tokens/sk-erc1155",
+  "tokens/sk-erc20",
+  "tokens/sk-erc721",
+  "tokens/sk-erc8004",
+  "system/spacekit-did-registry",
+  "system/spacekit-session-keys",
+  "system/spacekit-shared-vault",
+  "agents/routekit-agent",
+  "marketplace/astra-entitlement-ledger",
+  "rewards/astra-rewards",
+  "hello-world", "agents/finance-agent", "system/spacekit-anchor",
+]

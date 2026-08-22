@@ -1,0 +1,28 @@
+# Public subscriber: joins from a signed manifest and never enables a faucet implicitly.
+version = 3
+profile = "public"
+role = "subscriber"
+mode = "embedded"
+bind_host = "0.0.0.0"
+manifest = "configs/network-public.manifest.json"
+
+[admission]
+allowlist = []
+faucet_enabled = false
+require_signed_manifest = true
+
+[messaging]
+listen_addr = "0.0.0.0:7100"
+bootstrap_peers = ["/dns4/bootstrap.public.example/tcp/7000"]
+
+[runtime]
+enable_p2p = true
+
+[blockchain]
+enabled = true
+persist_state = true
+
+[blockchain.validators]
+self_validate = false
+peers = []
+min_validators = 1

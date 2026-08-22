@@ -1,0 +1,27 @@
+{
+  "deployment_id": "ccb44244-fad3-4939-9f57-75b814fc44d0",
+  "storage_node_url": "http://127.0.0.1:3030",
+  "storage_node_did": null,
+  "owner_did": "did:spacekit:agenthub:demo",
+  "owner_kem_algorithm": "Kyber1024",
+  "created_at": "2026-03-31T07:37:21.292438+00:00",
+  "upload_endpoint": "http://127.0.0.1:3030/files/upload",
+  "artifacts": [
+    {
+      "role": "wasm",
+      "local_path": "/Users/astor/Projects/2026/spacekit/spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_growformer_sentiment_analysis.wasm",
+      "file_id": "969192b6-5128-4b3d-aa1a-1ded57637869",
+      "stored_filename": "spacekit_growformer_sentiment_analysis.wasm",
+      "size_bytes": 14538,
+      "content_blake3_hex": "26c4334e019159368fe1cc34473465a42cf5acd4da42a893f96c8d803d73dba0"
+    },
+    {
+      "role": "bin",
+      "local_path": "/Users/astor/Projects/2026/spacekit/spacekit.xyz-website/public/growformer-agents/sentiment-brain.bin",
+      "file_id": "114d4112-5489-4f74-962e-1fde2982128c",
+      "stored_filename": "sentiment-brain.bin",
+      "size_bytes": 20754593,
+      "content_blake3_hex": "b335e057877aec56d5db6430926e69ca13ec38685c5d69069cec350ebfc38ad0"
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+{
+  "version": "0.1",
+  "contract_id": "routekit-agent",
+
+  "tools": {
+    "web_search": {
+      "module": "spacekit_tools",
+      "function": "web_search",
+      "pattern": "effect_queue",
+      "params": {
+        "query": {
+          "type": "string",
+          "max_bytes": 256,
+          "required": true,
+          "sanitize": "strip_control_chars"
+        },
+        "max_results": {
+          "type": "u32",
+          "min": 1,
+          "max": 10,
+          "default": 5
+        },
+        "max_response_bytes": {
+          "type": "u32",
+          "max": 65536,
+          "default": 65536
+        }
+      },
+      "constraints": {
+        "cost": "200",
+        "cost_unit": "ASTRA",
+        "rate_limit": "20/min",
+        "max_effects_per_execution": 4,
+        "requires_caller_did": true
+      }
+    },
+
+    "messaging_send": {
+      "module": "spacekit_messaging",
+      "function": "messaging_send",
+      "pattern": "fire_and_forget",
+      "params": {
+        "recipient": {
+          "type": "did",
+          "max_bytes": 256,
+          "required": true,
+          "validate": "did_format"
+        },
+        "payload": {
+          "type": "bytes",
+          "max_bytes": 4096,
+          "required": true
+        }
+      },
+      "constraints": {
+        "cost": "5000",
+        "cost_unit": "ASTRA",
+        "rate_limit": "10/min",
+        "requires_caller_did": true,
+        "allowed_recipients": ["did:sk:*"],
+        "blocked_recipients": []
+      }
+    },
+
+    "remote_storage_put": {
+      "module": "spacekit_remote_storage",
+      "function": "remote_storage_put",
+      "pattern": "effect_queue",
+      "params": {
+        "data": {
+          "type": "bytes",
+          "max_bytes": 102400,
+          "required": true
+        },
+        "max_ref_len": {
+          "type": "u32",
+          "max": 512,
+          "default": 512
+        }
+      },
+      "constraints": {
+        "cost": "50",
+        "cost_unit": "ASTRA",
+        "rate_limit": "30/min",
+        "requires_caller_did": true,
+        "storage_key_prefix": "{caller_did}",
+        "max_effects_per_execution": 8
+      }
+    },
+
+    "remote_storage_get": {
+      "module": "spacekit_remote_storage",
+      "function": "remote_storage_get",
+      "pattern": "effect_queue",
+      "params": {
+        "ref": {
+          "type": "string",
+          "max_bytes": 512,
+          "required": true,
+          "validate": "caller_did_prefix"
+        },
+        "max_bytes": {
+          "type": "u32",
+          "max": 98304,
+          "default": 98304
+        }
+      },
+      "constraints": {
+        "cost": "10",
+        "cost_unit": "ASTRA",
+        "rate_limit": "60/min",
+        "requires_caller_did": true,
+        "storage_key_prefix": "{caller_did}"
+      }
+    },
+
+    "payment_vault_charge": {
+      "module": "spacekit_payments",
+      "function": "payment_vault_charge",
+      "pattern": "fire_and_forget",
+      "params": {
+        "amount": {
+          "type": "string",
+          "required": true,
+          "validate": "numeric_string"
+        },
+        "beneficiary": {
+          "type": "did",
+          "max_bytes": 256,
+          "required": true,
+          "validate": "did_format"
+        }
+      },
+      "constraints": {
+        "requires_caller_did": true,
+        "beneficiary_must_match_caller": true
+      }
+    },
+
+    "growformer_generation": {
+      "module": "spacekit_agent",
+      "function": "agent_growformer_generation",
+      "pattern": "synchronous",
+      "params": {
+        "prompt": {
+          "type": "string",
+          "max_bytes": 32768,
+          "required": true,
+          "sanitize": "prompt_fence"
+        },
+        "max_tokens": {
+          "type": "u32",
+          "min": 1,
+          "max": 4096,
+          "default": 3072
+        }
+      },
+      "constraints": {
+        "cost": "100",
+        "cost_unit": "ASTRA",
+        "requires_caller_did": true,
+        "max_input_plus_output_bytes": 65536
+      }
+    }
+  }
+}

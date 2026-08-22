@@ -1,0 +1,224 @@
+# Bookshop: Spacekit dApp specification (complete example)
+# Conforms to: Spacekit Specification v0.2 + dApp Specification v0.1
+# A decentralized bookshop: books listed on-chain, paid in USDC, with an NFT receipt.
+
+spacekit: "0.2"
+dapp: "0.1"
+
+app:
+  name: Bookshop
+  version: 1.0.0
+  description: A decentralized bookstore. Books on-chain, USDC payment, NFT receipts.
+
+# ---------------------------------------------------------------------------
+# dApp config: chains, imported ABIs (authoritative interfaces), indexer, wallet
+# ---------------------------------------------------------------------------
+networks:
+  sepolia: { chainId: 11155111, rpc: "${SEPOLIA_RPC}" }
+  mainnet: { chainId: 1,        rpc: "${MAINNET_RPC}" }
+
+contracts:
+  Bookshop:
+    abi: ./abi/Bookshop.json          # compiler-emitted ABI is the source of truth
+    addresses: { sepolia: "0xBook…Sepolia", mainnet: "0xBook…Mainnet" }
+  USDC:
+    abi: erc20permit                  # ERC-20 + EIP-2612 permit
+    addresses: { sepolia: "0xUSDC…Sepolia", mainnet: "0xA0b86991…" }
+  Receipt:
+    abi: erc721
+    addresses: { sepolia: "0xRcpt…Sepolia", mainnet: "0xRcpt…Mainnet" }
+
+indexer:
+  source: Bookshop
+  events: [BookListed, Restocked, BookPurchased]
+  startBlock: { sepolia: 5500000, mainnet: 19000000 }
+
+wallet:
+  chains: [sepolia, mainnet]
+  required: true
+  connectors: [injected, walletconnect]
+
+# ---------------------------------------------------------------------------
+# Data layer: an indexed read model over contract events (+ one off-chain entity)
+# ---------------------------------------------------------------------------
+entities:
+  Book:
+    source: { index: Bookshop, from: [BookListed, Restocked, BookPurchased] }
+    key: id
+    fields:
+      id:     { type: tokenId }
+      title:  { type: text }
+      price:  { type: money }         # USDC units
+      stock:  { type: integer }       # derived from the event stream
+      seller: { type: address }
+
+  Purchase:
+    source: { index: Bookshop, from: [BookPurchased] }
+    key: id
+    fields:
+      id:        { type: id }
+      book:      { ref: Book }
+      buyer:     { type: address }
+      quantity:  { type: integer }
+      receiptId: { type: tokenId }
+      txHash:    { type: txhash }
+      at:        { type: timestamp }
+
+  UserProfile:
+    source: offchain                  # email is off-chain on purpose
+    key: address
+    fields:
+      address: { type: address }
+      email:   { type: email, rules: { } }
+
+# ---------------------------------------------------------------------------
+# Business layer: index reads, on-chain transactions, off-chain services
+# ---------------------------------------------------------------------------
+capabilities:
+  SearchBooks:
+    kind: read
+    source: index
+    input:  { query: { type: text } }
+    output: { books: { list: @Book } }
+
+  ListBook:
+    kind: transaction
+    call: @abi.Bookshop.listBook
+    signer: connectedWallet
+    input: { title: { type: text }, price: { type: money }, stock: { type: integer } }
+    with:  { title: input.title, price: input.price, stock: input.stock }
+    emits:  [@abi.Bookshop.BookListed]
+    errors: [@abi.Bookshop.NotSeller]
+    policy: walletConnected
+
+  Restock:
+    kind: transaction
+    call: @abi.Bookshop.restock
+    signer: connectedWallet
+    input: { bookId: { type: tokenId }, amount: { type: integer } }
+    with:  { bookId: input.bookId, amount: input.amount }
+    emits:  [@abi.Bookshop.Restocked]
+    errors: [@abi.Bookshop.NotSeller]
+    policy: walletConnected
+
+  PermitSpending:
+    kind: transaction
+    call: @abi.USDC.permit
+    signer: connectedWallet
+    input: { amount: { type: money }, deadline: { type: uint256 } }
+    with:
+      owner:    connectedWallet
+      spender:  @contracts.Bookshop.address
+      value:    input.amount
+      deadline: input.deadline
+    emits: [@abi.USDC.Approval]
+
+  BuyBook:
+    kind: transaction
+    call: @abi.Bookshop.buyBook
+    signer: connectedWallet
+    value: 0                          # paid in USDC via transferFrom inside the contract
+    input: { bookId: { type: tokenId }, quantity: { type: integer } }
+    with:  { bookId: input.bookId, quantity: input.quantity }
+    emits:  [@abi.Bookshop.BookPurchased, @abi.Receipt.Transfer]
+    errors: [@abi.Bookshop.OutOfStock, @abi.Bookshop.InsufficientAllowance]
+    policy: walletConnected
+
+  SendReceiptEmail:
+    kind: offchain
+    input: { purchaseId: { type: id } }
+    reads: [Purchase, UserProfile]
+
+  VoidReceipt:
+    kind: offchain
+    input: { purchaseId: { type: id } }
+
+# ---------------------------------------------------------------------------
+# Events (on-chain events are bound via @abi; these are workflow outcomes)
+# ---------------------------------------------------------------------------
+events:
+  PurchaseCompleted: { payload: { purchase: @Purchase } }
+  PurchaseFailed:    { payload: { bookId: { type: tokenId }, reason: { type: text } } }
+
+# ---------------------------------------------------------------------------
+# Workflow: atomic on-chain bundle, then a compensable off-chain step
+# ---------------------------------------------------------------------------
+workflows:
+  Checkout:
+    summary: Atomically permit + buy on-chain, then send an off-chain receipt email.
+    steps:
+      - bundle: [PermitSpending, BuyBook]   # atomic: reverts whole or commits whole
+        chain: onchain
+      - do: SendReceiptEmail                 # compensable off-chain follow-up
+        chain: offchain
+        compensate: VoidReceipt
+    onComplete: { emit: PurchaseCompleted }
+    onFailure:  { emit: PurchaseFailed }
+
+# ---------------------------------------------------------------------------
+# View layer: wallet gating + transaction-lifecycle states
+# ---------------------------------------------------------------------------
+widgets:
+  Spinner:        { props: {} }
+  EmptyState:     { props: { message: { type: text } } }
+  ConnectWallet:  { props: {} }
+  SwitchNetwork:  { props: { chain: { type: text } } }
+  TxPendingBanner:{ props: { txHash: { type: txhash } } }
+  TxErrorBanner:  { props: { message: { type: text } } }
+  BookCard:       { props: { book: @Book }, slots: [actions] }
+  ReceiptCard:    { props: { purchase: @Purchase } }
+  Button:         { props: { label: { type: text } } }
+
+views:
+  Catalog:
+    route: /
+    params: { q: { type: text } }
+    data:   { books: { from: @SearchBooks, with: { query: params.q } } }
+    states:
+      loading: @Spinner
+      empty:   { when: "books.length == 0", show: @EmptyState, props: { message: "No books listed yet." } }
+    layout:
+      - repeat: book in books
+        widget: @BookCard
+        props: { book: book }
+        slots:
+          actions:
+            - widget: @Button
+              props: { label: "Buy" }
+              on: { tap: -> @Checkout(id: book.id) }
+    transitions: [{ to: @Checkout, label: "Buy a book" }]
+
+  Checkout:
+    route: /books/:id/buy
+    requires: walletConnected
+    params: { id: { type: tokenId } }
+    data:   { book: { from: @Book, where: "id == params.id" } }
+    actions:
+      buy:
+        invokes: @Checkout                  # the workflow above
+        with: { bookId: book.id, quantity: 1 }
+        onConfirmed: -> @OrderConfirmation(purchaseId: result.purchaseId)
+        onReverted:  stay
+    states:
+      disconnected: @ConnectWallet
+      wrongNetwork: { show: @SwitchNetwork, props: { chain: "sepolia" } }
+      pending:      @TxPendingBanner
+      reverted:     { show: @TxErrorBanner, props: { message: "Transaction reverted." } }
+    transitions: [{ to: @Catalog, label: "Back to catalog" }]
+
+  OrderConfirmation:
+    route: /orders/:purchaseId
+    params: { purchaseId: { type: id } }
+    data:   { purchase: { from: @Purchase, where: "id == params.purchaseId" } }
+    layout:
+      - widget: @ReceiptCard
+        props: { purchase: purchase }
+      - widget: @Button
+        props: { label: "Continue shopping" }
+        on: { tap: -> @Catalog }
+
+# ---------------------------------------------------------------------------
+# Access rule used above
+# ---------------------------------------------------------------------------
+policies:
+  walletConnected: "actor.wallet != null"

@@ -1,0 +1,63 @@
+# Google Cloud Run deployment configuration for SpaceKit Storage Node
+# This allows serverless deployment with automatic scaling
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: spacekit-storage-node
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/execution-environment: gen2
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/memory: "2Gi"
+        run.googleapis.com/cpu: "2"
+    spec:
+      containerConcurrency: 100
+      timeoutSeconds: 300
+      containers:
+      - image: gcr.io/PROJECT_ID/spacekit-storage-node:latest
+        ports:
+        - name: http1
+          containerPort: 3030
+        env:
+        - name: NODE_DID
+          value: "did:spacekit:storage:gcp-cloud-run"
+        - name: API_PORT
+          value: "3030"
+        - name: DATA_DIR
+          value: "/tmp/storage-data"
+        - name: MAX_STORAGE_BYTES
+          value: "107374182400"  # 100GB
+        resources:
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+        startupProbe:
+          httpGet:
+            path: /api/health
+            port: 3030
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3030
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+  traffic:
+  - percent: 100
+    latestRevision: true
+

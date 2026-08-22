@@ -1,0 +1,27 @@
+# One-node persistent development network.
+version = 3
+profile = "local"
+role = "validator"
+mode = "embedded"
+bind_host = "127.0.0.1"
+
+[admission]
+faucet_enabled = true
+
+[services]
+storage = true
+messaging = true
+compute = true
+gateway = true
+
+[messaging]
+listen_addr = "127.0.0.1:7100"
+bootstrap_peers = ["/ip4/127.0.0.1/tcp/7000"]
+
+[blockchain]
+enabled = true
+persist_state = true
+
+[blockchain.validators]
+self_validate = true
+min_validators = 1

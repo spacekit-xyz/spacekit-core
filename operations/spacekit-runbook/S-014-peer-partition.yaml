@@ -1,0 +1,37 @@
+scenario_id: S-014
+version: 1
+summary: A node loses enough peer connectivity to contribute to quorum failure.
+severity_floor: Critical
+event_queries:
+  - kind: {Consensus: QuorumFailed}
+    min_severity: Critical
+  - kind: {Consensus: ViewChange}
+    min_severity: Warning
+diagnosis_steps:
+  - title: Collect live peer evidence
+    commands:
+      - "spacekit network status --detailed"
+      - "spacekit network peers --detailed"
+      - "spacekit network logs --service messaging --lines 300"
+    expected_outputs:
+      - "Expected peers and bootstrap reachability can be compared across nodes"
+    on_failure:
+      - "An unavailable peer endpoint is unknown state, not proof that peers exist."
+procedures:
+  - id: P-02
+    name: Peer partition diagnosis
+    note: "Run procedures/P-02-peer-partition.md."
+recommended_agent_classification:
+  domain: consensus_tuning
+  intent: hold
+  target: network.connectivity
+  reasoning: >
+    Preserve consensus parameters while operators distinguish a transport
+    partition from local process failure. Connectivity evidence is required
+    before changing bootstrap or firewall configuration.
+escalation:
+  - condition: "Quorum failures continue after network paths recover"
+    action: "Escalate as S-002 consensus stall with compute logs from all validators."
+agent_must_not:
+  - "Admit replacement validators automatically"
+  - "Change genesis or quorum settings"

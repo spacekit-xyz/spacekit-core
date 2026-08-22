@@ -1,0 +1,293 @@
+groups:
+  - name: swtch-compute-node-alerts
+    rules:
+      # System Resource Alerts
+      - alert: HighCPUUsage
+        expr: swtch_cpu_usage_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is {{ $value }}% for more than 5 minutes"
+
+      - alert: CriticalCPUUsage
+        expr: swtch_cpu_usage_percent > 95
+        for: 1m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Critical CPU usage detected"
+          description: "CPU usage is {{ $value }}% for more than 1 minute"
+
+      - alert: HighMemoryUsage
+        expr: swtch_memory_usage_percent > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value }}% for more than 5 minutes"
+
+      - alert: CriticalMemoryUsage
+        expr: swtch_memory_usage_percent > 95
+        for: 1m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Critical memory usage detected"
+          description: "Memory usage is {{ $value }}% for more than 1 minute"
+
+      # Compute Task Alerts
+      - alert: HighTaskFailureRate
+        expr: rate(swtch_tasks_failed_total[5m]) / rate(swtch_tasks_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          component: compute
+        annotations:
+          summary: "High task failure rate detected"
+          description: "Task failure rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+
+      - alert: CriticalTaskFailureRate
+        expr: rate(swtch_tasks_failed_total[5m]) / rate(swtch_tasks_total[5m]) > 0.25
+        for: 1m
+        labels:
+          severity: critical
+          component: compute
+        annotations:
+          summary: "Critical task failure rate detected"
+          description: "Task failure rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+
+      - alert: LongExecutionTime
+        expr: histogram_quantile(0.95, rate(swtch_execution_time_seconds_bucket[5m])) > 300
+        for: 5m
+        labels:
+          severity: warning
+          component: compute
+        annotations:
+          summary: "Long task execution times detected"
+          description: "95th percentile execution time is {{ $value }} seconds"
+
+      - alert: NoTasksProcessed
+        expr: rate(swtch_tasks_completed_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: compute
+        annotations:
+          summary: "No tasks processed recently"
+          description: "No tasks have been completed in the last 10 minutes"
+
+      # Network Alerts
+      - alert: HighNetworkLatency
+        expr: histogram_quantile(0.95, rate(swtch_network_latency_seconds_bucket[5m])) > 1.0
+        for: 3m
+        labels:
+          severity: warning
+          component: network
+        annotations:
+          summary: "High network latency detected"
+          description: "95th percentile network latency is {{ $value }} seconds"
+
+      - alert: CriticalNetworkLatency
+        expr: histogram_quantile(0.95, rate(swtch_network_latency_seconds_bucket[5m])) > 5.0
+        for: 1m
+        labels:
+          severity: critical
+          component: network
+        annotations:
+          summary: "Critical network latency detected"
+          description: "95th percentile network latency is {{ $value }} seconds"
+
+      - alert: LowP2PPeers
+        expr: swtch_p2p_peers < 3
+        for: 5m
+        labels:
+          severity: warning
+          component: network
+        annotations:
+          summary: "Low number of P2P peers"
+          description: "Only {{ $value }} P2P peers connected"
+
+      - alert: NoP2PPeers
+        expr: swtch_p2p_peers == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: network
+        annotations:
+          summary: "No P2P peers connected"
+          description: "No P2P peers are currently connected"
+
+      # Storage Alerts
+      - alert: HighStorageLatency
+        expr: histogram_quantile(0.95, rate(swtch_storage_latency_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "High storage latency detected"
+          description: "95th percentile storage latency is {{ $value }} seconds"
+
+      - alert: HighStorageUtilization
+        expr: swtch_storage_utilization_percent > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "High storage utilization"
+          description: "Storage utilization is {{ $value }}%"
+
+      - alert: CriticalStorageUtilization
+        expr: swtch_storage_utilization_percent > 95
+        for: 1m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Critical storage utilization"
+          description: "Storage utilization is {{ $value }}%"
+
+      # VPoS Alerts
+      - alert: LowReputationScore
+        expr: swtch_reputation_score < 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: vpos
+        annotations:
+          summary: "Low reputation score"
+          description: "Node reputation score is {{ $value }}"
+
+      - alert: CriticalReputationScore
+        expr: swtch_reputation_score < 0.2
+        for: 5m
+        labels:
+          severity: critical
+          component: vpos
+        annotations:
+          summary: "Critical reputation score"
+          description: "Node reputation score is critically low at {{ $value }}"
+
+      - alert: SlowVPoSVerification
+        expr: histogram_quantile(0.95, rate(swtch_vpos_verification_time_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          component: vpos
+        annotations:
+          summary: "Slow VPoS verification times"
+          description: "95th percentile VPoS verification time is {{ $value }} seconds"
+
+      # Cost Alerts
+      - alert: HighComputeCost
+        expr: rate(swtch_compute_cost_usd_total[1h]) > 10
+        for: 15m
+        labels:
+          severity: warning
+          component: cost
+        annotations:
+          summary: "High compute costs detected"
+          description: "Compute costs are ${{ $value }}/hour"
+
+      - alert: CriticalComputeCost
+        expr: rate(swtch_compute_cost_usd_total[1h]) > 50
+        for: 5m
+        labels:
+          severity: critical
+          component: cost
+        annotations:
+          summary: "Critical compute costs detected"
+          description: "Compute costs are ${{ $value }}/hour"
+
+      - alert: HighStorageCost
+        expr: rate(swtch_storage_cost_usd_total[1h]) > 5
+        for: 15m
+        labels:
+          severity: warning
+          component: cost
+        annotations:
+          summary: "High storage costs detected"
+          description: "Storage costs are ${{ $value }}/hour"
+
+      # Service Health Alerts
+      - alert: ServiceDown
+        expr: up{job=~"swtch-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: "{{ $labels.job }} service is down"
+          description: "{{ $labels.job }} service has been down for more than 1 minute"
+
+      - alert: HighErrorRate
+        expr: rate(swtch_errors_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          component: service
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors/second over the last 5 minutes"
+
+      # GPU Alerts (if applicable)
+      - alert: HighGPUUtilization
+        expr: swtch_gpu_utilization_percent > 90
+        for: 10m
+        labels:
+          severity: warning
+          component: gpu
+        annotations:
+          summary: "High GPU utilization"
+          description: "GPU utilization is {{ $value }}% for more than 10 minutes"
+
+      - alert: GPUMemoryHigh
+        expr: nvidia_ml_py_memory_used_bytes / nvidia_ml_py_memory_total_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: gpu
+        annotations:
+          summary: "High GPU memory usage"
+          description: "GPU memory usage is {{ $value | humanizePercentage }}"
+
+  - name: swtch-business-alerts
+    rules:
+      # Business metric alerts
+      - alert: LowTaskThroughput
+        expr: rate(swtch_tasks_completed_total[10m]) < 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "Low task throughput"
+          description: "Task completion rate is {{ $value }} tasks/second"
+
+      - alert: RevenueAlert
+        expr: rate(swtch_compute_cost_usd_total[24h]) < 1
+        for: 1h
+        labels:
+          severity: info
+          component: business
+        annotations:
+          summary: "Low daily revenue"
+          description: "Daily revenue is projected to be ${{ $value }}"
+
+      - alert: EfficiencyDrop
+        expr: swtch_reputation_score < 0.7 and rate(swtch_tasks_failed_total[1h]) / rate(swtch_tasks_total[1h]) > 0.05
+        for: 30m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "Node efficiency dropping"
+          description: "Node reputation ({{ $value }}) and high failure rate indicate efficiency issues" 

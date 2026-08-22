@@ -1,0 +1,101 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # SWTCH Compute Node metrics
+  - job_name: 'swtch-compute-node'
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    honor_labels: true
+    
+    # Add labels for better organization
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 'localhost:9090'
+    
+    # Metric relabeling
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'swtch_(.+)'
+        target_label: '__name__'
+        replacement: '${1}'
+
+  # System metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+    scrape_interval: 15s
+
+  # GPU metrics (if available)
+  - job_name: 'nvidia-gpu'
+    static_configs:
+      - targets: ['localhost:9445']
+    scrape_interval: 30s
+
+  # Storage metrics
+  - job_name: 'swtch-storage-node'
+    static_configs:
+      - targets: ['localhost:9091']
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+
+  # Network metrics
+  - job_name: 'swtch-network-metrics'
+    static_configs:
+      - targets: ['localhost:9092']
+    scrape_interval: 30s
+
+  # P2P service discovery metrics
+  - job_name: 'swtch-p2p-discovery'
+    static_configs:
+      - targets: ['localhost:9093']
+    scrape_interval: 60s
+
+  # Cross-chain bridge metrics
+  - job_name: 'swtch-layerzero-bridge'
+    static_configs:
+      - targets: ['localhost:9094']
+    scrape_interval: 60s
+
+  # VPoS metrics
+  - job_name: 'swtch-vpos'
+    static_configs:
+      - targets: ['localhost:9095']
+    scrape_interval: 30s
+
+  # Cost analysis metrics
+  - job_name: 'swtch-cost-analysis'
+    static_configs:
+      - targets: ['localhost:9096']
+    scrape_interval: 300s  # 5 minutes for cost analysis
+
+# Remote write configuration for long-term storage
+# remote_write:
+#   - url: "https://prometheus-remote-write-endpoint.example.com/write"
+#     basic_auth:
+#       username: "your-username"
+#       password: "your-password"
+
+# Global external labels
+external_labels:
+  cluster: 'swtch-compute-cluster'
+  environment: 'production' 

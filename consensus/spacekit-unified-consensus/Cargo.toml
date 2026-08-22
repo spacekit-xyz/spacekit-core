@@ -1,0 +1,26 @@
+[package]
+name = "spacekit-unified-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["SpaceKit Labs <team@spacekit.xyz>"]
+description = "Facade for SpaceKit unified consensus: reputation-weighted BFT API over CoordinatorHandle. Standalone in count mode; optional spacetime rotor paths (feature spacetime). Post-fork: authoritative reputation threshold."
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/consensus/spacekit-unified-consensus"
+[features]
+default = ["std", "serde"]
+std = []
+serde = ["dep:serde"]
+# Wire the spacetime extension through the facade. Enabled by default.
+spacetime = ["dep:spacekit-spacetime-consensus"]
+# Enable the optional event-logging hook so the facade emits log events at
+# integration points.
+log = ["dep:spacekit-log"]
+
+[dependencies]
+alloy-primitives = { version = "1.0", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+spacekit-spacetime-consensus = { path = "../spacekit-spacetime-consensus", optional = true, default-features = false, features = ["std", "serde"] }
+spacekit-log = { path = "../../observability/spacekit-log", optional = true }
+
+[dev-dependencies]

@@ -1,0 +1,92 @@
+scenario_id: S-005
+version: 1
+summary: Node loaded a brain whose hash doesn't match the network-canonical model_hash, OR storage served a brain with bad signature.
+severity_floor: Critical
+
+event_queries:
+  - kind: {Agent: BrainHashMismatch}
+    min_severity: Critical
+  - kind: {Agent: InferenceModelMismatch}
+    min_severity: Critical
+
+diagnosis_steps:
+  - title: Determine the mismatch type
+    commands:
+      - "spacekit-cli agent brain-status"
+    expected_outputs:
+      - "Reports BOTH local on-disk brain hash AND network-canonical hash"
+    interpretation:
+      - "On-disk hash matches network: this node is fine. Mismatch is during inference against a remote model."
+      - "On-disk hash doesn't match network: this node fetched the wrong brain."
+      - "Network hash unstable (changes between queries): storage node compromised or network forking."
+
+  - title: Check signature on the on-disk brain
+    commands:
+      - "spacekit-cli agent verify-signature"
+    expected_outputs:
+      - "Signature by genesis-authority key: VALID"
+    on_failure:
+      - "ALERT: brain was tampered with. The signature check is the last line of defense."
+      - "URGENT: do NOT continue operating with this brain. Procedure P-03 (force refresh) WITH verification."
+
+  - title: Check whether other nodes show the same mismatch
+    commands:
+      - "spacekit-cli p2p brain-hashes --sample 20"
+    expected_outputs:
+      - "Majority of peers report the same network-canonical hash"
+    interpretation:
+      - "Unanimous agreement (incl. this node): no issue, this is a test trigger."
+      - "Majority agreement excluding this node: this node has the wrong brain (procedure P-03)."
+      - "No agreement across peers: NETWORK-WIDE INCIDENT. Storage compromised or ratification activated incorrectly."
+
+  - title: Check most recent brain ratification status
+    commands:
+      - "spacekit-cli ratification recent --action growformer.model_hash"
+    expected_outputs:
+      - "A model_hash ratification recently activated"
+    interpretation:
+      - "Recent activation + this node still on old hash: node missed activation. P-03 refresh."
+      - "Recent activation + storage serving wrong hash: storage failed to upload new brain."
+      - "No recent activation but hash mismatch: something is wrong outside the documented flow."
+
+procedures:
+  - id: P-03-ref
+    name: Force brain refresh
+    note: "See procedures/P-03-force-brain-refresh.md."
+
+  - id: P-11
+    name: Storage node anomaly response
+    steps:
+      - "Confirm network majority agrees on canonical hash"
+      - "Compare storage-served hash against majority"
+      - "If storage is serving the wrong hash: contact storage operator IMMEDIATELY"
+      - "Pause node ratification voting until resolved"
+
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: network_attack  # if the mismatch is network-wide
+  target: infrastructure
+  reasoning: >
+    A brain hash mismatch is one of the highest-severity events because
+    it indicates either compromised storage (supply-chain risk) or
+    failed activation (which can desynchronize the network's behavior).
+    Default classification is network_attack at the infrastructure
+    target. The agent must NOT continue producing inferences from the
+    mismatched brain — refusal is the safe behavior.
+
+# This scenario directly triggers regime change.
+followup_scenarios:
+  - "S-010 if regime fails to transition"
+
+escalation:
+  - condition: "Single node mismatch resolved by P-03 refresh"
+    action: "No further escalation; document in daily review."
+  - condition: "Multiple nodes report mismatch"
+    action: "Page primary on-call; activate incident response; halt all ratification activity."
+  - condition: "Storage operator unreachable AND mismatch persists"
+    action: "Activate disaster-recovery contact list; consider emergency network halt."
+
+agent_must_not:
+  - "Continue producing inferences from a brain with mismatched hash"
+  - "Auto-activate a ratification that would change model_hash"
+  - "Trust outputs from peers whose brain hash differs from local"

@@ -1,0 +1,7 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/foundation/spacekit-primitives/src/v1/runtime"
+[dependencies]

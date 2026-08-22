@@ -1,0 +1,8 @@
+.DS_Store
+
+/files
+/keys
+/out
+/target
+src/**/target/
+/scratch/

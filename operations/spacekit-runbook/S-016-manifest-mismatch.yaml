@@ -1,0 +1,35 @@
+scenario_id: S-016
+version: 1
+summary: A network manifest fails signature, genesis, protocol, chain, or admission verification.
+severity_floor: Critical
+event_queries:
+  - kind: {Spacetime: AttestationMismatchDetected}
+    min_severity: Critical
+  - kind: {Agent: BrainHashMismatch}
+    min_severity: Critical
+diagnosis_steps:
+  - title: Verify the exact configured manifest
+    commands:
+      - "spacekit network config show"
+      - "spacekit network manifest verify /absolute/path/to/manifest.json"
+    expected_outputs:
+      - "Approved signature, genesis, protocol, chain, and role grants all verify"
+    on_failure:
+      - "Keep the node stopped and preserve the suspect file."
+procedures:
+  - id: P-04
+    name: Manifest integrity response
+    note: "Run procedures/P-04-manifest-integrity.md."
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: network_attack
+  target: network.manifest
+  reasoning: >
+    A manifest mismatch is a trust-boundary failure until an operator proves
+    it is an authorized release mismatch. Startup must remain fail-closed.
+escalation:
+  - condition: "Multiple nodes received the same unapproved key or manifest"
+    action: "Activate supply-chain incident response and freeze joins."
+agent_must_not:
+  - "Trust a replacement key embedded only in the suspect manifest"
+  - "Re-sign or edit the manifest automatically"

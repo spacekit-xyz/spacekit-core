@@ -1,0 +1,62 @@
+[package]
+name = "spacekit-primitives"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/foundation/spacekit-primitives"
+[features]
+default = ["std", "quantum"]
+std = [
+    "aes-gcm", "aes-gcm/std", "chrono", "uuid", "wee_alloc", "tokio", "log",
+    "alloy", "alloy-primitives", "bip39", "chacha20poly1305", "ecies", "hex",
+    "rand", "secp256k1", "tiny-keccak", "pbkdf2", "sha3",
+    "clap", "serde_json", "sled", "thiserror", "ed25519-dalek", "bs58",
+]
+no_std = []
+quantum = ["oqs", "pqcrypto-sphincsplus", "pqcrypto-traits"]
+secrets-core = ["ml-kem", "ml-dsa", "slh-dsa", "hkdf", "zeroize", "rand_core", "getrandom", "aes-gcm"]
+
+[dependencies]
+# no_std-compatible (used by secrets-core)
+anyhow = { version = "1.0", default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+sha2 = "0.10.8"
+aes-gcm = { version = "0.10.3", optional = true, default-features = false, features = ["aes", "alloc"] }
+
+# std-only (optional, enabled by "std")
+chrono = { version = "0.4.39", optional = true, features = ["serde"] }
+uuid = { version = "1.11.0", optional = true, features = ["serde", "v4"] }
+wee_alloc = { version = "0.4.5", optional = true }
+tokio = { version = "1.0", optional = true, features = ["full"] }
+log = { version = "0.4", optional = true }
+alloy = { version = "1.0", optional = true, features = ["providers", "network", "contract", "sol-types", "signers", "signer-local", "rpc-types"] }
+alloy-primitives = { version = "1.4.1", optional = true, features = ["serde"] }
+bip39 = { version = "2.1.0", optional = true, features = ["rand"] }
+chacha20poly1305 = { version = "0.10.1", optional = true }
+ecies = { version = "0.2.7", optional = true }
+hex = { version = "0.4", optional = true }
+rand = { version = "0.8.5", optional = true }
+secp256k1 = { version = "0.30.0", optional = true, features = ["rand"] }
+tiny-keccak = { version = "2.0.2", optional = true, features = ["keccak"] }
+pbkdf2 = { version = "0.12", optional = true }
+sha3 = { version = "0.10", optional = true }
+clap = { version = "4.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0.134", optional = true, default-features = false, features = ["alloc"] }
+sled = { version = "0.34.7", optional = true }
+thiserror = { version = "2.0.11", optional = true }
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+bs58 = { version = "0.4.0", optional = true }
+
+# Quantum crypto (optional)
+oqs = { version = "0.9.0", optional = true, features = ["vendored", "bike", "classic_mceliece", "hqc", "kyber", "dilithium", "frodokem", "ntruprime"] }
+pqcrypto-sphincsplus = { version = "0.7.2", optional = true }
+pqcrypto-traits = { version = "0.3.5", optional = true }
+
+# FIPS 203/204/205 secrets-core (optional)
+ml-kem = { version = "0.3.0-rc.0", optional = true, features = ["getrandom", "zeroize"] }
+ml-dsa = { version = "0.1.0-rc.8", optional = true }
+slh-dsa = { version = "0.2.0-rc.4", optional = true }
+hkdf = { version = "0.12", optional = true }
+zeroize = { version = "1", optional = true, features = ["derive"] }
+rand_core = { version = "0.10", optional = true }
+getrandom = { version = "0.3", optional = true }

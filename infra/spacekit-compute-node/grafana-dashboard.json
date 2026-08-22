@@ -1,0 +1,510 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "SWTCH Compute Node - Production Metrics Dashboard",
+    "tags": ["swtch", "compute", "production", "metrics"],
+    "style": "dark",
+    "timezone": "browser",
+    "refresh": "30s",
+    "schemaVersion": 30,
+    "version": 1,
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+      "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "System Overview",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "swtch_cpu_usage_percent",
+            "legendFormat": "CPU Usage %",
+            "refId": "A"
+          },
+          {
+            "expr": "swtch_memory_usage_percent",
+            "legendFormat": "Memory Usage %",
+            "refId": "B"
+          },
+          {
+            "expr": "swtch_active_connections",
+            "legendFormat": "Active Connections",
+            "refId": "C"
+          },
+          {
+            "expr": "swtch_p2p_peers",
+            "legendFormat": "P2P Peers",
+            "refId": "D"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "custom": {"displayMode": "list", "orientation": "horizontal"},
+            "mappings": [],
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 70},
+                {"color": "red", "value": 90}
+              ]
+            },
+            "unit": "percent"
+          }
+        },
+        "options": {
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "orientation": "horizontal",
+          "textMode": "auto",
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "auto"
+        }
+      },
+      {
+        "id": 2,
+        "title": "Task Execution Metrics",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(swtch_tasks_total[5m])",
+            "legendFormat": "Tasks Submitted/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_tasks_completed_total[5m])",
+            "legendFormat": "Tasks Completed/sec",
+            "refId": "B"
+          },
+          {
+            "expr": "rate(swtch_tasks_failed_total[5m])",
+            "legendFormat": "Tasks Failed/sec",
+            "refId": "C"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "axisLabel": "",
+              "axisPlacement": "auto",
+              "barAlignment": 0,
+              "drawStyle": "line",
+              "fillOpacity": 10,
+              "gradientMode": "none",
+              "hideFrom": {"legend": false, "tooltip": false, "vis": false},
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "pointSize": 5,
+              "scaleDistribution": {"type": "linear"},
+              "showPoints": "never",
+              "spanNulls": false,
+              "stacking": {"group": "A", "mode": "none"},
+              "thresholdsStyle": {"mode": "off"}
+            },
+            "unit": "reqps"
+          }
+        },
+        "options": {
+          "legend": {"calcs": [], "displayMode": "list", "placement": "bottom"},
+          "tooltip": {"mode": "multi", "sort": "none"}
+        }
+      },
+      {
+        "id": 3,
+        "title": "Execution Time Distribution",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(swtch_execution_time_seconds_bucket[5m]))",
+            "legendFormat": "50th percentile",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(swtch_execution_time_seconds_bucket[5m]))",
+            "legendFormat": "95th percentile",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(swtch_execution_time_seconds_bucket[5m]))",
+            "legendFormat": "99th percentile",
+            "refId": "C"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Network Performance",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(swtch_network_latency_seconds_bucket[5m]))",
+            "legendFormat": "Network Latency (95th)",
+            "refId": "A"
+          },
+          {
+            "expr": "swtch_network_throughput_bps / 1024 / 1024",
+            "legendFormat": "Throughput (MB/s)",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Storage Metrics",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(swtch_storage_operations_total[5m])",
+            "legendFormat": "Storage Operations/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "swtch_storage_utilization_percent",
+            "legendFormat": "Storage Utilization %",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(swtch_storage_latency_seconds_bucket[5m]))",
+            "legendFormat": "Storage Latency (95th)",
+            "refId": "C"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"}
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Cost Analysis",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "rate(swtch_compute_cost_usd_total[1h])",
+            "legendFormat": "Compute Cost/hour",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_storage_cost_usd_total[1h])",
+            "legendFormat": "Storage Cost/hour",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "unit": "currencyUSD",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 5},
+                {"color": "red", "value": 20}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "title": "VPoS Reputation & Verification",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 24},
+        "targets": [
+          {
+            "expr": "swtch_reputation_score",
+            "legendFormat": "Reputation Score",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_vpos_proofs_generated_total[5m])",
+            "legendFormat": "VPoS Proofs/sec",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "min": 0,
+            "max": 1
+          }
+        }
+      },
+      {
+        "id": 8,
+        "title": "GPU Utilization",
+        "type": "gauge",
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 24},
+        "targets": [
+          {
+            "expr": "swtch_gpu_utilization_percent",
+            "legendFormat": "GPU Utilization",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 70},
+                {"color": "red", "value": 90}
+              ]
+            },
+            "min": 0,
+            "max": 100
+          }
+        },
+        "options": {
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "orientation": "auto",
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        }
+      },
+      {
+        "id": 9,
+        "title": "Error Rate Analysis",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 30},
+        "targets": [
+          {
+            "expr": "rate(swtch_errors_total[5m])",
+            "legendFormat": "Error Rate",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_tasks_failed_total[5m]) / rate(swtch_tasks_total[5m]) * 100",
+            "legendFormat": "Task Failure Rate %",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 10,
+        "title": "Active Alerts",
+        "type": "table",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 30},
+        "targets": [
+          {
+            "expr": "ALERTS{alertstate=\"firing\"}",
+            "legendFormat": "{{alertname}} - {{severity}}",
+            "refId": "A",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "custom": {
+              "align": "auto",
+              "displayMode": "auto"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 1},
+                {"color": "red", "value": 3}
+              ]
+            }
+          }
+        },
+        "options": {
+          "showHeader": true
+        }
+      },
+      {
+        "id": 11,
+        "title": "Resource Utilization Trends",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 36},
+        "targets": [
+          {
+            "expr": "swtch_cpu_usage_percent",
+            "legendFormat": "CPU Usage %",
+            "refId": "A"
+          },
+          {
+            "expr": "swtch_memory_usage_percent",
+            "legendFormat": "Memory Usage %",
+            "refId": "B"
+          },
+          {
+            "expr": "swtch_storage_utilization_percent",
+            "legendFormat": "Storage Utilization %",
+            "refId": "C"
+          },
+          {
+            "expr": "swtch_gpu_utilization_percent",
+            "legendFormat": "GPU Utilization %",
+            "refId": "D"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "percent",
+            "min": 0,
+            "max": 100
+          }
+        }
+      },
+      {
+        "id": 12,
+        "title": "Cross-Chain Bridge Activity",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 44},
+        "targets": [
+          {
+            "expr": "rate(swtch_bridge_transfers_total[5m])",
+            "legendFormat": "Bridge Transfers/sec",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_cross_chain_tasks_total[5m])",
+            "legendFormat": "Cross-Chain Tasks/sec",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "reqps"
+          }
+        }
+      },
+      {
+        "id": 13,
+        "title": "P2P Service Discovery",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 44},
+        "targets": [
+          {
+            "expr": "swtch_discovered_services",
+            "legendFormat": "Discovered Services",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(swtch_service_queries_total[5m])",
+            "legendFormat": "Service Queries/sec",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"}
+          }
+        }
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "query": "label_values(swtch_cpu_usage_percent, instance)",
+          "current": {"selected": false, "text": "All", "value": "$__all"},
+          "options": [],
+          "refresh": 1,
+          "includeAll": true,
+          "multi": true,
+          "allValue": ".*"
+        },
+        {
+          "name": "job",
+          "type": "query",
+          "query": "label_values(up, job)",
+          "current": {"selected": false, "text": "All", "value": "$__all"},
+          "options": [],
+          "refresh": 1,
+          "includeAll": true,
+          "multi": true,
+          "allValue": ".*"
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "name": "Alerts",
+          "enable": true,
+          "iconColor": "red",
+          "lineColor": "red",
+          "query": "ALERTS{alertstate=\"firing\"}",
+          "textFormat": "{{alertname}}: {{description}}",
+          "titleFormat": "Alert: {{alertname}}",
+          "useValueForTime": false
+        },
+        {
+          "name": "Deployments",
+          "enable": true,
+          "iconColor": "blue",
+          "lineColor": "blue",
+          "query": "swtch_deployment_events",
+          "textFormat": "{{description}}",
+          "titleFormat": "Deployment: {{version}}",
+          "useValueForTime": false
+        }
+      ]
+    },
+    "links": [
+      {
+        "title": "Prometheus",
+        "url": "http://localhost:9090",
+        "type": "link",
+        "icon": "external link",
+        "tooltip": "Open Prometheus UI",
+        "targetBlank": true
+      },
+      {
+        "title": "SWTCH Documentation",
+        "url": "https://docs.swtch.network",
+        "type": "link",
+        "icon": "doc",
+        "tooltip": "SWTCH Network Documentation",
+        "targetBlank": true
+      }
+    ]
+  }
+} 

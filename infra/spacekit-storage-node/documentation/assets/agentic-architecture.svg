@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 880" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="title desc">
+  <title id="title">SpaceKit Storage Node - Agentic Architecture</title>
+  <desc id="desc">Sequence-and-flow diagram of the agentic primitives. Agents call HTTP or MCP into the Storage Facade, which threads requests through the IdempotencyCache, DidRateLimiter, TransactionManager (Serializable via global commit lock), SandboxManager (TTL-bounded ephemeral workspaces with conflict policy and dry-run), and publishes commit/rollback/sandbox events to the ChangeFeed. The change feed pushes back to subscribed agents over Server-Sent Events with Last-Event-ID resume backed by an on-disk JSONL log. The runtime config flag enable_real_transactions defaults to false in this release for a safer rollout.</desc>
+
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0b0f1a"/>
+      <stop offset="100%" stop-color="#11172a"/>
+    </linearGradient>
+    <linearGradient id="facadeGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="agentGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3a8a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#10b981"/>
+    </marker>
+    <marker id="arrowPink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ec4899"/>
+    </marker>
+  </defs>
+
+  <rect width="1180" height="880" fill="url(#bgGrad)"/>
+
+  <text x="590" y="40" text-anchor="middle" fill="#e2e8f0" font-size="24" font-weight="700">Agentic Architecture (Phase 0 / 1 / 3 / 4 / 5)</text>
+  <text x="590" y="64" text-anchor="middle" fill="#94a3b8" font-size="13">Multi-model ACID / ephemeral sandboxes / MCP tools / idempotency / per-DID rate limit / change feed</text>
+
+  <!-- Left column: Agents -->
+  <g transform="translate(40, 110)">
+    <text x="0" y="0" fill="#94a3b8" font-size="12" font-weight="600" letter-spacing="2">AGENTS</text>
+
+    <g transform="translate(0, 14)">
+      <rect width="240" height="86" rx="12" fill="url(#agentGrad)" stroke="#3b82f6" stroke-width="1.5"/>
+      <text x="120" y="26" text-anchor="middle" fill="#e2e8f0" font-size="14" font-weight="700">HTTP Agent</text>
+      <text x="120" y="46" text-anchor="middle" fill="#cbd5e1" font-size="11">POST /api/transactions</text>
+      <text x="120" y="62" text-anchor="middle" fill="#cbd5e1" font-size="11">POST /api/sandboxes</text>
+      <text x="120" y="78" text-anchor="middle" fill="#cbd5e1" font-size="11">GET  /api/changes (SSE)</text>
+    </g>
+
+    <g transform="translate(0, 120)">
+      <rect width="240" height="100" rx="12" fill="url(#agentGrad)" stroke="#a855f7" stroke-width="1.5"/>
+      <text x="120" y="26" text-anchor="middle" fill="#e2e8f0" font-size="14" font-weight="700">MCP Agent (stdio)</text>
+      <text x="120" y="46" text-anchor="middle" fill="#cbd5e1" font-size="11">tools/list  +  tools/call</text>
+      <text x="120" y="62" text-anchor="middle" fill="#cbd5e1" font-size="11">tx_*.v1  +  sandbox_*.v1</text>
+      <text x="120" y="78" text-anchor="middle" fill="#cbd5e1" font-size="11">graph_traverse.v1</text>
+      <text x="120" y="92" text-anchor="middle" fill="#94a3b8" font-size="10">deterministic idempotency keys</text>
+    </g>
+
+    <g transform="translate(0, 240)">
+      <rect width="240" height="120" rx="12" fill="#0f172a" stroke="#475569" stroke-width="1"/>
+      <text x="120" y="22" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="700" letter-spacing="2">REQUEST HEADERS</text>
+      <text x="14" y="44" fill="#e2e8f0" font-size="11">- Authorization: DID &lt;did&gt;</text>
+      <text x="14" y="62" fill="#e2e8f0" font-size="11">- Idempotency-Key: &lt;ulid&gt;</text>
+      <text x="14" y="80" fill="#e2e8f0" font-size="11">- X-Sandbox-Id: &lt;id&gt;</text>
+      <text x="14" y="98" fill="#e2e8f0" font-size="11">- If-Match: &lt;etag&gt; (docs)</text>
+      <text x="14" y="114" fill="#e2e8f0" font-size="11">- Last-Event-ID: &lt;seq&gt; (SSE)</text>
+    </g>
+  </g>
+
+  <line x1="280" y1="160" x2="380" y2="320" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="295" y="220" fill="#94a3b8" font-size="11">request</text>
+  <text x="295" y="234" fill="#94a3b8" font-size="11">+ headers</text>
+
+  <line x1="380" y1="380" x2="280" y2="240" stroke="#ec4899" stroke-width="2" marker-end="url(#arrowPink)"/>
+  <text x="220" y="290" fill="#f9a8d4" font-size="11">SSE events</text>
+  <text x="220" y="304" fill="#f9a8d4" font-size="11">resume by seq</text>
+
+  <!-- Center column: Storage Facade -->
+  <g transform="translate(360, 110)">
+    <rect width="460" height="640" rx="16" fill="url(#facadeGrad)" stroke="#a78bfa" stroke-width="2"/>
+    <text x="230" y="32" text-anchor="middle" fill="#fff" font-size="18" font-weight="700">Storage Facade</text>
+    <text x="230" y="54" text-anchor="middle" fill="#ede9fe" font-size="11">src/storage_facade.rs - the seam every read/write goes through</text>
+    <text x="230" y="74" text-anchor="middle" fill="#ede9fe" font-size="11">runtime flag: enable_real_transactions = false (safe default)</text>
+
+    <g transform="translate(20, 100)">
+      <rect width="420" height="84" rx="10" fill="rgba(15,23,42,0.55)" stroke="#06b6d4" stroke-width="1.5"/>
+      <text x="14" y="22" fill="#67e8f9" font-size="12" font-weight="700">IdempotencyCache</text>
+      <text x="14" y="42" fill="#e2e8f0" font-size="10.5">- BLAKE3 body fingerprint, 422 on key collision + body mismatch</text>
+      <text x="14" y="58" fill="#e2e8f0" font-size="10.5">- In-flight Notify block-and-return (default 30s, max 120s)</text>
+      <text x="14" y="74" fill="#e2e8f0" font-size="10.5">- Per-route TTL, 24h default, 7d max, cancel on handler error</text>
+    </g>
+
+    <g transform="translate(20, 200)">
+      <rect width="420" height="62" rx="10" fill="rgba(15,23,42,0.55)" stroke="#60a5fa" stroke-width="1.5"/>
+      <text x="14" y="22" fill="#93c5fd" font-size="12" font-weight="700">DidRateLimiter</text>
+      <text x="14" y="42" fill="#e2e8f0" font-size="10.5">- Token bucket per DID (refill_per_sec, capacity)</text>
+      <text x="14" y="56" fill="#e2e8f0" font-size="10.5">- 429 Too Many Requests + Retry-After on throttle</text>
+    </g>
+
+    <g transform="translate(20, 278)">
+      <rect width="420" height="116" rx="10" fill="rgba(15,23,42,0.55)" stroke="#10b981" stroke-width="1.5"/>
+      <text x="14" y="22" fill="#6ee7b7" font-size="12" font-weight="700">TransactionManager</text>
+      <text x="14" y="42" fill="#e2e8f0" font-size="10.5">- BEGIN -&gt; record -&gt; COMMIT / ROLLBACK / SAVEPOINT</text>
+      <text x="14" y="58" fill="#e2e8f0" font-size="10.5">- Serializable on the write path (global commit Mutex)</text>
+      <text x="14" y="74" fill="#e2e8f0" font-size="10.5">- Real apply / revert against Database, Vector, FTS, Documents</text>
+      <text x="14" y="90" fill="#e2e8f0" font-size="10.5">- Per-step trace at /api/transactions/{id}/trace (subsystem,ms,ok)</text>
+      <text x="14" y="106" fill="#e2e8f0" font-size="10.5">- Lock-free reads against most recently committed snapshot</text>
+    </g>
+
+    <g transform="translate(20, 410)">
+      <rect width="420" height="116" rx="10" fill="rgba(15,23,42,0.55)" stroke="#f59e0b" stroke-width="1.5"/>
+      <text x="14" y="22" fill="#fbbf24" font-size="12" font-weight="700">SandboxManager</text>
+      <text x="14" y="42" fill="#e2e8f0" font-size="10.5">- TTL-bounded ephemeral workspace, X-Sandbox-Id header</text>
+      <text x="14" y="58" fill="#e2e8f0" font-size="10.5">- Conflict policy: 3-way merge / optimistic-reject / LWW / If-Match</text>
+      <text x="14" y="74" fill="#e2e8f0" font-size="10.5">- Default: reject + 409 with structured diff</text>
+      <text x="14" y="90" fill="#e2e8f0" font-size="10.5">- ?dry_run=true preview commit, per-step quotas</text>
+      <text x="14" y="106" fill="#e2e8f0" font-size="10.5">- bytes_written / vector_ops / fact_puts / background reaper</text>
+    </g>
+
+    <g transform="translate(20, 542)">
+      <rect width="420" height="86" rx="10" fill="rgba(15,23,42,0.55)" stroke="#ec4899" stroke-width="1.5"/>
+      <text x="14" y="22" fill="#f9a8d4" font-size="12" font-weight="700">ChangeFeed</text>
+      <text x="14" y="42" fill="#e2e8f0" font-size="10.5">- Monotonic seq, in-memory ring + disk JSONL (fsync per append)</text>
+      <text x="14" y="58" fill="#e2e8f0" font-size="10.5">- Per-subscriber bounded mpsc, disconnect-on-overflow (no drops)</text>
+      <text x="14" y="74" fill="#e2e8f0" font-size="10.5">- Subscribers MUST resume by seq (Last-Event-ID)</text>
+    </g>
+  </g>
+
+  <line x1="820" y1="180" x2="900" y2="180" stroke="#10b981" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <line x1="820" y1="270" x2="900" y2="270" stroke="#10b981" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <line x1="820" y1="360" x2="900" y2="360" stroke="#10b981" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <line x1="820" y1="450" x2="900" y2="450" stroke="#10b981" stroke-width="2" marker-end="url(#arrowGreen)"/>
+
+  <!-- Right column: Subsystems enrolled in tx -->
+  <g transform="translate(900, 110)">
+    <text x="0" y="0" fill="#94a3b8" font-size="12" font-weight="600" letter-spacing="2">ENROLLED IN TX</text>
+
+    <g transform="translate(0, 14)">
+      <rect width="240" height="74" rx="10" fill="#1e293b" stroke="#10b981" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="700">Database (relational)</text>
+      <text x="120" y="42" text-anchor="middle" fill="#94a3b8" font-size="10">users / files / facts / grants</text>
+      <text x="120" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">apply: Database::insert/update</text>
+      <text x="120" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">revert: from captured old_value</text>
+    </g>
+
+    <g transform="translate(0, 104)">
+      <rect width="240" height="74" rx="10" fill="#1e293b" stroke="#10b981" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="700">Document store</text>
+      <text x="120" y="42" text-anchor="middle" fill="#94a3b8" font-size="10">DID-scoped collections</text>
+      <text x="120" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">apply: upsert_document</text>
+      <text x="120" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">revert: restore prior or delete</text>
+    </g>
+
+    <g transform="translate(0, 194)">
+      <rect width="240" height="74" rx="10" fill="#1e293b" stroke="#10b981" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="700">VectorIndex</text>
+      <text x="120" y="42" text-anchor="middle" fill="#94a3b8" font-size="10">cosine similarity / embeddings</text>
+      <text x="120" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">apply: add_embedding callback</text>
+      <text x="120" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">revert: re-add prior or remove</text>
+    </g>
+
+    <g transform="translate(0, 284)">
+      <rect width="240" height="74" rx="10" fill="#1e293b" stroke="#10b981" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="700">FullTextIndex</text>
+      <text x="120" y="42" text-anchor="middle" fill="#94a3b8" font-size="10">TF-IDF inverted index</text>
+      <text x="120" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">apply: index_document callback</text>
+      <text x="120" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">revert: remove_document</text>
+    </g>
+
+    <g transform="translate(0, 374)">
+      <rect width="240" height="74" rx="10" fill="#1e293b" stroke="#475569" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="700">Repo / CAS</text>
+      <text x="120" y="42" text-anchor="middle" fill="#94a3b8" font-size="10">blobs / commits / refs</text>
+      <text x="120" y="58" text-anchor="middle" fill="#94a3b8" font-size="10">3-way merge via spacekit-diff</text>
+      <text x="120" y="70" text-anchor="middle" fill="#94a3b8" font-size="10">FactPackage dependencies DAG</text>
+    </g>
+
+    <g transform="translate(0, 470)">
+      <rect width="240" height="100" rx="10" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+      <text x="120" y="24" text-anchor="middle" fill="#cbd5e1" font-size="11" font-weight="700" letter-spacing="2">PERSISTENCE</text>
+      <text x="14" y="44" fill="#94a3b8" font-size="10">database.json (encrypted)</text>
+      <text x="14" y="58" fill="#94a3b8" font-size="10">facts/ / blobs/ / WAL / backups/</text>
+      <text x="14" y="72" fill="#94a3b8" font-size="10">change_log.jsonl / resume by seq</text>
+      <text x="14" y="86" fill="#94a3b8" font-size="10">AES-256-GCM / BLAKE3 integrity</text>
+    </g>
+  </g>
+
+  <!-- Bottom: rollout flag + observability tools -->
+  <g transform="translate(40, 770)">
+    <rect width="1100" height="80" rx="12" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+    <text x="20" y="26" fill="#cbd5e1" font-size="12" font-weight="700" letter-spacing="2">ROLLOUT &amp; OBSERVABILITY</text>
+    <text x="20" y="48" fill="#e2e8f0" font-size="11">Runtime flag SPACEKIT_ENABLE_REAL_TRANSACTIONS=true (default false) toggles real apply/revert without changing the wire surface.</text>
+    <text x="20" y="64" fill="#e2e8f0" font-size="11">Observability: GET /api/transactions/{id}/trace + GET /api/sandboxes/{id}/journal + MCP tools tx_trace.v1 / sandbox_journal.v1 / graph_traverse.v1</text>
+  </g>
+</svg>

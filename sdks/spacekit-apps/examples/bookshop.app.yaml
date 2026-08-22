@@ -1,0 +1,191 @@
+# Bookshop: Spacekit app specification (complete example)
+# Conforms to: Spacekit Specification v0.2
+# The base (web) bookshop: off-chain data, a fulfillment saga, and a storefront.
+# Its decentralized sibling is bookshop.dapp.yaml.
+
+spacekit: "0.2"
+
+app:
+  name: Bookshop
+  version: 1.2.0
+  description: A small online bookstore.
+
+# ---------------------------------------------------------------------------
+# Data layer
+# ---------------------------------------------------------------------------
+entities:
+  User:
+    identity: id
+    fields:
+      id:          { type: id, generated: true }
+      email:       { type: email, required: true, unique: true }
+      displayName: { type: text, rules: { minLength: 1, maxLength: 80 } }
+      createdAt:   { type: timestamp, generated: true }
+    relations:
+      orders: { hasMany: Order, inverse: buyer }
+
+  Book:
+    identity: id
+    fields:
+      id:     { type: id, generated: true }
+      title:  { type: text, required: true, indexed: true, rules: { minLength: 1, maxLength: 200 } }
+      price:  { type: money, required: true, rules: { min: 0 } }
+      stock:  { type: integer, default: 0, rules: { min: 0 } }
+      status: { type: enum, values: [draft, listed, retired], default: draft }
+
+  Order:
+    identity: id
+    fields:
+      id:       { type: id, generated: true }
+      total:    { type: money, generated: true }
+      placedAt: { type: timestamp }
+      state:    { type: enum, values: [cart, placed, fulfilled, failed, cancelled], default: cart }
+    relations:
+      buyer: { belongsTo: User }
+      lines: { hasMany: OrderLine }
+
+  OrderLine:
+    identity: id
+    fields:
+      id:       { type: id, generated: true }
+      quantity: { type: integer, required: true, rules: { min: 1 } }
+    relations:
+      order: { belongsTo: Order }
+      book:  { belongsTo: Book }
+
+# ---------------------------------------------------------------------------
+# Business layer
+# ---------------------------------------------------------------------------
+capabilities:
+  ListBooks:
+    summary: Return books available for purchase.
+    input:  { query: { type: text } }
+    output: { books: { list: @Book } }
+    reads:  [Book]
+    policy: public
+
+  PlaceOrder:
+    summary: Convert the buyer's cart into a placed order.
+    input:
+      orderId:       { type: id, required: true }
+      paymentMethod: { type: enum, values: [card, paypal], required: true }
+    output: { order: @Order }
+    reads:  [Book, Order, OrderLine]
+    writes: [{ updates: Order }]
+    emits:  [OrderPlaced]
+    policy: @OwnsOrder
+    errors: [EmptyCart, OutOfStock]
+
+  ReserveStock:     { input: { orderId: { type: id, required: true } }, writes: [{ updates: Book }],  errors: [OutOfStock] }
+  ReleaseStock:     { input: { orderId: { type: id, required: true } }, writes: [{ updates: Book }] }
+  ChargePayment:    { input: { orderId: { type: id, required: true } }, writes: [{ updates: Order }], errors: [PaymentDeclined] }
+  RefundPayment:    { input: { orderId: { type: id, required: true } }, writes: [{ updates: Order }] }
+  ScheduleShipment: { input: { orderId: { type: id, required: true } }, writes: [{ updates: Order }] }
+
+# ---------------------------------------------------------------------------
+# Events + fulfillment workflow (saga with compensation)
+# ---------------------------------------------------------------------------
+events:
+  OrderPlaced:    { payload: { order: @Order, at: { type: timestamp } } }
+  OrderFulfilled: { payload: { order: @Order } }
+  OrderFailed:    { payload: { order: @Order, reason: { type: text } } }
+
+workflows:
+  FulfillOrder:
+    summary: Reserve stock, charge, and ship a placed order; compensate on failure.
+    on: OrderPlaced
+    steps:
+      - { do: ReserveStock,     with: { orderId: event.order.id }, compensate: ReleaseStock }
+      - { do: ChargePayment,    with: { orderId: event.order.id }, compensate: RefundPayment }
+      - { do: ScheduleShipment, with: { orderId: event.order.id } }
+    onComplete: { emit: OrderFulfilled }
+    onFailure:  { emit: OrderFailed }
+
+# ---------------------------------------------------------------------------
+# Access rules
+# ---------------------------------------------------------------------------
+policies:
+  OwnsOrder: "actor.id == resource.buyer.id"
+  AdminOnly: "actor.role == 'admin'"
+
+# ---------------------------------------------------------------------------
+# View layer
+# ---------------------------------------------------------------------------
+widgets:
+  Button:      { props: { label: { type: text, required: true }, variant: { type: enum, values: [primary, ghost], default: primary } } }
+  BookCard:    { props: { book: @Book }, slots: [actions] }
+  Spinner:     { props: {} }
+  EmptyState:  { props: { message: { type: text } } }
+  ErrorBanner: { props: { message: { type: text } } }
+
+views:
+  Catalog:
+    route: /
+    summary: Browse and search books.
+    params: { q: { type: text } }
+    data:   { books: { from: @ListBooks, with: { query: params.q } } }
+    states:
+      loading: @Spinner
+      empty:   { when: "books.length == 0", show: @EmptyState, props: { message: @text.noBooks } }
+      error:   @ErrorBanner
+    layout:
+      - repeat: book in books
+        widget: @BookCard
+        props: { book: book }
+        slots:
+          actions:
+            - widget: @Button
+              props: { label: @text.view }
+              on: { tap: -> @BookDetail(id: book.id) }
+    transitions:
+      - { to: @BookDetail, label: "Open a book" }
+
+  BookDetail:
+    route: /books/:id
+    params: { id: { type: id, required: true } }
+    data:   { book: { from: @Book, where: "id == params.id" } }
+    states:
+      loading: @Spinner
+      error:   @ErrorBanner
+    layout:
+      - widget: @BookCard
+        props: { book: book }
+    actions:
+      addToCart:
+        invokes: @PlaceOrder
+        with: { orderId: book.id, paymentMethod: card }
+        onSuccess: -> @OrderConfirmation(orderId: result.order.id)
+        onError:   stay
+    transitions:
+      - { to: @Catalog, label: "Back to catalog" }
+
+  OrderConfirmation:
+    route: /orders/:orderId
+    params: { orderId: { type: id, required: true } }
+    data:   { order: { from: @Order, where: "id == params.orderId" } }
+    policy: @OwnsOrder
+    layout:
+      - widget: @Button
+        props: { label: @text.continueShopping }
+        on: { tap: -> @Catalog }
+
+flows:
+  Purchase:
+    steps:
+      - { at: @Catalog }
+      - { at: @BookDetail }
+      - { at: @OrderConfirmation, on: { OrderPlaced: complete } }
+
+# ---------------------------------------------------------------------------
+# i18n + design tokens
+# ---------------------------------------------------------------------------
+text:
+  view:             { en: "View",              es: "Ver" }
+  noBooks:          { en: "No books found.",   es: "No se encontraron libros." }
+  continueShopping: { en: "Continue shopping", es: "Seguir comprando" }
+
+tokens:
+  color: { brand: "#1f6feb", surface: "#ffffff" }
+  space: { sm: 8, md: 16, lg: 24 }
+  type:  { body: { family: Inter, size: 16 } }
+  breakpoints: { sm: 480, md: 768, lg: 1200 }

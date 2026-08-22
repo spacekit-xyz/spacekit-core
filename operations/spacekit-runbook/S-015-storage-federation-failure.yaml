@@ -1,0 +1,39 @@
+scenario_id: S-015
+version: 1
+summary: A storage federation export, transfer, or import cannot be verified end to end.
+severity_floor: Critical
+event_queries:
+  - kind: {Agent: InferenceUnavailable}
+    min_severity: Warning
+    field_predicates:
+      - Exists: [storage_url]
+  - kind: {Service: BlobServedRead}
+    min_severity: Warning
+    field_predicates:
+      - Exists: [federation_error]
+diagnosis_steps:
+  - title: Probe both storage endpoints
+    commands:
+      - "spacekit network doctor"
+      - "spacekit network logs --service storage --lines 300"
+      - "spacekit storage stats --storage-url \"$SPACEKIT_STORAGE_URL\""
+    expected_outputs:
+      - "Source and destination failures are recorded without bypassing auth or hashes"
+procedures:
+  - id: P-07
+    name: Storage federation diagnosis
+    note: "Run procedures/P-07-storage-federation.md."
+recommended_agent_classification:
+  domain: anomaly_scoring
+  intent: investigate
+  target: storage.federation
+  reasoning: >
+    Federation failure may be reachability, authorization, signature, or
+    missing-blob failure. Preserve the handoff bundle and classify from
+    endpoint evidence rather than assuming automatic replication.
+escalation:
+  - condition: "The destination accepted a bundle whose signature or content hash fails"
+    action: "Stop imports and escalate as an integrity incident."
+agent_must_not:
+  - "Disable handoff signatures or blob/fact authentication"
+  - "Report replication complete without destination verification"

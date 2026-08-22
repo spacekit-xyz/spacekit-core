@@ -1,0 +1,32 @@
+scenario_id: S-018
+version: 1
+summary: A reviewed manifest grants a candidate DID the validator role.
+severity_floor: Notice
+event_queries:
+  - kind: {Consensus: ValidatorAdmitted}
+    min_severity: Notice
+diagnosis_steps:
+  - title: Verify grant and readiness
+    commands:
+      - "spacekit network manifest verify approved-manifest.json"
+      - "spacekit network doctor"
+      - "spacekit network peers --detailed"
+    expected_outputs:
+      - "Candidate DID has an explicit validator grant and expected connectivity"
+procedures:
+  - id: P-06
+    name: Validator admission
+    note: "Run procedures/P-06-validator-admission.md."
+recommended_agent_classification:
+  domain: policy_regime_recommendation
+  intent: hold
+  target: consensus.validator_set
+  reasoning: >
+    Admission is an operator-reviewed manifest and deployment action.
+    Observe the admitted validator without automatically changing quorum.
+escalation:
+  - condition: "ValidatorAdmitted appears for a DID absent from the approved manifest"
+    action: "Freeze further admissions and investigate manifest/runtime divergence."
+agent_must_not:
+  - "Add a validator by editing only the local role"
+  - "Coordinate activation or quorum changes without operator approval"

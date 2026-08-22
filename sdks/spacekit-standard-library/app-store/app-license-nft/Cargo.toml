@@ -1,0 +1,18 @@
+[package]
+name = "spacekit-app-license-nft"
+version = "1.0.0"
+edition = "2021"
+description = "Per-content license NFT (main/get_result opcodes for content monetization)"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/app-store/app-license-nft"
+[lib]
+name = "spacekit_app_license_nft"
+path = "../app_license_nft.rs"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

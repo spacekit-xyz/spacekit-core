@@ -1,0 +1,85 @@
+scenario_id: S-003
+version: 1
+summary: A fraud proof was accepted, triggering rollback of one or more soft-finalized blocks.
+severity_floor: Critical
+
+event_queries:
+  - kind: {Fraud: ProofAccepted}
+    min_severity: Critical
+
+diagnosis_steps:
+  - title: Confirm the rollback completed
+    commands:
+      - "spacekit-cli consensus head"
+      - "spacekit-cli fraud last-acceptance"
+    expected_outputs:
+      - "Head is at or below the rolled-back target height"
+      - "RollbackCompleted event in log"
+    on_failure:
+      - "If rollback did not complete: state inconsistent. URGENT — see P-09 (forced rollback) with secondary on-call."
+
+  - title: Identify the slashed validator(s)
+    commands:
+      - "spacekit-cli fraud last-acceptance --show-slashes"
+    expected_outputs:
+      - "One or more SlashingApplied events with severity Full or Partial"
+
+  - title: Classify the event scale
+    commands:
+      - "spacekit-cli fraud recent --last 24h"
+    expected_outputs:
+      - "Count of fraud proofs in past 24h"
+    interpretation:
+      - "1-2 events / 24h: likely isolated bug or single-actor attack"
+      - "3-10 events / 24h: minority attack class"
+      - "10+ events / 24h or coordinated pattern: network attack"
+
+  - title: Verify mempool requeue happened
+    commands:
+      - "spacekit-cli mempool stats"
+    expected_outputs:
+      - "Mempool size increased by approximately the rolled-back tx count"
+    on_failure:
+      - "Mempool requeue failed; transactions are lost. URGENT — see P-10 (manual requeue)."
+
+procedures:
+  - id: P-09-ref
+    name: Forced rollback completion
+    note: "See procedures/P-09-forced-rollback.md. Required for state-inconsistent rollbacks."
+
+  - id: P-10-ref
+    name: Manual mempool requeue
+    note: "See procedures/P-10-manual-mempool-requeue.md when automatic requeue fails."
+
+# The agent's role: classify severity to inform downstream slashing
+# severity selection. The actual classification flows through the
+# fraud_classification domain.
+recommended_agent_classification:
+  domain: fraud_classification
+  intent: minority_attack  # default; agent may upgrade to network_attack
+  target: fraud_pipeline
+  reasoning: >
+    A single accepted fraud proof is by default classified as
+    minority_attack (single actor or small coalition). The agent
+    re-classifies as network_attack only if (a) the slashed weight
+    exceeds 1/3 of reputation-weighted voting power, (b) the fraud was
+    correlated across multiple validators in the same round, or (c)
+    multiple fraud proofs occurred in the same challenge window.
+
+# Followup classification: this scenario typically triggers S-009 review.
+followup_scenarios:
+  - "S-009-coordinated-anomaly-wake-up if multiple validators slashed"
+  - "S-002-consensus-stalled if rollback caused further finality issues"
+
+escalation:
+  - condition: "Rollback scope >= 50 blocks"
+    action: "Page primary + secondary on-call; public network status post."
+  - condition: "Slashed weight >= 1/3 total"
+    action: "Activate incident response; emergency transition to SECURE regime; halt new validator admissions."
+  - condition: "Multiple fraud proofs in the same challenge window"
+    action: "Network is under active attack. Activate incident response immediately."
+
+agent_must_not:
+  - "Auto-loosen parameters in response to a fraud proof event"
+  - "Auto-classify as network_attack without supporting evidence threshold"
+  - "Penalize the submitter of the fraud proof (they did the right thing)"

@@ -1,0 +1,7 @@
+**
+!routekit/Cargo.toml
+!routekit/src/**
+!spacekit-primitives/Cargo.toml
+!spacekit-primitives/src/**
+!spacekit-primitives/vendor/pqcrypto-internals/**
+!spacekit-primitives/vendor/pqcrypto-kyber/**

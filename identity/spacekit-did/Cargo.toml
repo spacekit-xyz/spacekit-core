@@ -1,0 +1,47 @@
+[package]
+name = "spacekit-did"
+version = "0.1.0"
+edition = "2021"
+authors = ["SpaceKit Labs <team@spacekit.xyz>"]
+description = "Post-quantum (SPHINCS+) identity library for the SpaceKit stack; used by CLI and compute node"
+license = "Apache-2.0"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+keywords = ["quantum", "cryptography", "identity", "did", "sphincs"]
+categories = ["cryptography", "authentication"]
+readme = "README.md"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/identity/spacekit-did"
+[lib]
+name = "spacekit_did"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spacekit-did-demo"
+path = "src/main.rs"
+required-features = ["std"]
+
+[dependencies]
+anyhow = { version = "1.0", optional = true }
+base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4.41", features = ["serde"], optional = true }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+pqcrypto-sphincsplus = "0.7.1"
+pqcrypto-traits = "0.3.5"
+rand = { version = "0.9.1", optional = true }
+serde = { version = "1.0.219", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0.140", optional = true }
+sha2 = { version = "0.10.9", default-features = false }
+uuid = { version = "1.17.0", features = ["v4"], optional = true }
+
+[features]
+default = ["std"]
+std = [
+  "anyhow",
+  "base64",
+  "chrono",
+  "hex/std",
+  "rand",
+  "serde/std",
+  "serde_json",
+  "sha2/std",
+  "uuid",
+]

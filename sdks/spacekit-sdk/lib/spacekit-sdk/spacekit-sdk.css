@@ -1,0 +1,407 @@
+/**
+ * SpaceKit SDK Styles
+ * 
+ * Import this CSS in your app to style SDK components.
+ * These styles use CSS custom properties for easy theming.
+ */
+
+/* ───────────────────────── CSS Variables ───────────────────────── */
+
+:root {
+  --spacekit-primary: #22d3ee;
+  --spacekit-primary-hover: #06b6d4;
+  --spacekit-secondary: #64748b;
+  --spacekit-bg: rgba(2, 6, 23, 0.9);
+  --spacekit-bg-light: rgba(15, 23, 42, 0.8);
+  --spacekit-border: rgba(34, 211, 238, 0.2);
+  --spacekit-text: #e2e8f0;
+  --spacekit-text-muted: #94a3b8;
+  --spacekit-success: #22c55e;
+  --spacekit-error: #ef4444;
+  --spacekit-radius: 8px;
+  --spacekit-radius-lg: 12px;
+}
+
+/* ───────────────────────── Base Components ───────────────────────── */
+
+.spacekit-btn {
+  padding: 8px 16px;
+  border-radius: var(--spacekit-radius);
+  border: 1px solid var(--spacekit-border);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.spacekit-btn-primary {
+  background: var(--spacekit-primary);
+  color: #000;
+  border-color: var(--spacekit-primary);
+}
+
+.spacekit-btn-primary:hover {
+  background: var(--spacekit-primary-hover);
+}
+
+.spacekit-btn-secondary {
+  background: transparent;
+  color: var(--spacekit-text);
+}
+
+.spacekit-btn-secondary:hover {
+  background: var(--spacekit-bg-light);
+}
+
+.spacekit-btn-sm {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.spacekit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.spacekit-input {
+  padding: 8px 12px;
+  border-radius: var(--spacekit-radius);
+  border: 1px solid var(--spacekit-border);
+  background: var(--spacekit-bg);
+  color: var(--spacekit-text);
+  font-size: 14px;
+  width: 100%;
+}
+
+.spacekit-input:focus {
+  outline: none;
+  border-color: var(--spacekit-primary);
+}
+
+.spacekit-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--spacekit-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ───────────────────────── Wallet ───────────────────────── */
+
+.spacekit-wallet {
+  background: var(--spacekit-bg);
+  border: 1px solid var(--spacekit-border);
+  border-radius: var(--spacekit-radius-lg);
+  padding: 16px;
+}
+
+.spacekit-wallet-header h3 {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  color: var(--spacekit-text);
+}
+
+.spacekit-wallet-section {
+  margin-bottom: 16px;
+}
+
+.spacekit-wallet-section label {
+  display: block;
+  font-size: 12px;
+  color: var(--spacekit-text-muted);
+  margin-bottom: 4px;
+}
+
+.spacekit-wallet-balance-display {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.spacekit-wallet-balance-value {
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--spacekit-text);
+}
+
+.spacekit-wallet-balance-unit {
+  font-size: 14px;
+  color: var(--spacekit-text-muted);
+}
+
+.spacekit-wallet-balance-micro {
+  font-size: 12px;
+  color: var(--spacekit-text-muted);
+}
+
+.spacekit-wallet-identity-display {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.spacekit-wallet-identity-name {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--spacekit-text);
+}
+
+.spacekit-wallet-identity-did {
+  font-size: 12px;
+  font-family: monospace;
+  color: var(--spacekit-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spacekit-wallet-compact {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+/* ───────────────────────── Explorer ───────────────────────── */
+
+.spacekit-explorer {
+  background: var(--spacekit-bg);
+  border: 1px solid var(--spacekit-border);
+  border-radius: var(--spacekit-radius-lg);
+  padding: 16px;
+}
+
+.spacekit-explorer-stats {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.spacekit-explorer-stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.spacekit-explorer-stat label {
+  font-size: 11px;
+  color: var(--spacekit-text-muted);
+  text-transform: uppercase;
+}
+
+.spacekit-explorer-stat strong {
+  font-size: 18px;
+  color: var(--spacekit-text);
+}
+
+.spacekit-explorer-section {
+  margin-bottom: 20px;
+}
+
+.spacekit-explorer-section h4 {
+  margin: 0 0 12px 0;
+  font-size: 14px;
+  color: var(--spacekit-text);
+}
+
+.spacekit-explorer-compact {
+  display: flex;
+  gap: 16px;
+  padding: 8px 12px;
+}
+
+/* ───────────────────────── Table ───────────────────────── */
+
+.spacekit-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.spacekit-table-header {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--spacekit-bg-light);
+  border-radius: var(--spacekit-radius) var(--spacekit-radius) 0 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--spacekit-text-muted);
+}
+
+.spacekit-table-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--spacekit-border);
+  font-size: 13px;
+  color: var(--spacekit-text);
+  background: transparent;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  width: 100%;
+  text-align: left;
+  cursor: default;
+}
+
+.spacekit-table-row-clickable {
+  cursor: pointer;
+}
+
+.spacekit-table-row-clickable:hover {
+  background: var(--spacekit-bg-light);
+}
+
+.spacekit-table-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--spacekit-text-muted);
+  font-size: 13px;
+}
+
+/* ───────────────────────── Detail Grid ───────────────────────── */
+
+.spacekit-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.spacekit-detail-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.spacekit-detail-grid label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--spacekit-text-muted);
+}
+
+.spacekit-detail-grid span {
+  font-size: 13px;
+  color: var(--spacekit-text);
+}
+
+/* ───────────────────────── Identity Card ───────────────────────── */
+
+.spacekit-identity-card {
+  background: var(--spacekit-bg);
+  border: 1px solid var(--spacekit-border);
+  border-radius: var(--spacekit-radius-lg);
+  padding: 16px;
+}
+
+.spacekit-identity-card-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.spacekit-identity-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--spacekit-primary);
+  color: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.spacekit-identity-avatar-large {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--spacekit-primary);
+  color: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.spacekit-identity-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.spacekit-identity-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--spacekit-text);
+}
+
+.spacekit-identity-name-large {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--spacekit-text);
+  margin: 0 0 4px 0;
+}
+
+.spacekit-identity-did {
+  font-size: 12px;
+  font-family: monospace;
+  color: var(--spacekit-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin: 0;
+}
+
+.spacekit-identity-card-body {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.spacekit-identity-stat label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--spacekit-text-muted);
+  margin-bottom: 4px;
+}
+
+.spacekit-identity-stat strong {
+  font-size: 14px;
+  color: var(--spacekit-text);
+}
+
+.spacekit-identity-card-footer {
+  display: flex;
+  gap: 8px;
+}
+
+.spacekit-identity-card-compact {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+/* ───────────────────────── Responsive ───────────────────────── */
+
+@media (max-width: 640px) {
+  .spacekit-table-header,
+  .spacekit-table-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .spacekit-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .spacekit-explorer-stats {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

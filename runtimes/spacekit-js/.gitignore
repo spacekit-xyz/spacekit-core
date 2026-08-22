@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+images/
+working/
+extension/
+demo/
+examples/
+growformer-pkg/

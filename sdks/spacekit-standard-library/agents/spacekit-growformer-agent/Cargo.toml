@@ -1,0 +1,23 @@
+[package]
+name = "spacekit-growformer-agent"
+version = "0.1.0"
+edition = "2021"
+description = "SpaceKit Growformer AI Agent integration contract - uses Growformer brain runtime for intelligent on-chain operations"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/agents/spacekit-growformer-agent"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use path in the monorepo so `growformer_*` APIs are available before the SDK is published.
+spacekit-contract-sdk = { version = "0.1.0", path = "../../../spacekit-contract-sdk" }
+wee_alloc = "0.4"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"
+

@@ -1,0 +1,25 @@
+[package]
+name = "app_store_contract"
+version = "1.0.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/app-store"
+[dependencies]
+# No external dependencies - pure no_std WASM
+
+[lib]
+name = "app_store_contract"
+path = "appstore.rs"
+crate-type = ["cdylib"]
+
+
+[profile.release]
+opt-level = "z"         # Optimize for size
+lto = true              # Enable Link Time Optimization
+codegen-units = 1       # Better optimization
+panic = "abort"         # Smaller binary
+strip = true            # Strip symbols
+
+[features]
+default = []
+

@@ -1,0 +1,106 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+# Note: Cargo.lock should be committed for binaries/applications
+# Uncomment the line below only if this is a library crate
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Storage node runtime data
+storage_data/
+demo_storage/
+nft_demo_storage/
+fact_storage/
+spacekit_storage.json
+spacekit_storage.wal
+spacekit_storage.key
+*.bak
+backups/
+migrations/history.json
+
+# Database files (runtime)
+*.db
+*.sqlite
+*.sqlite3
+
+# Build outputs
+dist/
+dist-gcp/
+.build-context*/
+*.tar.gz
+*.zip
+
+# Docker build artifacts (generated during build)
+.build-context*/Dockerfile
+.build-context*/.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS files
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test coverage
+coverage/
+*.gcda
+*.gcno
+*.profdata
+
+# Documentation build outputs
+*.pdf
+!SpaceKit-Storage-Node-Whitepaper-v1.0.pdf  # Keep the official whitepaper PDF
+
+# Flycheck (Emacs)
+flycheck*/
+
+# Backup files
+*~
+*.orig
+*.rej
+
+# Compiled binaries (keep source, ignore compiled)
+spacekit-storage-node
+*.exe
+*.dll
+*.so
+*.dylib
+
+# AWS/GCP credentials (if accidentally committed)
+.aws/
+.gcp/
+*.pem
+# Private keys (but allow public keys and example keys)
+*.key
+!*.pub
+!examples/*.key  # Allow example keys in examples directory
+
+# Session data
+sessions/
+
+# Cache directories
+.cache/
+*.cache

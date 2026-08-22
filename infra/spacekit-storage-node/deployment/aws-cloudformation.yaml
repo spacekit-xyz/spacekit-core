@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SpaceKit Storage Node on AWS EC2'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    Description: EC2 instance type
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair name for SSH access
+  
+  StorageSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 500
+    Description: EBS volume size in GB
+
+Resources:
+  # Security Group
+  StorageNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: spacekit-storage-node-sg
+      GroupDescription: Security group for SpaceKit Storage Node
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3030
+          ToPort: 3030
+          CidrIp: 0.0.0.0/0
+          Description: Storage Node API
+        - IpProtocol: tcp
+          FromPort: 4001
+          ToPort: 4001
+          CidrIp: 0.0.0.0/0
+          Description: P2P Network
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+      Tags:
+        - Key: Name
+          Value: spacekit-storage-node-sg
+
+  # IAM Role for CloudWatch Logs
+  StorageNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SpaceKitStorageNodeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  # Instance Profile
+  StorageNodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref StorageNodeRole
+
+  # EC2 Instance
+  StorageNodeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c55b159cbfafe1f0  # Ubuntu 22.04 LTS (us-east-1)
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref StorageNodeSecurityGroup
+      IamInstanceProfile: !Ref StorageNodeInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref StorageSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Update system
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install dependencies
+          apt-get install -y curl wget unzip
+          
+          # Download and deploy SpaceKit Storage Node
+          # (Binary should be uploaded to S3 first)
+          # aws s3 cp s3://your-bucket/spacekit-storage-node /opt/spacekit-storage-node/bin/
+          
+          # Create systemd service
+          cat > /etc/systemd/system/spacekit-storage-node.service << 'EOF'
+          [Unit]
+          Description=SpaceKit Storage Node
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=spacekit
+          Group=spacekit
+          WorkingDirectory=/opt/spacekit-storage-node
+          ExecStart=/opt/spacekit-storage-node/bin/spacekit-storage-node \
+              --config /opt/spacekit-storage-node/config/config.toml \
+              --data-dir /opt/spacekit-storage-node/data
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          # Create user and directories
+          useradd -r -s /bin/false -d /opt/spacekit-storage-node spacekit || true
+          mkdir -p /opt/spacekit-storage-node/{bin,config,data,logs}
+          chown -R spacekit:spacekit /opt/spacekit-storage-node
+          
+          # Enable and start service
+          systemctl daemon-reload
+          systemctl enable spacekit-storage-node
+          systemctl start spacekit-storage-node
+      Tags:
+        - Key: Name
+          Value: spacekit-storage-node
+        - Key: Project
+          Value: SpaceKit
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref StorageNodeInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+  
+  PublicIP:
+    Description: Public IP address
+    Value: !GetAtt StorageNodeInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+  
+  PrivateIP:
+    Description: Private IP address
+    Value: !GetAtt StorageNodeInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+  
+  APIEndpoint:
+    Description: Storage Node API endpoint
+    Value: !Sub 'http://${StorageNodeInstance.PublicIp}:3030'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoint'
+

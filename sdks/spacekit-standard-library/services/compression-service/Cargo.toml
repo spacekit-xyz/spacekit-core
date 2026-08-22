@@ -1,0 +1,19 @@
+[package]
+name = "compression-service-contract"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/spacekit-xyz/spacekit-core"
+homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/sdks/spacekit-standard-library/services/compression-service"
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No dependencies for no_std WASM
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
+strip = true        # Strip symbols
+
