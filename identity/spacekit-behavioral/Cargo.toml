@@ -1,0 +1,48 @@
+[package]
+name = "spacekit-behavioral"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# evm support
+alloy-primitives = { version = "1.4.1", features = ["serde"] }
+alloy = { version = "1.0", features = ["providers", "network", "contract", "sol-types", "signers", "signer-local", "rpc-types"] }
+
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+spacekit-primitives = { path = "../spacekit-primitives" }
+spacekit-recovery = { path = "../spacekit-recovery" }
+
+[lib]
+name = "spacekit_behavioral_simulation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "simulation"
+path = "src/main.rs"
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+
+# Behavioral Simulation Demos
+[[example]]
+name = "quick_demo"
+path = "examples/quick_demo.rs"
+
+[[example]]
+name = "simple_integration"
+path = "examples/simple_integration.rs"
+
+[[example]]
+name = "production_integration"
+path = "examples/production_integration.rs"

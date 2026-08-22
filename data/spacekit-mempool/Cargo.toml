@@ -1,0 +1,21 @@
+[package]
+name = "spacekit-mempool"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Transaction mempool for the SpaceKit network. Single ingress, drain on propose, requeue on fraud-proof rollback, pluggable priority and visibility strategies."
+
+[features]
+default = ["std", "serde"]
+std = []
+serde = ["dep:serde"]
+# Optional: enable the visibility-strategy trait for future encryption work.
+# Off by default; the core mempool ships with everything-visible-to-everyone.
+visibility = []
+
+[dependencies]
+alloy-primitives = { version = "1.0", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+thiserror = { version = "1", optional = true }
+
+[dev-dependencies]

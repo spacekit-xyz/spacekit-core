@@ -1,0 +1,24 @@
+[package]
+name = "spacekit-diff"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-computation diff and three-way merge for SpaceKit tree snapshots and blobs"
+license = "Apache-2.0"
+
+[lib]
+path = "lib.rs"
+# Pure rlib — library lives at crate root (not src/).
+
+[dependencies]
+# Intentionally none. This crate is no_std + alloc, with no external deps,
+# so it can compile to wasm32-unknown-unknown for browser/contract use.
+
+[features]
+default = []
+# `std` feature is reserved for future opt-in std-only conveniences. The crate
+# is no_std by default. Tests automatically link std (they are not no_std).
+std = []
+
+[profile.release]
+lto = true
+opt-level = "z"   # size-optimized for WASM

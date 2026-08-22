@@ -1,0 +1,12 @@
+[package]
+name = "spacekit-service-rewards"
+version = "0.1.0"
+edition = "2021"
+description = "SpaceKit Service Reward Accumulator — emission schedule and per-epoch CREDIT computation"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+spacekit-primitives = { path = "../spacekit-primitives" }
+spacekit-log = { path = "../spacekit-log" }
+
+[dev-dependencies]

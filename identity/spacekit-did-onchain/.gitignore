@@ -1,0 +1,13 @@
+/target
+**/.DS_Store
+.env
+.env.*
+
+quantum-evm-contracts/node_modules/
+quantum-evm-contracts/cache/
+quantum-evm-contracts/artifacts/
+quantum-evm-contracts/typechain-types/
+
+.anchor/
+target/deploy/
+test-ledger/

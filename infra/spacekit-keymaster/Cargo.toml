@@ -1,0 +1,50 @@
+[package]
+name = "spacekit-keymaster"
+version = "0.1.0"
+edition = "2021"
+description = "SKKM-1 guardian, coordinator, and registry services"
+
+[workspace]
+
+[[bin]]
+name = "spacekit-keymaster-guardian"
+path = "src/bin/guardian.rs"
+
+[[bin]]
+name = "spacekit-keymaster-coordinator"
+path = "src/bin/coordinator.rs"
+
+[[bin]]
+name = "spacekit-keymaster-registry"
+path = "src/bin/registry.rs"
+
+[[bin]]
+name = "spacekit-keymaster-signer"
+path = "src/bin/signer.rs"
+
+[dependencies]
+ml-kem  = { version = "0.3.2", features = ["getrandom"] }
+ml-dsa  = { version = "0.1.1", features = ["getrandom", "alloc"] }
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

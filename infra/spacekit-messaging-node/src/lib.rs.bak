@@ -1,0 +1,465 @@
+//! SWTCH Messaging Node Library
+//! 
+//! Provides quantum-resistant P2P messaging services that can be embedded
+//! in applications or run as standalone infrastructure nodes.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use anyhow::Result;
+use thiserror::Error;
+
+// Re-export modules
+pub mod models;
+pub mod network;
+pub mod encryption;
+pub mod handlers;
+pub mod config;
+
+// Re-export key types from models (excluding MessageEvent which comes from handlers)
+pub use models::{
+    User, Group, GroupMembership, MemberRole, Message, MessageType, 
+    EncryptedMessage, GroupFile, FileStatus, FileAccess, FileAccessType,
+    GroupInvitation, InvitationStatus, EncryptionConfig
+};
+pub use config::MessagingConfig;
+pub use network::MessagingNetwork;
+pub use handlers::{GroupMessageHandler, MessageEvent};
+pub use encryption::{MessageEncryption, EncryptedPayload, KeyPair, GroupEncryptionContext};
+
+use swtch_primitives::v1::crypto::quantum::{Algorithm, CipherSuite};
+
+/// Core messaging node that provides quantum-resistant group messaging
+#[derive(Clone)]
+pub struct MessagingNode {
+    /// Node configuration
+    config: MessagingConfig,
+    /// Group message handler
+    message_handler: Arc<GroupMessageHandler>,
+    /// Networking layer
+    network: Arc<tokio::sync::Mutex<MessagingNetwork>>,
+    /// Message event broadcaster
+    message_tx: broadcast::Sender<MessageEvent>,
+    /// Node status
+    status: Arc<RwLock<NodeStatus>>,
+}
+
+/// Message channel for organized conversations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageChannel {
+    /// Unique channel identifier
+    pub id: String,
+    /// Channel name/topic
+    pub name: String,
+    /// Participants in the channel
+    pub participants: Vec<String>,
+    /// Channel creation time
+    pub created_at: DateTime<Utc>,
+    /// Last activity timestamp
+    pub last_activity: DateTime<Utc>,
+    /// Channel type (direct, group, broadcast)
+    pub channel_type: ChannelType,
+    /// Encryption settings for this channel
+    pub encryption_config: ChannelEncryption,
+}
+
+/// Types of message channels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChannelType {
+    /// Direct 1-on-1 messaging
+    Direct,
+    /// Group messaging with multiple participants
+    Group,
+    /// Broadcast channel (one-to-many)
+    Broadcast,
+    /// Public channel (discoverable)
+    Public,
+}
+
+/// Channel encryption configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEncryption {
+    /// Quantum algorithm used for key exchange
+    pub quantum_algorithm: String,
+    /// Cipher suite for message encryption
+    pub cipher_suite: String,
+    /// Whether forward secrecy is enabled
+    pub forward_secrecy: bool,
+    /// Key rotation interval in seconds
+    pub key_rotation_interval: u64,
+}
+
+
+
+/// Node operational status
+#[derive(Debug, Clone)]
+pub struct NodeStatus {
+    /// Whether the node is currently running
+    pub is_running: bool,
+    /// Number of active connections
+    pub active_connections: u32,
+    /// Number of active groups
+    pub active_groups: u32,
+    /// Number of registered users
+    pub registered_users: u32,
+    /// Messages sent today
+    pub messages_sent_today: u64,
+    /// Messages received today
+    pub messages_received_today: u64,
+    /// Node start time
+    pub started_at: chrono::DateTime<Utc>,
+    /// Last activity timestamp
+    pub last_activity: chrono::DateTime<Utc>,
+}
+
+/// Messaging node errors
+#[derive(Debug, Error)]
+pub enum MessagingError {
+    #[error("Network error: {0}")]
+    Network(#[from] network::NetworkError),
+    #[error("Encryption error: {0}")]
+    Encryption(String),
+    #[error("Group not found: {0}")]
+    GroupNotFound(String),
+    #[error("User not found: {0}")]
+    UserNotFound(String),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+impl MessagingNode {
+    /// Create a new messaging node with the given configuration
+    pub async fn new(config: MessagingConfig) -> Result<Self> {
+        let message_handler = Arc::new(GroupMessageHandler::new(config.node_did.clone()));
+        let network = Arc::new(tokio::sync::Mutex::new(MessagingNetwork::new(&config).await?));
+        let (message_tx, _) = broadcast::channel(1000);
+        let status = Arc::new(RwLock::new(NodeStatus {
+            is_running: false,
+            active_connections: 0,
+            active_groups: 0,
+            registered_users: 0,
+            messages_sent_today: 0,
+            messages_received_today: 0,
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+        }));
+
+        Ok(Self {
+            config,
+            message_handler,
+            network,
+            message_tx,
+            status,
+        })
+    }
+
+    /// Start the messaging node
+    pub async fn start(&self) -> Result<()> {
+        {
+            let mut status = self.status.write().await;
+            status.is_running = true;
+            status.started_at = Utc::now();
+        }
+
+        // Start the network layer
+        {
+            let mut network = self.network.lock().await;
+            network.start().await?;
+        }
+        
+        tracing::info!("Messaging node started with DID: {}", self.config.node_did);
+        Ok(())
+    }
+
+    /// Stop the messaging node
+    pub async fn stop(&self) -> Result<()> {
+        {
+            let mut status = self.status.write().await;
+            status.is_running = false;
+        }
+
+        // Stop the network layer
+        {
+            let mut network = self.network.lock().await;
+            network.stop().await?;
+        }
+        
+        tracing::info!("Messaging node stopped");
+        Ok(())
+    }
+
+    /// Register a user in the messaging system
+    pub async fn register_user(
+        &self,
+        did: String,
+        username: String,
+        public_key: Vec<u8>,
+        algorithm: Algorithm,
+    ) -> Result<User> {
+        let user = self.message_handler.register_user(did, username, public_key, algorithm).await?;
+        
+        // Update status
+        {
+            let mut status = self.status.write().await;
+            status.registered_users += 1;
+            status.last_activity = Utc::now();
+        }
+
+        Ok(user)
+    }
+
+    /// Create a new group
+    pub async fn create_group(
+        &self,
+        name: String,
+        creator_id: String,
+        description: Option<String>,
+    ) -> Result<Group> {
+        let group = self.message_handler.create_group(name, creator_id, description).await?;
+
+        // Update status
+        {
+            let mut status = self.status.write().await;
+            status.active_groups += 1;
+            status.last_activity = Utc::now();
+        }
+
+        // Broadcast group creation event
+        let users = self.message_handler.users.read().await;
+        if let Some(creator) = users.get(&group.creator_id) {
+            let event = MessageEvent::GroupCreated {
+                group: group.clone(),
+                creator: creator.clone(),
+            };
+            let _ = self.message_tx.send(event);
+        }
+
+        Ok(group)
+    }
+
+    /// Send a text message to a group
+    pub async fn send_text_message(
+        &self,
+        group_id: String,
+        sender_id: String,
+        content: String,
+    ) -> Result<Vec<MessageEvent>> {
+        let events = self.message_handler.send_text_message(group_id, sender_id, content).await?;
+
+        // Update status and broadcast events
+        {
+            let mut status = self.status.write().await;
+            status.messages_sent_today += 1;
+            status.last_activity = Utc::now();
+        }
+
+        // Broadcast events
+        for event in &events {
+            let _ = self.message_tx.send(event.clone());
+        }
+
+        Ok(events)
+    }
+
+    /// Upload a file to a group
+    pub async fn upload_file(
+        &self,
+        group_id: String,
+        uploader_id: String,
+        filename: String,
+        file_data: Vec<u8>,
+        mime_type: String,
+    ) -> Result<Vec<MessageEvent>> {
+        let events = self.message_handler.upload_file(
+            group_id,
+            uploader_id,
+            filename,
+            file_data,
+            mime_type,
+        ).await?;
+
+        // Update status and broadcast events
+        {
+            let mut status = self.status.write().await;
+            status.messages_sent_today += 1;
+            status.last_activity = Utc::now();
+        }
+
+        // Broadcast events
+        for event in &events {
+            let _ = self.message_tx.send(event.clone());
+        }
+
+        Ok(events)
+    }
+
+    /// Get group information
+    pub async fn get_group(&self, group_id: String) -> Result<Option<Group>> {
+        self.message_handler.get_group(group_id).await
+    }
+
+    /// Get group members
+    pub async fn get_group_members(&self, group_id: String) -> Result<Vec<(User, MemberRole)>> {
+        self.message_handler.get_group_members(group_id).await
+    }
+
+    /// Get files in a group
+    pub async fn get_group_files(
+        &self,
+        group_id: String,
+        status_filter: Option<FileStatus>,
+    ) -> Result<Vec<GroupFile>> {
+        self.message_handler.get_group_files(group_id, status_filter).await
+    }
+
+    /// Get messages for a specific user (requires private key for decryption)
+    pub async fn get_user_messages(
+        &self,
+        user_id: String,
+        private_key: Vec<u8>,
+    ) -> Result<Vec<Message>> {
+        self.message_handler.get_user_messages(user_id, private_key).await
+    }
+
+    /// Add a user to a group
+    pub async fn add_user_to_group(
+        &self,
+        group_id: String,
+        user_id: String,
+        invited_by: Option<String>,
+    ) -> Result<()> {
+        self.message_handler.add_user_to_group(group_id, user_id, invited_by).await?;
+        
+        // Update status
+        {
+            let mut status = self.status.write().await;
+            status.last_activity = Utc::now();
+        }
+
+        Ok(())
+    }
+
+    /// Change file status (archive/delete)
+    pub async fn change_file_status(
+        &self,
+        file_id: String,
+        new_status: FileStatus,
+        changed_by: String,
+    ) -> Result<MessageEvent> {
+        let event = self.message_handler.change_file_status(file_id, new_status, changed_by).await?;
+        
+        // Update status
+        {
+            let mut status = self.status.write().await;
+            status.last_activity = Utc::now();
+        }
+
+        // Broadcast event
+        let _ = self.message_tx.send(event.clone());
+        
+        Ok(event)
+    }
+
+    /// Subscribe to message events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<MessageEvent> {
+        self.message_tx.subscribe()
+    }
+
+    /// Get current node status
+    pub async fn get_status(&self) -> NodeStatus {
+        self.status.read().await.clone()
+    }
+
+    /// Check if node is running
+    pub async fn is_running(&self) -> bool {
+        self.status.read().await.is_running
+    }
+
+    /// Get node configuration
+    pub fn get_config(&self) -> &MessagingConfig {
+        &self.config
+    }
+
+    /// Generate a new quantum-resistant keypair
+    pub async fn generate_keypair(&self, algorithm: Option<Algorithm>) -> Result<KeyPair> {
+        use crate::encryption::MessageEncryption;
+        
+        let encryption = MessageEncryption::new(
+            algorithm.unwrap_or(Algorithm::Kyber768),
+            CipherSuite::AES256,
+        );
+        
+        encryption.generate_keypair(algorithm).await
+    }
+}
+
+impl Default for ChannelEncryption {
+    fn default() -> Self {
+        Self {
+            quantum_algorithm: "Kyber768".to_string(),
+            cipher_suite: "AES256".to_string(),
+            forward_secrecy: true,
+            key_rotation_interval: 3600,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_messaging_node_creation() {
+        let config = MessagingConfig::default();
+        let node = MessagingNode::new(config).await.unwrap();
+        
+        assert!(!node.is_running().await);
+    }
+
+    #[tokio::test]
+    async fn test_user_registration() {
+        let config = MessagingConfig::default();
+        let node = MessagingNode::new(config).await.unwrap();
+        
+        let user = node.register_user(
+            "did:example:alice".to_string(),
+            "Alice".to_string(),
+            vec![1, 2, 3, 4], // Mock public key
+            Algorithm::Kyber768,
+        ).await.unwrap();
+        
+        assert_eq!(user.username, "Alice");
+        assert_eq!(user.did, "did:example:alice");
+    }
+
+    #[tokio::test]
+    async fn test_group_creation() {
+        let config = MessagingConfig::default();
+        let node = MessagingNode::new(config).await.unwrap();
+        
+        // Register a user first
+        let user = node.register_user(
+            "did:example:alice".to_string(),
+            "Alice".to_string(),
+            vec![1, 2, 3, 4],
+            Algorithm::Kyber768,
+        ).await.unwrap();
+        
+        // Create a group
+        let group = node.create_group(
+            "Test Group".to_string(),
+            user.id.clone(),
+            Some("A test group".to_string()),
+        ).await.unwrap();
+        
+        assert_eq!(group.name, "Test Group");
+        assert_eq!(group.creator_id, user.id);
+    }
+} 

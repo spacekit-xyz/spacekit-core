@@ -1,0 +1,456 @@
+//! Message handlers for processing different types of messages
+
+use crate::models::*;
+use crate::encryption::{MessageEncryption, EncryptedPayload, GroupEncryptionContext};
+use anyhow::{Result, anyhow};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{info, warn, error};
+use swtch_primitives::v1::crypto::quantum::{Algorithm, CipherSuite};
+use uuid::Uuid;
+use chrono::Utc;
+
+/// Group message handler that processes group-based messaging with encryption
+pub struct GroupMessageHandler {
+    /// Node DID for message filtering
+    node_did: String,
+    /// Users in the system
+    users: Arc<RwLock<HashMap<String, User>>>,
+    /// Groups in the system
+    groups: Arc<RwLock<HashMap<String, Group>>>,
+    /// Group memberships
+    memberships: Arc<RwLock<HashMap<String, Vec<GroupMembership>>>>,
+    /// Group files
+    group_files: Arc<RwLock<HashMap<String, GroupFile>>>,
+    /// Encrypted messages by recipient
+    encrypted_messages: Arc<RwLock<HashMap<String, Vec<EncryptedMessage>>>>,
+    /// Encryption service
+    encryption: MessageEncryption,
+    /// Content filter
+    content_filter: ContentFilter,
+}
+
+/// Events that can be emitted by the message handler
+#[derive(Debug, Clone)]
+pub enum MessageEvent {
+    /// A new message was received
+    MessageReceived {
+        message: Message,
+        group_id: String,
+        sender: User,
+    },
+    /// A file was uploaded to a group
+    FileUploaded {
+        file: GroupFile,
+        group_id: String,
+        uploader: User,
+    },
+    /// A user joined a group
+    UserJoinedGroup {
+        user: User,
+        group: Group,
+        invited_by: Option<String>,
+    },
+    /// A user left a group
+    UserLeftGroup {
+        user_id: String,
+        group: Group,
+    },
+    /// A group was created
+    GroupCreated {
+        group: Group,
+        creator: User,
+    },
+    /// Group settings were updated
+    GroupUpdated {
+        group: Group,
+        updated_by: String,
+    },
+    /// A file was archived or deleted
+    FileStatusChanged {
+        file: GroupFile,
+        new_status: FileStatus,
+        changed_by: String,
+    },
+}
+
+impl GroupMessageHandler {
+    /// Create a new group message handler
+    pub fn new(node_did: String) -> Self {
+        let encryption = MessageEncryption::new(
+            Algorithm::Kyber768, // Default quantum-resistant algorithm
+            CipherSuite::AES256,  // Default cipher suite
+        );
+
+        Self {
+            node_did,
+            users: Arc::new(RwLock::new(HashMap::new())),
+            groups: Arc::new(RwLock::new(HashMap::new())),
+            memberships: Arc::new(RwLock::new(HashMap::new())),
+            group_files: Arc::new(RwLock::new(HashMap::new())),
+            encrypted_messages: Arc::new(RwLock::new(HashMap::new())),
+            encryption,
+            content_filter: ContentFilter::new(true, true),
+        }
+    }
+
+    /// Register a user in the system
+    pub async fn register_user(&self, did: String, username: String, public_key: Vec<u8>, algorithm: Algorithm) -> Result<User> {
+        let user = User::new(did, username, public_key, format!("{:?}", algorithm));
+        let user_id = user.id.clone();
+        
+        let mut users = self.users.write().await;
+        users.insert(user_id.clone(), user.clone());
+        
+        info!("Registered user: {} (DID: {})", user.username, user.did);
+        Ok(user)
+    }
+
+    /// Create a new group
+    pub async fn create_group(&self, name: String, creator_id: String, description: Option<String>) -> Result<Group> {
+        let group = Group::new(name, creator_id.clone(), description);
+        let group_id = group.id.clone();
+        
+        // Add creator as a member with Creator role
+        let membership = GroupMembership {
+            group_id: group_id.clone(),
+            user_id: creator_id.clone(),
+            role: MemberRole::Creator,
+            joined_at: Utc::now(),
+            invited_by: None,
+        };
+
+        let mut groups = self.groups.write().await;
+        let mut memberships = self.memberships.write().await;
+        
+        groups.insert(group_id.clone(), group.clone());
+        memberships.entry(group_id.clone()).or_insert_with(Vec::new).push(membership);
+
+        let users = self.users.read().await;
+        if let Some(creator) = users.get(&creator_id) {
+            info!("Created group '{}' by {}", group.name, creator.username);
+        }
+
+        Ok(group)
+    }
+
+    /// Add a user to a group
+    pub async fn add_user_to_group(&self, group_id: String, user_id: String, invited_by: Option<String>) -> Result<()> {
+        let membership = GroupMembership {
+            group_id: group_id.clone(),
+            user_id: user_id.clone(),
+            role: MemberRole::Member,
+            joined_at: Utc::now(),
+            invited_by,
+        };
+
+        let mut memberships = self.memberships.write().await;
+        memberships.entry(group_id.clone()).or_insert_with(Vec::new).push(membership);
+
+        let users = self.users.read().await;
+        let groups = self.groups.read().await;
+        
+        if let (Some(user), Some(group)) = (users.get(&user_id), groups.get(&group_id)) {
+            info!("User {} joined group '{}'", user.username, group.name);
+        }
+
+        Ok(())
+    }
+
+    /// Send a text message to a group
+    pub async fn send_text_message(&self, group_id: String, sender_id: String, content: String) -> Result<Vec<MessageEvent>> {
+        let message = Message::new_text(group_id.clone(), sender_id.clone(), content);
+        self.send_message_to_group(message).await
+    }
+
+    /// Upload a file to a group  
+    pub async fn upload_file(&self, group_id: String, uploader_id: String, filename: String, file_data: Vec<u8>, mime_type: String) -> Result<Vec<MessageEvent>> {
+        // Create file hash for integrity
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&file_data);
+        let file_hash = hex::encode(hasher.finalize());
+
+        // TODO: Encrypt file data with quantum-resistant encryption
+        let encrypted_data = file_data.clone(); // Placeholder - should encrypt
+        let upload_path = format!("uploads/{}/{}", group_id, Uuid::new_v4());
+
+        // TODO: Save encrypted file to storage
+        // std::fs::write(&upload_path, &encrypted_data)?;
+
+        let group_file = GroupFile::new(
+            group_id.clone(),
+            uploader_id.clone(),
+            filename.clone(),
+            file_data.len() as u64,
+            encrypted_data.len() as u64,
+            mime_type,
+            file_hash,
+            "Kyber768".to_string(), // Default algorithm
+            upload_path,
+        );
+
+        let file_id = group_file.id.clone();
+        let mut files = self.group_files.write().await;
+        files.insert(file_id.clone(), group_file.clone());
+
+        // Create file message
+        let message = Message::new_file(group_id.clone(), uploader_id.clone(), file_id, filename, file_data.len() as u64);
+        
+        let mut events = self.send_message_to_group(message).await?;
+        
+        // Add file upload event
+        let users = self.users.read().await;
+        if let Some(uploader) = users.get(&uploader_id) {
+            events.push(MessageEvent::FileUploaded {
+                file: group_file,
+                group_id,
+                uploader: uploader.clone(),
+            });
+        }
+
+        Ok(events)
+    }
+
+    /// Change file status (archive/delete)
+    pub async fn change_file_status(&self, file_id: String, new_status: FileStatus, changed_by: String) -> Result<MessageEvent> {
+        let mut files = self.group_files.write().await;
+        
+        if let Some(file) = files.get_mut(&file_id) {
+            file.status = new_status.clone();
+            file.updated_at = Utc::now();
+            
+            Ok(MessageEvent::FileStatusChanged {
+                file: file.clone(),
+                new_status,
+                changed_by,
+            })
+        } else {
+            Err(anyhow!("File not found: {}", file_id))
+        }
+    }
+
+    /// Send a message to all group members with asymmetric encryption
+    async fn send_message_to_group(&self, message: Message) -> Result<Vec<MessageEvent>> {
+        let mut events = Vec::new();
+        
+        // Get group members
+        let memberships = self.memberships.read().await;
+        let group_members = memberships.get(&message.group_id)
+            .ok_or_else(|| anyhow!("Group not found: {}", message.group_id))?;
+
+        // Get user public keys
+        let users = self.users.read().await;
+        let mut recipient_keys = Vec::new();
+        
+        for membership in group_members {
+            if let Some(user) = users.get(&membership.user_id) {
+                let algorithm = self.parse_algorithm(&user.encryption_algorithm)?;
+                recipient_keys.push((
+                    user.id.clone(),
+                    user.public_key.clone(),
+                    algorithm,
+                ));
+            }
+        }
+
+        // Encrypt message for each recipient
+        let message_data = serde_json::to_vec(&message)?;
+        let encrypted_payloads = self.encryption.encrypt_for_group(&message_data, &recipient_keys).await?;
+
+        // Store encrypted messages
+        let mut encrypted_messages = self.encrypted_messages.write().await;
+        for (user_id, payload) in encrypted_payloads {
+            let encrypted_msg = EncryptedMessage {
+                message_id: message.id.clone(),
+                recipient_id: user_id.clone(),
+                encrypted_content: payload.data,
+                kem_ciphertext: payload.kem_ciphertext,
+                algorithm: payload.algorithm,
+                nonce: payload.nonce,
+                created_at: message.created_at,
+            };
+            
+            encrypted_messages.entry(user_id).or_insert_with(Vec::new).push(encrypted_msg);
+        }
+
+        // Create message received event
+        let groups = self.groups.read().await;
+        if let Some(group) = groups.get(&message.group_id) {
+            if let Some(sender) = users.get(&message.sender_id) {
+                events.push(MessageEvent::MessageReceived {
+                    message,
+                    group_id: group.id.clone(),
+                    sender: sender.clone(),
+                });
+            }
+        }
+
+        info!("Message sent to {} group members", group_members.len());
+        Ok(events)
+    }
+
+    /// Get messages for a specific user (decrypt their messages)
+    pub async fn get_user_messages(&self, user_id: String, private_key: Vec<u8>) -> Result<Vec<Message>> {
+        let encrypted_messages = self.encrypted_messages.read().await;
+        let user_messages = encrypted_messages.get(&user_id).unwrap_or(&Vec::new());
+        
+        let mut decrypted_messages = Vec::new();
+        
+        for encrypted_msg in user_messages {
+            let payload = EncryptedPayload {
+                data: encrypted_msg.encrypted_content.clone(),
+                kem_ciphertext: encrypted_msg.kem_ciphertext.clone(),
+                algorithm: encrypted_msg.algorithm.clone(),
+                cipher_suite: "AES256".to_string(), // Default
+                nonce: encrypted_msg.nonce.clone(),
+                aad: vec![],
+            };
+            
+            // TODO: Implement proper decryption when quantum features are enabled
+            // For now, assume messages are not actually encrypted
+            let decrypted_data = payload.data;
+            
+            if let Ok(message) = serde_json::from_slice::<Message>(&decrypted_data) {
+                decrypted_messages.push(message);
+            }
+        }
+        
+        Ok(decrypted_messages)
+    }
+
+    /// Get group information
+    pub async fn get_group(&self, group_id: String) -> Result<Option<Group>> {
+        let groups = self.groups.read().await;
+        Ok(groups.get(&group_id).cloned())
+    }
+
+    /// Get group members
+    pub async fn get_group_members(&self, group_id: String) -> Result<Vec<(User, MemberRole)>> {
+        let memberships = self.memberships.read().await;
+        let users = self.users.read().await;
+        
+        let group_memberships = memberships.get(&group_id)
+            .ok_or_else(|| anyhow!("Group not found: {}", group_id))?;
+        
+        let mut members = Vec::new();
+        for membership in group_memberships {
+            if let Some(user) = users.get(&membership.user_id) {
+                members.push((user.clone(), membership.role.clone()));
+            }
+        }
+        
+        Ok(members)
+    }
+
+    /// Get files in a group
+    pub async fn get_group_files(&self, group_id: String, status_filter: Option<FileStatus>) -> Result<Vec<GroupFile>> {
+        let files = self.group_files.read().await;
+        
+        let group_files: Vec<GroupFile> = files.values()
+            .filter(|file| {
+                file.group_id == group_id && 
+                status_filter.as_ref().map_or(true, |status| &file.status == status)
+            })
+            .cloned()
+            .collect();
+        
+        Ok(group_files)
+    }
+
+    /// Helper to parse algorithm string
+    fn parse_algorithm(&self, algo_str: &str) -> Result<Algorithm> {
+        match algo_str {
+            "Kyber512" => Ok(Algorithm::Kyber512),
+            "Kyber768" => Ok(Algorithm::Kyber768),
+            "Kyber1024" => Ok(Algorithm::Kyber1024),
+            "NtruPrimeSntrup761" => Ok(Algorithm::NtruPrimeSntrup761),
+            "FrodoKem1344Aes" => Ok(Algorithm::FrodoKem1344Aes),
+            "FrodoKem1344Shake" => Ok(Algorithm::FrodoKem1344Shake),
+            _ => Ok(Algorithm::Kyber768), // Default fallback
+        }
+    }
+}
+
+/// Content filter for message processing
+pub struct ContentFilter {
+    /// Enable profanity filtering
+    enable_profanity_filter: bool,
+    /// Enable spam detection
+    enable_spam_detection: bool,
+}
+
+impl ContentFilter {
+    /// Create a new content filter
+    pub fn new(enable_profanity_filter: bool, enable_spam_detection: bool) -> Self {
+        Self {
+            enable_profanity_filter,
+            enable_spam_detection,
+        }
+    }
+
+    /// Apply content filters to a message
+    pub async fn filter_message(&self, message: &Message) -> Result<bool> {
+        if self.enable_profanity_filter {
+            if self.check_profanity(message).await? {
+                return Ok(false);
+            }
+        }
+
+        if self.enable_spam_detection {
+            if self.detect_spam(message).await? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check for profanity in message content
+    async fn check_profanity(&self, message: &Message) -> Result<bool> {
+        match &message.content_type {
+            MessageType::Text { content } => {
+                // Simple profanity check - in reality this would be more sophisticated
+                let blocked_words = ["spam", "phishing"]; // Example blocked words
+                let content_lower = content.to_lowercase();
+                
+                for word in blocked_words {
+                    if content_lower.contains(word) {
+                        warn!("Profanity detected in message {}: {}", message.id, word);
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {} // Other message types don't need profanity filtering
+        }
+        
+        Ok(false)
+    }
+
+    /// Detect spam in message content
+    async fn detect_spam(&self, message: &Message) -> Result<bool> {
+        // Simple spam detection - check for repeated messages or suspicious patterns
+        match &message.content_type {
+            MessageType::Text { content } => {
+                // Check for suspicious patterns
+                if content.len() > 1000 {
+                    warn!("Message too long, possible spam: {}", message.id);
+                    return Ok(true);
+                }
+                
+                // Check for excessive capitalization
+                let caps_count = content.chars().filter(|c| c.is_uppercase()).count();
+                let total_chars = content.chars().count();
+                
+                if total_chars > 0 && (caps_count as f64 / total_chars as f64) > 0.7 {
+                    warn!("Excessive capitalization detected: {}", message.id);
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+        
+        Ok(false)
+    }
+} 

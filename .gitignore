@@ -1,0 +1,73 @@
+# Credentials and local identity material
+.env
+.env.*
+!.env.example
+**/keys/
+**/*_private_key.*
+**/*_secret_key.*
+**/secret_key.*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+/pems/
+
+# Rust, JavaScript, and generated build output
+**/target/
+**/node_modules/
+**/dist/
+**/build/
+**/.build-context/
+**/.build-context-*/
+**/pkg/
+**/coverage/
+**/*.wasm
+!**/fixtures/**/*.wasm
+
+# Local network and contract state
+**/.spacekit/
+**/network-data/
+**/node-data/
+**/local-state/
+**/swx/compute_storage/
+**/*.pid
+**/*.log
+
+# Generated reports and research artifacts
+/tools/spacekit-cli/scratch/
+**/phase*.txt
+**/checkpoints/
+**/models/
+**/corpora/
+**/*.safetensors
+**/*.gguf
+**/*.bin
+**/*.onnx
+**/*.pt
+**/*.pth
+
+# Growformer release datasets and experiment output
+/ai/growformer/agent-data/
+/ai/growformer/data/cifar-10-batches-py/
+/ai/growformer/data/cifar10_export/
+/ai/growformer/data/cifar-10-python.tar.gz
+/ai/growformer/data/pathology/
+/ai/growformer/data/*-images-idx*-ubyte*
+/ai/growformer/data/*-labels-idx*-ubyte*
+/ai/growformer/capture_artifacts/
+/ai/growformer/certify_artifacts/
+/ai/growformer/drift_artifacts/
+/ai/growformer/reports/
+/ai/growformer/*_results.txt
+/ai/growformer/*_diagnostic.csv
+/ai/growformer/*_curve.csv
+/ai/growformer/*_proposals.csv
+/ai/growformer/*_captures.csv
+/ai/growformer/embeddings_*.json
+/ai/growformer/language_checkpoint.json
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

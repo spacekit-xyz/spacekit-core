@@ -1,0 +1,24 @@
+[package]
+name = "quantum-did-solana"
+version = "0.1.0"
+description = "Quantum-resistant DID management program for Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "quantum_did_solana"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"
+hex = "0.4.3"
+
+[dev-dependencies]
+solana-sdk = "~1.16.0"
+anchor-client = "0.29.0" 

@@ -1,0 +1,21 @@
+[package]
+name = "spacekit-compressor-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+spacekit-compressor = { path = ".." }
+
+[[bin]]
+name = "adaptive_envelope"
+path = "fuzz_targets/adaptive_envelope.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]
