@@ -1,0 +1,87 @@
+# Workspace root for spacekit-core.
+# Every crate under a category directory is a member, so `cargo build -p <name>`
+# works from here for all of them. Note that -p takes the *package* name from
+# each crate's [package] name field, which need not match its directory name:
+#   tools/spacekit-cli                     -> spacekit
+#   foundation/spacekit-contract-language  -> spacekit-contract-lang
+#   data/spacekit-quantum-verkle           -> spacekit-quantum-verkle-tree
+
+[workspace]
+resolver = "2"
+
+members = [
+  "consensus/*",
+  "data/spacekit-compressor",
+  "data/spacekit-diff",
+  "data/spacekit-mempool",
+  "data/spacekit-memsearcher",
+  "data/spacekit-quantum-verkle",
+  "data/spacekit-repo",
+  "economics/*",
+  "foundation/*",
+  "identity/*",
+  "infra/*",
+  "observability/*",
+  "operations/*",
+  "runtimes/*",
+  "tools/*",
+]
+
+# Anything here is invisible to `cargo build -p` from the root and does NOT
+# inherit [profile.release] or [patch.crates-io] below. Each nested workspace
+# root must set overflow-checks in its own manifest.
+exclude = [
+  # Nested workspace roots - Cargo cannot nest workspaces, so these are
+  # separate build graphs with their own lockfiles. Build with -p from inside.
+  "identity/spacekit-did-onchain",
+  "infra/spacekit-keymaster",
+  "sdks/spacekit-contract-sdk",
+  "sdks/spacekit-standard-library",
+
+  # Not Rust (TypeScript/JavaScript).
+  "runtimes/spacekit-js",
+  "sdks/spacekit-apps",
+  "sdks/spacekit-sdk",
+  "economics/spacekit-tokenomics",
+  "infra/spacekit-pay",
+
+  # wasm32 targets - built by their own scripts, different build graph.
+  "identity/wasm-did",
+  "data/spacekit-quantum-verkle/wasm-quantum-verkle",
+  "foundation/spacekit-primitives/wasm-kyber",
+  "foundation/spacekit-primitives/wasm-sphincs",
+
+  # Vendored third-party. Excluded so --workspace test/clippy/fmt skip them;
+  # [patch.crates-io] below still redirects to these paths.
+  "foundation/spacekit-primitives/vendor/pqcrypto-internals",
+  "foundation/spacekit-primitives/vendor/pqcrypto-kyber",
+  "foundation/spacekit-primitives/vendor/pqcrypto-sphincsplus",
+
+  # Crate nested inside another crate's src/ - see note.
+  "foundation/spacekit-primitives/src/v1/runtime",
+]
+
+# Balance, stake, and reward arithmetic must never wrap silently. A panic on
+# overflow takes down one node; a silent wrap corrupts consensus state across
+# the whole network and is not detectable after the fact.
+[profile.release]
+overflow-checks = true
+
+# Required at workspace level: patches in member manifests are ignored once the
+# repo root is a workspace.
+[patch.crates-io]
+pqcrypto-internals = { path = "foundation/spacekit-primitives/vendor/pqcrypto-internals" }
+pqcrypto-kyber     = { path = "foundation/spacekit-primitives/vendor/pqcrypto-kyber" }
+
+# Inherit in members with `version.workspace = true`, `edition.workspace = true`, etc.
+[workspace.package]
+edition      = "2021"
+rust-version = "1.82"
+license      = "Apache-2.0"
+
+# Inherit in members with `spacekit-primitives = { workspace = true }`.
+# Declaring internal crates here makes path deps depth-independent: moving a
+# crate between category directories touches one line, not every dependent.
+[workspace.dependencies]
+spacekit-primitives = { path = "foundation/spacekit-primitives" }
+spacekit-log        = { path = "observability/spacekit-log" }

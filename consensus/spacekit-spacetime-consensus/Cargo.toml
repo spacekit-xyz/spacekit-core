@@ -44,4 +44,4 @@ proptest = "1"
 
 [[test]]
 name = "e2e_cli_http_finalize"
-path = "e2e_cli_http_finalize.rs"
+path = "src/e2e_cli_http_finalize.rs"

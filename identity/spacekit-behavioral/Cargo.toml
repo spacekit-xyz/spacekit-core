@@ -37,10 +37,6 @@ path = "src/main.rs"
 
 # Behavioral Simulation Demos
 [[example]]
-name = "quick_demo"
-path = "examples/quick_demo.rs"
-
-[[example]]
 name = "simple_integration"
 path = "examples/simple_integration.rs"
 
