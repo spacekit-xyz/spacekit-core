@@ -2,6 +2,8 @@
 //!
 //! Provides quantum-secure distributed computing services integrated with the SpaceKit platform
 
+#![recursion_limit = "512"]
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};

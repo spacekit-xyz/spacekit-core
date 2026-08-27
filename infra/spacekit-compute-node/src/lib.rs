@@ -2,6 +2,8 @@
 //!
 //! Provides quantum-secure distributed computing services integrated with the SpaceKit platform
 
+#![recursion_limit = "512"]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
