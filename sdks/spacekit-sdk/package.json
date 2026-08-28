@@ -124,7 +124,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "typescript": "~5.9.3",
-    "@spacekit/spacekit-js": "git+https://github.com/spacekit-xyz/spacekit-js.git#main"
+    "@spacekit/spacekit-js": "file:../../runtimes/spacekit-js"
   },
   "dependencies": {
     "fflate": "^0.8.3"
