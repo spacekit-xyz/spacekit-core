@@ -68,6 +68,16 @@ pub fn slh_dsa_128s_sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
     Ok(sig.to_bytes().as_slice().to_vec())
 }
 
+/// Recover the 32-byte public key from a 64-byte SLH-DSA-128s private key.
+/// The SLH-DSA secret key embeds the public seed + root, so this is a pure
+/// derivation — used to restore a quantum identity from its recovery key.
+#[wasm_bindgen(js_name = "slhDsa128sPublicKey")]
+pub fn slh_dsa_128s_public_key(private_key: &[u8]) -> Result<Vec<u8>, JsError> {
+    let sk = SigningKey::<Sha2_128s>::try_from(private_key)
+        .map_err(|e| JsError::new(&format!("invalid SLH-DSA-128s private key: {e:?}")))?;
+    Ok(sk.verifying_key().to_bytes().as_slice().to_vec())
+}
+
 #[wasm_bindgen(js_name = "slhDsa128sVerify")]
 pub fn slh_dsa_128s_verify(
     public_key: &[u8],
@@ -103,6 +113,14 @@ pub fn slh_dsa_192s_sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
         .map_err(|e| JsError::new(&format!("invalid SLH-DSA-192s private key: {e:?}")))?;
     let sig = sk.sign(message);
     Ok(sig.to_bytes().as_slice().to_vec())
+}
+
+/// Recover the 48-byte public key from a 96-byte SLH-DSA-192s private key.
+#[wasm_bindgen(js_name = "slhDsa192sPublicKey")]
+pub fn slh_dsa_192s_public_key(private_key: &[u8]) -> Result<Vec<u8>, JsError> {
+    let sk = SigningKey::<Sha2_192s>::try_from(private_key)
+        .map_err(|e| JsError::new(&format!("invalid SLH-DSA-192s private key: {e:?}")))?;
+    Ok(sk.verifying_key().to_bytes().as_slice().to_vec())
 }
 
 #[wasm_bindgen(js_name = "slhDsa192sVerify")]

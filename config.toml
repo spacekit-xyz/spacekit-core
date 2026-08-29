@@ -26,6 +26,11 @@ quantum_algorithms = [
 ]
 chain_id = "spacekit-local"
 embedded_supervisor_mode = false
+# Durable world-state snapshot (accounts + balances) as a bincode file. With this
+# set, faucet claims and settled balances survive node restarts; the in-memory
+# Verkle tree is rebuilt on load. Remove it (or set SPACEKIT_SWTCHVM_DISABLE_PERSIST=1)
+# to run ephemerally.
+swtchvm_state_path = "./swx/swtchvm_state.bin"
 
 [compute.storage_config]
 enable_storage_integration = true

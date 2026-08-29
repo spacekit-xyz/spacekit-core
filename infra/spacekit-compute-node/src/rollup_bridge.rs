@@ -280,6 +280,51 @@ pub fn validate_rollup_bundle_with_policy(
     Ok(result)
 }
 
+/// The PQ address (`0x` + hex(SHA-256(pubkey)[0..20])) implied by a bundle
+/// signature's public key. Matches the frontend `pqAddressFromPublicKey` and
+/// `SwtchvmAddress::from_pq_public_key`, so the address a bundle is signed under
+/// is exactly the address whose funds it is allowed to move.
+pub fn signer_pq_address_hex(signature: &BundleSignature) -> Result<String, String> {
+    let pk = hex::decode(&signature.public_key_hex).map_err(|e| e.to_string())?;
+    if pk.is_empty() {
+        return Err("empty signer public key".to_string());
+    }
+    let digest = Sha256::digest(&pk);
+    Ok(format!("0x{}", hex::encode(&digest[..20])))
+}
+
+/// Guardrail for **self-custody** (browser-submitted) settlement: every native
+/// transfer in the bundle must spend FROM the signer's own address. A signature
+/// authorizes moving the signer's own funds and nothing else, so a browser
+/// cannot sign a bundle that drains an address it does not control. `to` may be
+/// any address (you can pay anyone). Returns the signer address on success.
+///
+/// This is what makes the un-operator-gated `/rollup/submit` route safe: the
+/// signature *is* the authorization, and it can only authorize the signer's
+/// own outflows.
+pub fn enforce_self_custody(bundle: &RollupBundle) -> Result<String, String> {
+    let signature = bundle
+        .signature
+        .as_ref()
+        .ok_or_else(|| "bundle is unsigned".to_string())?;
+    let signer = signer_pq_address_hex(signature)?.to_lowercase();
+    if let Some(payloads) = &bundle.tx_payloads {
+        for tx in payloads {
+            let mut from = tx.from.trim().to_lowercase();
+            if !from.starts_with("0x") {
+                from = format!("0x{from}");
+            }
+            if from != signer {
+                return Err(format!(
+                    "self-custody violation: signer {} cannot spend from {}",
+                    signer, tx.from
+                ));
+            }
+        }
+    }
+    Ok(signer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MerkleStep {
@@ -348,6 +393,80 @@ mod tests {
         // SHA-256("")[0..20] — the canonical PQ address rule (spacekit-did).
         let a = hex::encode(&Sha256::digest(b"")[..20]);
         assert_eq!(a, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4");
+    }
+
+    #[test]
+    fn self_custody_allows_own_outflow_and_rejects_foreign() {
+        let sig = BundleSignature {
+            algorithm: "slh-dsa-sha2-128s".into(),
+            public_key_hex:
+                "8f7a8204730b4f0422b78f3e112e3d551bea6c1f3d7ae6cddab1f15b2d32c019".into(),
+            signature_base64: String::new(),
+        };
+        let signer = signer_pq_address_hex(&sig).unwrap();
+
+        let mk = |from: &str| RollupBundle {
+            bundle_id: "b1".into(),
+            from_height: 0,
+            to_height: 0,
+            block_count: 0,
+            block_hashes: vec![],
+            state_roots: vec![],
+            quantum_state_roots: None,
+            tx_roots: vec![],
+            receipt_roots: vec![],
+            sealed_archives: vec![],
+            timestamp: 0,
+            bundle_hash: String::new(),
+            signature: Some(sig.clone()),
+            tx_payloads: Some(vec![BundleTxPayload {
+                block_index: 0,
+                from: from.to_string(),
+                to: Some("0x000000000000000000000000000000000000dead".into()),
+                data: String::new(),
+                value: "100".into(),
+                gas_limit: 0,
+            }]),
+        };
+
+        // Spending from the signer's own address is allowed; any other from is not.
+        assert!(enforce_self_custody(&mk(&signer)).is_ok());
+        assert!(enforce_self_custody(&mk("0x00000000000000000000000000000000deadbeef")).is_err());
+    }
+
+    #[test]
+    fn bundle_hash_matches_browser_canonical_vector() {
+        // Reference hash computed in kit.space-website (settlement.ts
+        // `computeBundleHash`) for this exact transfer bundle. Proves the JS and
+        // Rust bundle-hash canonical encodings agree, so a browser-signed
+        // bundle's `bundle_hash` is accepted by the node (`hash_valid`).
+        let bundle = RollupBundle {
+            bundle_id: "xfer-test-v1".into(),
+            from_height: 0,
+            to_height: 0,
+            block_count: 0,
+            block_hashes: vec![],
+            state_roots: vec![],
+            quantum_state_roots: None,
+            tx_roots: vec![],
+            receipt_roots: vec![],
+            sealed_archives: vec![],
+            timestamp: 1234567890,
+            bundle_hash: String::new(),
+            signature: None,
+            tx_payloads: Some(vec![BundleTxPayload {
+                block_index: 0,
+                from: "0x8f7a8204730b4f0422b78f3e112e3d551bea6c1f".into(),
+                to: Some("0x000000000000000000000000000000000000dead".into()),
+                data: String::new(),
+                value: "1000".into(),
+                gas_limit: 0,
+            }]),
+        };
+        assert_eq!(
+            compute_bundle_hash(&bundle).unwrap(),
+            "f8f2c01fb084fd9656a6bd03c1adddfa03508f16cb1bf65e1af23b81ba872a4e"
+        );
     }
 
     /// A pqcrypto SPHINCS+ round-trip stays green under the `sphincs-*` strings.

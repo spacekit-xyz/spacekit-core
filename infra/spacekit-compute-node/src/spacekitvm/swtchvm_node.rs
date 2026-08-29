@@ -6426,6 +6426,16 @@ impl SwtchvmNode {
             .and_then(validate_rollup_bundle_handler)
             .map(Reply::into_response);
 
+        // Self-custody submission (browser-signed, optimistic Pending). NOT
+        // operator-gated: the bundle signature authorizes it, and
+        // `enforce_self_custody` restricts it to the signer's own funds.
+        let submit_bundle = warp::path!("rollup" / "submit")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_node(node.clone()))
+            .and_then(submit_self_custody_bundle_handler)
+            .map(Reply::into_response);
+
         let list_bundles = warp::path!("rollup" / "bundles")
             .and(warp::get())
             .and(rollup_auth.clone())
@@ -6484,6 +6494,8 @@ impl SwtchvmNode {
         let rpc_routes = verify_proof.or(json_rpc).unify().or(faucet).unify();
 
         let rollup_routes = validate_bundle
+            .or(submit_bundle)
+            .unify()
             .or(list_bundles)
             .unify()
             .or(get_bundle)
@@ -7312,6 +7324,111 @@ fn normalize_root(s: &str) -> String {
         .trim_start_matches("verkle:")
         .trim_start_matches("0x")
         .to_ascii_lowercase()
+}
+
+/// Self-custody settlement submission (Phase 1: browser-signed, optimistic).
+///
+/// Unlike `/rollup/validate`, this route is intentionally NOT operator-token
+/// gated — the bundle's own signature is the authorization. Safety rests on two
+/// guarantees:
+///   1. `enforce_self_custody`: the signature can only move the signer's OWN
+///      funds (every `from` must equal `SHA-256(signerPubkey)[..20]`), so a
+///      valid signature can never drain an address the signer does not control.
+///   2. Replay protection by `bundle_id` (a bundle settles at most once).
+///
+/// It always settles as `Pending` (never `Verified`): a browser cannot prove a
+/// full-state account root. The operator-sequencer path (`/rollup/validate` +
+/// account_root determinism) is what upgrades settlements to `Verified`.
+async fn submit_self_custody_bundle_handler(
+    bundle: crate::rollup_bridge::RollupBundle,
+    node: Arc<SwtchvmNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use crate::rollup_bridge::{enforce_self_custody, validate_rollup_bundle, BundleStatus};
+    use warp::http::StatusCode;
+    use warp::Reply;
+
+    let json = |code: StatusCode, v: serde_json::Value| {
+        warp::reply::with_status(warp::reply::json(&v), code).into_response()
+    };
+
+    // Replay protection: a bundle id settles at most once.
+    match crate::rollup_registry::get_bundle(&bundle.bundle_id) {
+        Ok(Some(_)) => {
+            return Ok(json(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "status": "Rejected", "error": "bundle already submitted" }),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "status": "Rejected", "error": e }),
+            ));
+        }
+    }
+
+    // Hash + signature must be valid (self-custody: no operator key policy).
+    let validation = match validate_rollup_bundle(&bundle) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "status": "Rejected", "error": e }),
+            ));
+        }
+    };
+    if !validation.hash_valid || !validation.signature_valid {
+        return Ok(json(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({
+                "status": "Rejected",
+                "error": "invalid bundle hash or signature",
+                "hashValid": validation.hash_valid,
+                "signatureValid": validation.signature_valid,
+            }),
+        ));
+    }
+
+    // The signature may only move the signer's own funds.
+    let signer = match enforce_self_custody(&bundle) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(json(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "status": "Rejected", "error": e }),
+            ));
+        }
+    };
+
+    // Optimistic settlement — Pending (a browser cannot prove a full-state root).
+    match node.settle_rollup_bundle(&bundle).await {
+        Ok(transfers) => {
+            let _ = crate::rollup_registry::ingest_bundle(&bundle);
+            let _ = crate::rollup_registry::track_verified_bundle(
+                &bundle,
+                BundleStatus::Pending,
+                crate::rollup_bridge::DEFAULT_CHALLENGE_WINDOW_SECS,
+            );
+            tracing::info!(
+                bundle_id = %bundle.bundle_id, signer = %signer, transfers,
+                "self-custody bundle settled (Pending)"
+            );
+            Ok(json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "Pending",
+                    "bundleId": bundle.bundle_id,
+                    "signer": signer,
+                    "transfers": transfers,
+                }),
+            ))
+        }
+        Err(e) => Ok(json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "status": "Rejected", "error": e.to_string() }),
+        )),
+    }
 }
 
 async fn validate_rollup_bundle_handler(
