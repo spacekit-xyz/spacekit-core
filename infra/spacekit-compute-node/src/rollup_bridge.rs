@@ -187,7 +187,9 @@ pub fn validate_rollup_bundle(bundle: &RollupBundle) -> Result<BundleValidationR
                 key_allowed = signature_valid;
             }
             "sphincs" | "sphincs+" | "sphincs-128f" | "sphincs-128s" | "sphincs-192f"
-            | "sphincs-192s" | "sphincs-256f" | "sphincs-256s" => {
+            | "sphincs-192s" | "sphincs-256f" | "sphincs-256s"
+            // SLH-DSA (FIPS-205) wire strings from the browser/CLI:
+            | "slh-dsa-sha2-128s" | "slh-dsa-sha2-192s" => {
                 #[cfg(feature = "quantum")]
                 {
                     let pub_key_bytes =

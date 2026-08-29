@@ -135,7 +135,7 @@ pub fn verify_sphincs_signature(
             &signature.public_key,
             &signature.signature_bytes,
         )?,
-        "sphincs-128s" => verify_with_sha2_128s_simple(
+        "sphincs-128s" | "slh-dsa-sha2-128s" | "slh-dsa-128s" => verify_with_sha2_128s_simple(
             message,
             &signature.public_key,
             &signature.signature_bytes,
@@ -145,7 +145,7 @@ pub fn verify_sphincs_signature(
             &signature.public_key,
             &signature.signature_bytes,
         )?,
-        "sphincs-192s" => verify_with_sha2_192s_simple(
+        "sphincs-192s" | "slh-dsa-sha2-192s" => verify_with_sha2_192s_simple(
             message,
             &signature.public_key,
             &signature.signature_bytes,
