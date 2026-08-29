@@ -529,6 +529,30 @@ impl SwtchvmState {
     /// Quantum-resistant verkle state root.
     /// Falls back to legacy merkle root if the verkle tree is unavailable.
     /// TODO: Remove this once the verkle tree is fully integrated.
+    /// Deterministic commitment to ALL account state (balance, nonce, code).
+    /// Separate from `state_root()` (which covers only contract storage), so it
+    /// can be added without changing the existing consensus root. The browser
+    /// sequencer MUST compute this identically (address-sorted; LE u128 balance,
+    /// LE u64 nonce; SHA-256(code)) — see docs/VERKLE_REEXECUTION.md.
+    pub fn account_root(&self) -> String {
+        let mut addrs: Vec<&SwtchvmAddress> = self.accounts.keys().collect();
+        addrs.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"SPACEKIT-ACCOUNT-ROOT-v1\n");
+        for addr in addrs {
+            let acct = &self.accounts[addr];
+            hasher.update(addr.as_bytes());
+            hasher.update(&acct.balance.to_le_bytes());
+            hasher.update(&acct.nonce.to_le_bytes());
+            let code_hash = match &acct.code {
+                Some(code) => Sha256::digest(code).to_vec(),
+                None => vec![0u8; 32],
+            };
+            hasher.update(&code_hash);
+        }
+        format!("0x{}", hex::encode(hasher.finalize()))
+    }
+
     pub fn state_root(&self) -> [u8; 32] {
         if let Some(tree) = &self.verkle_tree {
             return tree.root().0;
@@ -980,7 +1004,7 @@ impl SwtchvmRuntime {
     fn growformer_brain_skip_tag(data: &[u8]) -> (u32, u32) {
         let n = data.len();
         let mut t0 = (n.wrapping_mul(0x9e3779b1)) as u32;
-        let mut t1 = ((n ^ 0xa5a5_a5a5) as u32);
+        let mut t1 = (n ^ 0xa5a5_a5a5) as u32;
         let head = 48.min(n);
         for i in 0..head {
             t0 = t0.wrapping_mul(31).wrapping_add(data[i] as u32);
@@ -5540,9 +5564,53 @@ impl SwtchvmNode {
 
         // Phase 2 — commit final balances.
         for (addr, bal) in cache {
-            self.runtime.setup_account_balance(&addr, bal).await?;
+            self.runtime
+                .setup_account_balance(&addr, bal)
+                .await
+                .map_err(|e| anyhow::anyhow!("ledger write failed for {}: {}", addr.to_string(), e))?;
         }
         Ok(applied)
+    }
+
+    /// Re-execute a bundle's native transfers on a CLONE and check the resulting
+    /// account root against the sequencer's committed root.
+    ///   Ok(Some(true))  committed root present and MATCHES
+    ///   Ok(Some(false)) committed root present but MISMATCHES
+    ///   Ok(None)        no committed account root -> optimistic settlement
+    pub async fn verify_rollup_bundle_roots(
+        &self,
+        bundle: &crate::rollup_bridge::RollupBundle,
+    ) -> anyhow::Result<Option<bool>> {
+        let committed = match bundle.quantum_state_roots.as_ref().and_then(|v| v.last()) {
+            Some(r) => r.clone(),
+            None => return Ok(None),
+        };
+
+        let mut scratch = { self.runtime.get_state().read().await.clone() };
+        if let Some(payloads) = &bundle.tx_payloads {
+            for tx in payloads {
+                let value: u128 = tx.value.parse().unwrap_or(0);
+                if value == 0 {
+                    continue;
+                }
+                let from = SwtchvmAddress::from_hex(&tx.from)?;
+                {
+                    let a = scratch.get_account_mut(&from);
+                    if a.balance < value {
+                        anyhow::bail!("reexec: insufficient balance for {}", tx.from);
+                    }
+                    a.balance -= value;
+                }
+                if let Some(to_str) = &tx.to {
+                    let to = SwtchvmAddress::from_hex(to_str)?;
+                    let a = scratch.get_account_mut(&to);
+                    a.balance = a.balance.saturating_add(value);
+                }
+            }
+        }
+
+        let computed = scratch.account_root();
+        Ok(Some(normalize_root(&computed) == normalize_root(&committed)))
     }
 
     pub async fn apply_faucet(
@@ -7237,6 +7305,15 @@ fn logs_bloom_hex(logs: &[SwtchvmLog]) -> String {
     format!("0x{}", hex::encode(bloom))
 }
 
+/// Root strings vary across the node (`verkle:…`, `0x…`, bare hex) — normalize
+/// before comparing a committed root to a recomputed one.
+fn normalize_root(s: &str) -> String {
+    s.trim()
+        .trim_start_matches("verkle:")
+        .trim_start_matches("0x")
+        .to_ascii_lowercase()
+}
+
 async fn validate_rollup_bundle_handler(
     _auth: (),
     bundle: crate::rollup_bridge::RollupBundle,
@@ -7265,40 +7342,58 @@ async fn validate_rollup_bundle_handler(
         Ok(result) => {
             let basic_ok = result.hash_valid && result.signature_valid && result.key_allowed;
 
-            // Optimistic settlement: signature + operator key policy are verified
-            // above; we apply the batch's native value transfers to the ledger.
-            // Full verkle state-root re-execution remains a follow-up, so status
-            // stays `Pending` (inside the challenge window), not `Verified`.
+            // Verify-then-settle: re-execute on a clone, check the committed
+            // account root, and mark `Verified` only on match. With no committed
+            // root (or, during rollout, on mismatch) fall back to optimistic
+            // settlement as `Pending`.
             let mut settled = false;
+            let mut verified = false;
             let mut settle_error: Option<String> = None;
             let mut re_exec_results: Vec<ReExecutionResult> = Vec::new();
 
             if basic_ok {
-                match node.settle_rollup_bundle(&bundle).await {
-                    Ok(n) => {
-                        settled = true;
+                match node.verify_rollup_bundle_roots(&bundle).await {
+                    Ok(Some(true)) => {
+                        verified = true;
+                        match node.settle_rollup_bundle(&bundle).await {
+                            Ok(n) => {
+                                settled = true;
+                                tracing::info!(
+                                    bundle_id = %bundle.bundle_id, transfers = n,
+                                    "rollup bundle verified and settled"
+                                );
+                            }
+                            Err(e) => settle_error = Some(e.to_string()),
+                        }
                         re_exec_results.push(ReExecutionResult {
-                            block_index: bundle.from_height,
+                            block_index: bundle.to_height,
                             expected_state_root: bundle
-                                .state_roots
-                                .last()
-                                .cloned()
+                                .quantum_state_roots
+                                .as_ref()
+                                .and_then(|v| v.last().cloned())
                                 .unwrap_or_default(),
-                            computed_state_root: String::from("applied"),
+                            computed_state_root: String::from("match"),
                             match_ok: true,
                         });
-                        tracing::info!(
-                            bundle_id = %bundle.bundle_id, transfers = n,
-                            "rollup bundle settled to the ledger"
-                        );
                     }
-                    Err(e) => {
-                        settle_error = Some(e.to_string());
+                    Ok(Some(false)) => {
+                        // ROLLOUT: mismatch is treated as unproven determinism,
+                        // not fraud — settle optimistically. Flip to reject+slash
+                        // once the Rust<->JS account_root vector passes.
                         tracing::warn!(
-                            bundle_id = %bundle.bundle_id, error = %e,
-                            "rollup bundle verified but settlement failed"
+                            bundle_id = %bundle.bundle_id,
+                            "account_root mismatch — settling optimistically pending determinism proof"
                         );
+                        match node.settle_rollup_bundle(&bundle).await {
+                            Ok(_) => settled = true,
+                            Err(e) => settle_error = Some(e.to_string()),
+                        }
                     }
+                    Ok(None) => match node.settle_rollup_bundle(&bundle).await {
+                        Ok(_) => settled = true,
+                        Err(e) => settle_error = Some(e.to_string()),
+                    },
+                    Err(e) => settle_error = Some(e.to_string()),
                 }
             }
 
@@ -7310,6 +7405,8 @@ async fn validate_rollup_bundle_handler(
 
             let status = if !basic_ok {
                 BundleStatus::Rejected
+            } else if verified && settled {
+                BundleStatus::Verified
             } else if settled {
                 BundleStatus::Pending
             } else {
@@ -7344,6 +7441,7 @@ async fn validate_rollup_bundle_handler(
                 "verification": verification,
                 "ingested": basic_ok && settled,
                 "settled": settled,
+                "verified": verified,
                 "error": settle_error,
                 "archived": archived
             }))

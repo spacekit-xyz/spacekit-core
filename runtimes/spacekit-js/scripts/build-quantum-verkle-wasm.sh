@@ -3,8 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPACEKIT_JS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ROOT="$(cd "$SPACEKIT_JS_ROOT/.." && pwd)"
-VERKLE_WASM="$ROOT/spacekit-quantum-verkle/wasm-quantum-verkle"
+# spacekit-js lives at spacekit-core/runtimes/spacekit-js; the quantum-verkle
+# crate lives under spacekit-core/data/. Resolve the core root two levels up
+# (overridable via SPACEKIT_CORE_ROOT / SPACEKIT_VERKLE_WASM).
+CORE_ROOT="${SPACEKIT_CORE_ROOT:-$(cd "$SPACEKIT_JS_ROOT/../.." && pwd)}"
+VERKLE_WASM="${SPACEKIT_VERKLE_WASM:-$CORE_ROOT/data/spacekit-quantum-verkle/wasm-quantum-verkle}"
 OUT_DIST="$SPACEKIT_JS_ROOT/dist/wasm"
 WEBSITE_OUT="${WEBSITE_WASM_OUT:-}"
 

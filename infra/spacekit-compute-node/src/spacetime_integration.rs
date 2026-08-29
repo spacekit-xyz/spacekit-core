@@ -274,7 +274,7 @@ pub use inner::bootstrap_consensus_growformer_agent;
 #[cfg(all(test, feature = "spacetime-consensus"))]
 mod tests {
     use super::{state_root_hex_to_b256, validate_block_spacetime_sidecar};
-    use alloy_primitives::B256;
+    use alloy_primitives::{keccak256, B256};
     use spacekit_spacetime_consensus::causal::CausalCoord;
     use spacekit_spacetime_consensus::{Rotor, SpacetimeTransition};
 

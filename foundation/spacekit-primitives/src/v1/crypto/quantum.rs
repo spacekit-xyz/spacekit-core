@@ -135,7 +135,11 @@ pub fn verify_sphincs_signature(
             &signature.public_key,
             &signature.signature_bytes,
         )?,
-        "sphincs-128s" | "slh-dsa-sha2-128s" | "slh-dsa-128s" => verify_with_sha2_128s_simple(
+        // NOTE: the `slh-dsa-*` (FIPS-205) wire strings are intentionally NOT
+        // accepted here. FIPS-205 SLH-DSA and SPHINCS+ round-3 (what
+        // pqcrypto-sphincsplus implements) share key/signature sizes but are not
+        // byte-compatible, so those strings route to `verify_slh_dsa_signature`.
+        "sphincs-128s" => verify_with_sha2_128s_simple(
             message,
             &signature.public_key,
             &signature.signature_bytes,
@@ -145,7 +149,7 @@ pub fn verify_sphincs_signature(
             &signature.public_key,
             &signature.signature_bytes,
         )?,
-        "sphincs-192s" | "slh-dsa-sha2-192s" => verify_with_sha2_192s_simple(
+        "sphincs-192s" => verify_with_sha2_192s_simple(
             message,
             &signature.public_key,
             &signature.signature_bytes,
@@ -168,6 +172,55 @@ pub fn verify_sphincs_signature(
         }
     };
 
+    Ok(ok)
+}
+
+/// Verify a **FIPS-205 SLH-DSA** signature produced by the RustCrypto `slh-dsa`
+/// crate — the browser `wasm-did` bindings, the CLI, and any other FIPS-205
+/// signer (empty-context / "pure" signing, as `signature::Signer::sign` does).
+///
+/// This is deliberately separate from [`verify_sphincs_signature`]. FIPS-205
+/// SLH-DSA and the SPHINCS+ round-3 scheme that `pqcrypto-sphincsplus`
+/// implements share key/signature *sizes* but are **not** byte-compatible
+/// (FIPS-205 changed the message-hash domain separation), so a signature from
+/// one will never verify under the other. Route the `slh-dsa-*` wire strings
+/// here; keep `sphincs-*` on [`verify_sphincs_signature`].
+///
+/// This mirrors `wasm-did::slh_dsa_*_verify` exactly (same crate + version), so
+/// a signature made in the browser verifies here byte-for-byte.
+#[cfg(all(feature = "slh-dsa", feature = "signature"))]
+pub fn verify_slh_dsa_signature(
+    message: &[u8],
+    algorithm: &str,
+    public_key: &[u8],
+    sig_bytes: &[u8],
+) -> anyhow::Result<bool> {
+    use signature::Verifier;
+    let alg = algorithm.trim().to_ascii_lowercase();
+    let ok = match alg.as_str() {
+        "slh-dsa-sha2-128s" | "slh-dsa-128s" => {
+            use slh_dsa::{Sha2_128s, VerifyingKey};
+            let vk = VerifyingKey::<Sha2_128s>::try_from(public_key)
+                .map_err(|e| anyhow::anyhow!("invalid SLH-DSA-SHA2-128s public key: {e:?}"))?;
+            let sig = slh_dsa::Signature::<Sha2_128s>::try_from(sig_bytes)
+                .map_err(|e| anyhow::anyhow!("invalid SLH-DSA-SHA2-128s signature: {e:?}"))?;
+            vk.verify(message, &sig).is_ok()
+        }
+        "slh-dsa-sha2-192s" | "slh-dsa-192s" => {
+            use slh_dsa::{Sha2_192s, VerifyingKey};
+            let vk = VerifyingKey::<Sha2_192s>::try_from(public_key)
+                .map_err(|e| anyhow::anyhow!("invalid SLH-DSA-SHA2-192s public key: {e:?}"))?;
+            let sig = slh_dsa::Signature::<Sha2_192s>::try_from(sig_bytes)
+                .map_err(|e| anyhow::anyhow!("invalid SLH-DSA-SHA2-192s signature: {e:?}"))?;
+            vk.verify(message, &sig).is_ok()
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unsupported SLH-DSA algorithm string: {}",
+                other
+            ));
+        }
+    };
     Ok(ok)
 }
 

@@ -260,7 +260,7 @@ mod tests {
     use crate::quantum_security::{QuantumResistantDID, QuantumResistantEncryption};
 
     async fn test_coordinator() -> (Arc<ConsensusCoordinator>, String) {
-        let identity = Arc::new(QuantumResistantDID::generate().unwrap());
+        let identity = Arc::new(QuantumResistantDID::new());
         let encryption = Arc::new(
             QuantumResistantEncryption::new("kyber512", &["kyber512".to_string()])
                 .await

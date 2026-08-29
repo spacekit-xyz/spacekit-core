@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/spacekit-xyz/spacekit-core"
 homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/data/spacekit-quantum-verkle/wasm-quantum-verkle"
+
+# Standalone wasm32 build target — detached from the spacekit-core workspace
+# (../../../Cargo.toml), which does not list this cdylib as a member. The
+# path dependency on the parent crate below still resolves across the boundary.
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 

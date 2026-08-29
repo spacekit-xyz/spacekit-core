@@ -2,7 +2,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "quantum")]
-use spacekit_primitives::v1::crypto::quantum::{verify_sphincs_signature, SPHINCSSignature};
+use spacekit_primitives::v1::crypto::quantum::{
+    verify_slh_dsa_signature, verify_sphincs_signature, SPHINCSSignature,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,10 +188,32 @@ pub fn validate_rollup_bundle(bundle: &RollupBundle) -> Result<BundleValidationR
                 signature_valid = verifying_key.verify(&msg, &signature).is_ok();
                 key_allowed = signature_valid;
             }
+            // FIPS-205 SLH-DSA wire strings (browser wasm-did / CLI). Verified
+            // with the RustCrypto `slh-dsa` crate — NOT pqcrypto's SPHINCS+ r3,
+            // which is a different, non-interoperable scheme despite equal sizes.
+            "slh-dsa-sha2-128s" | "slh-dsa-128s" | "slh-dsa-sha2-192s" | "slh-dsa-192s" => {
+                #[cfg(feature = "quantum")]
+                {
+                    let pub_key_bytes =
+                        hex::decode(&signature.public_key_hex).map_err(|e| e.to_string())?;
+                    let sig_bytes =
+                        base64::decode(&signature.signature_base64).map_err(|e| e.to_string())?;
+                    signature_valid = verify_slh_dsa_signature(
+                        &msg,
+                        &signature.algorithm,
+                        &pub_key_bytes,
+                        &sig_bytes,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    key_allowed = signature_valid;
+                }
+                #[cfg(not(feature = "quantum"))]
+                {
+                    return Err("Quantum feature not enabled".to_string());
+                }
+            }
             "sphincs" | "sphincs+" | "sphincs-128f" | "sphincs-128s" | "sphincs-192f"
-            | "sphincs-192s" | "sphincs-256f" | "sphincs-256s"
-            // SLH-DSA (FIPS-205) wire strings from the browser/CLI:
-            | "slh-dsa-sha2-128s" | "slh-dsa-sha2-192s" => {
+            | "sphincs-192s" | "sphincs-256f" | "sphincs-256s" => {
                 #[cfg(feature = "quantum")]
                 {
                     let pub_key_bytes =
@@ -312,4 +336,84 @@ pub struct SlashRecord {
     pub fraud_proof: FraudProof,
     pub slash_amount: u64,
     pub timestamp: u64,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pq_address_matches_spec_vector() {
+        // SHA-256("")[0..20] — the canonical PQ address rule (spacekit-did).
+        let a = hex::encode(&Sha256::digest(b"")[..20]);
+        assert_eq!(a, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4");
+    }
+
+    /// A pqcrypto SPHINCS+ round-trip stays green under the `sphincs-*` strings.
+    #[cfg(feature = "quantum")]
+    #[test]
+    fn sphincs_128s_roundtrip_verifies() {
+        use spacekit_primitives::v1::crypto::quantum::{
+            generate_sphincs_keypair, sign_sphincs_detached,
+        };
+        let (pk, sk) = generate_sphincs_keypair("sphincs-128s").unwrap();
+        let msg = b"rollup-bundle-hash";
+        let signed = sign_sphincs_detached(msg, "sphincs-128s", &pk, &sk).unwrap();
+        let s = SPHINCSSignature {
+            signature_bytes: signed.signature_bytes,
+            algorithm: "sphincs-128s".into(),
+            public_key: pk,
+        };
+        assert!(verify_sphincs_signature(msg, &s).unwrap());
+    }
+
+    // ── SLH-DSA (FIPS-205) browser determinism vector ──────────────────────
+    //
+    // A real (public key, signature) generated in kit.space-website by
+    // `wasm-did`'s SLH-DSA-SHA2-128s bindings (pure-Rust `slh-dsa` / FIPS-205),
+    // signing VECTOR_MSG. It MUST verify under this node's
+    // `verify_slh_dsa_signature`, proving the browser signer and the node
+    // verifier share one parameter set — i.e. a browser-signed settlement bundle
+    // is acceptable here. If this fails, the two SLH-DSA impls diverged and
+    // settlement signatures would be silently rejected.
+    #[cfg(feature = "quantum")]
+    const VECTOR_MSG: &[u8] = b"spacekit-slh-dsa-determinism-vector-v1";
+    #[cfg(feature = "quantum")]
+    const VECTOR_PUB_HEX: &str =
+        "8f7a8204730b4f0422b78f3e112e3d551bea6c1f3d7ae6cddab1f15b2d32c019";
+    #[cfg(feature = "quantum")]
+    const VECTOR_SIG_HEX: &str = include_str!("../tests/vectors/slh_dsa_128s_browser.sig.hex");
+
+    #[cfg(feature = "quantum")]
+    #[test]
+    fn slh_dsa_browser_wasm_vector_verifies() {
+        let pk = hex::decode(VECTOR_PUB_HEX).unwrap();
+        let sig = hex::decode(VECTOR_SIG_HEX.trim()).unwrap();
+        assert_eq!(pk.len(), 32, "SLH-DSA-SHA2-128s public key is 32 bytes");
+        assert_eq!(sig.len(), 7856, "SLH-DSA-SHA2-128s signature is 7856 bytes");
+        let ok =
+            verify_slh_dsa_signature(VECTOR_MSG, "slh-dsa-sha2-128s", &pk, &sig).unwrap();
+        assert!(
+            ok,
+            "browser wasm-did SLH-DSA-128s signature must verify on the node"
+        );
+    }
+
+    /// Negative control: the same signature must NOT verify for a different
+    /// message — guards against an accidentally-permissive verifier.
+    #[cfg(feature = "quantum")]
+    #[test]
+    fn slh_dsa_browser_wasm_vector_rejects_tampered_message() {
+        let pk = hex::decode(VECTOR_PUB_HEX).unwrap();
+        let sig = hex::decode(VECTOR_SIG_HEX.trim()).unwrap();
+        let ok = verify_slh_dsa_signature(
+            b"spacekit-slh-dsa-determinism-vector-v2",
+            "slh-dsa-sha2-128s",
+            &pk,
+            &sig,
+        )
+        .unwrap();
+        assert!(!ok, "signature must not verify for a different message");
+    }
 }

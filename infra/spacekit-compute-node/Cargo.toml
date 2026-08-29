@@ -136,6 +136,10 @@ flate2 = "1.1.5"
 [features]
 default = ["storage-integration", "gpu"]
 standalone = ["clap", "tracing-subscriber", "toml", "serde_yaml", "storage-integration", "spacetime-consensus"]
+# Turns on the compute node's SLH-DSA/SPHINCS+ rollup-signature verify call
+# sites (rollup_bridge.rs #[cfg(feature = "quantum")]). spacekit-primitives is
+# already built with its own quantum feature, so this is just the local gate.
+quantum = ["spacekit-primitives/quantum"]
 gpu = ["wgpu"]
 storage-integration = ["spacekit-storage-node"]  # Enhanced storage integration (no SQL)
 python-compression = ["pyo3"]  # Enable Python SpaceKit Compressor bridge
