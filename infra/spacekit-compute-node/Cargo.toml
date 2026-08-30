@@ -134,8 +134,8 @@ libp2p = { version = "0.54", features = ["tcp", "mdns", "noise", "yamux", "ident
 flate2 = "1.1.5"
 
 [features]
-default = ["storage-integration", "gpu"]
-standalone = ["clap", "tracing-subscriber", "toml", "serde_yaml", "storage-integration", "spacetime-consensus"]
+default = ["storage-integration", "gpu", "quantum"]
+standalone = ["clap", "tracing-subscriber", "toml", "serde_yaml", "storage-integration", "spacetime-consensus", "quantum"]
 # Turns on the compute node's SLH-DSA/SPHINCS+ rollup-signature verify call
 # sites (rollup_bridge.rs #[cfg(feature = "quantum")]). spacekit-primitives is
 # already built with its own quantum feature, so this is just the local gate.
