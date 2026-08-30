@@ -334,6 +334,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spacekit-treasury"
+version = "0.1.0"
+dependencies = [
+ "spacekit-contract-sdk",
+ "wee_alloc",
+]
+
+[[package]]
 name = "spacekit-tube"
 version = "0.1.0"
 dependencies = [

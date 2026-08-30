@@ -804,6 +804,33 @@ impl SwtchComputeNode {
             ));
             tracing::info!("Service Reward Accumulator (SRA) enabled on SwtchVM");
         }
+        if config.compute.potw_config.enabled {
+            match spacekit_compute_node::PoTWHost::new(config.compute.potw_config.clone()) {
+                Ok(host) => {
+                    swtchvm_node.set_potw_host(host);
+                    tracing::info!(
+                        reviewers = config.compute.potw_config.reviewers.len(),
+                        threshold = config.compute.potw_config.threshold,
+                        "Proof of Tangible Works (PoTW) award host enabled on SwtchVM"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "PoTW host init failed; awards disabled"),
+            }
+        }
+        if config.compute.treasury_config.enabled {
+            swtchvm_node.ensure_system_contracts().await?;
+            match spacekit_compute_node::TreasuryHost::new(config.compute.treasury_config.clone()) {
+                Ok(host) => {
+                    swtchvm_node.set_treasury_host(host);
+                    tracing::info!(
+                        contract = %config.compute.treasury_config.treasury_contract,
+                        custodian = %config.compute.treasury_config.custodian_address,
+                        "Treasury disbursement bridge enabled on SwtchVM"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "Treasury bridge init failed; disabled"),
+            }
+        }
         let swtchvm_node = Arc::new(swtchvm_node);
 
         #[cfg(feature = "spacetime-consensus")]

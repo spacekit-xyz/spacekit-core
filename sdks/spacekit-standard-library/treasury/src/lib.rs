@@ -25,12 +25,16 @@
 //! | Op | Opcode | Payload |
 //! |----|--------|---------|
 //! | INIT         | 0x01 | [balance 16][threshold 8][signer_count 8][signer 32]×count |
-//! | PROPOSE      | 0x10 | [spend_id 32][recipient 32][amount 16][memo 32] |
+//! | PROPOSE      | 0x10 | [spend_id 32][recipient 20][amount 16][memo 32] |
 //! | APPROVE      | 0x11 | [spend_id 32] |
 //! | DEPOSIT      | 0x20 | [amount 16]  (signer-only; records a host-bridged inflow) |
 //! | GET_BALANCE  | 0x30 | (empty) → [balance 16] |
-//! | GET_PROPOSAL | 0x31 | [spend_id 32] → [recipient 32][amount 16][memo 32][approvals 8][executed 1] |
+//! | GET_PROPOSAL | 0x31 | [spend_id 32] → [recipient 20][amount 16][memo 32][approvals 8][executed 1] |
 //! | GET_CONFIG   | 0x32 | (empty) → [threshold 8][signer_count 8] |
+//!
+//! `recipient` is a **20-byte native address** (PQ or EVM). A `treasury.disbursed`
+//! event therefore maps directly to a native-ledger transfer by the host bridge —
+//! the same spendable ledger the faucet credits and settlement moves.
 
 #![no_std]
 
@@ -45,7 +49,7 @@ use spacekit_contract_sdk::{
     spacekit_contract,
     spacekit_storage::{storage_load, storage_save},
     wire::{read_u64, read_u8},
-    ContractError, SpacekitContract,
+    ContractError, ContractErrorCode, SpacekitContract,
 };
 
 #[global_allocator]
@@ -66,6 +70,7 @@ const OP_GET_PROPOSAL: u8 = 0x31;
 const OP_GET_CONFIG: u8 = 0x32;
 
 const ZERO_HASH: [u8; 32] = [0u8; 32];
+const ZERO_ADDR: [u8; 20] = [0u8; 20];
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const KEY_INIT: &str = "treasury.initialized";
@@ -152,11 +157,11 @@ fn op_propose(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError
     require_signer(&caller)?;
 
     let spend_id = read_did_hash(input, cursor)?;
-    let recipient = read_did_hash(input, cursor)?;
+    let recipient = read_address20(input, cursor)?;
     let amount = read_u128(input, cursor)?;
     let memo = read_did_hash(input, cursor)?;
 
-    if amount == 0 || recipient == ZERO_HASH || spend_id == ZERO_HASH {
+    if amount == 0 || recipient == ZERO_ADDR || spend_id == ZERO_HASH {
         return Err(ContractError::InvalidInput);
     }
     if storage_load(&proposal_key(&spend_id)).is_ok() {
@@ -230,7 +235,8 @@ fn try_execute(spend_id: &[u8; 32]) -> Result<(), ContractError> {
     prop.executed = 1;
     write_proposal(spend_id, &prop)?;
 
-    let mut payload = Vec::with_capacity(96);
+    // Disbursed payload: spend_id(32)+recipient(20)+amount(16)+memo(32) = 100 bytes.
+    let mut payload = Vec::with_capacity(100);
     payload.extend_from_slice(spend_id);
     payload.extend_from_slice(&prop.recipient);
     payload.extend_from_slice(&prop.amount.to_le_bytes());
@@ -269,7 +275,7 @@ fn op_get_balance() -> Result<Vec<u8>, ContractError> {
 fn op_get_proposal(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
     let spend_id = read_did_hash(input, cursor)?;
     let prop = read_proposal(&spend_id)?;
-    let mut out = Vec::with_capacity(89);
+    let mut out = Vec::with_capacity(PROPOSAL_RECORD_LEN);
     out.extend_from_slice(&prop.recipient);
     out.extend_from_slice(&prop.amount.to_le_bytes());
     out.extend_from_slice(&prop.memo);
@@ -304,15 +310,18 @@ fn require_signer(caller: &[u8; 32]) -> Result<(), ContractError> {
 
 // ── Proposal record ──────────────────────────────────────────────────────────
 struct Proposal {
-    recipient: [u8; 32],
+    recipient: [u8; 20],
     amount: u128,
     memo: [u8; 32],
     approvals: u64,
     executed: u8,
 }
 
+// Proposal record: recipient(20)+amount(16)+memo(32)+approvals(8)+executed(1) = 77 bytes.
+const PROPOSAL_RECORD_LEN: usize = 77;
+
 fn write_proposal(spend_id: &[u8; 32], p: &Proposal) -> Result<(), ContractError> {
-    let mut buf = Vec::with_capacity(89);
+    let mut buf = Vec::with_capacity(PROPOSAL_RECORD_LEN);
     buf.extend_from_slice(&p.recipient);
     buf.extend_from_slice(&p.amount.to_le_bytes());
     buf.extend_from_slice(&p.memo);
@@ -323,23 +332,23 @@ fn write_proposal(spend_id: &[u8; 32], p: &Proposal) -> Result<(), ContractError
 
 fn read_proposal(spend_id: &[u8; 32]) -> Result<Proposal, ContractError> {
     let bytes = storage_load(&proposal_key(spend_id)).map_err(|_| ContractError::InvalidInput)?;
-    if bytes.len() < 89 {
+    if bytes.len() < PROPOSAL_RECORD_LEN {
         return Err(ContractError::StorageError);
     }
-    let mut recipient = [0u8; 32];
-    recipient.copy_from_slice(&bytes[0..32]);
+    let mut recipient = [0u8; 20];
+    recipient.copy_from_slice(&bytes[0..20]);
     let mut amt = [0u8; 16];
-    amt.copy_from_slice(&bytes[32..48]);
+    amt.copy_from_slice(&bytes[20..36]);
     let mut memo = [0u8; 32];
-    memo.copy_from_slice(&bytes[48..80]);
+    memo.copy_from_slice(&bytes[36..68]);
     let mut appr = [0u8; 8];
-    appr.copy_from_slice(&bytes[80..88]);
+    appr.copy_from_slice(&bytes[68..76]);
     Ok(Proposal {
         recipient,
         amount: u128::from_le_bytes(amt),
         memo,
         approvals: u64::from_le_bytes(appr),
-        executed: bytes[88],
+        executed: bytes[76],
     })
 }
 
@@ -398,6 +407,16 @@ fn read_did_hash(input: &[u8], cursor: &mut usize) -> Result<[u8; 32], ContractE
     let mut a = [0u8; 32];
     a.copy_from_slice(&input[*cursor..*cursor + 32]);
     *cursor += 32;
+    Ok(a)
+}
+
+fn read_address20(input: &[u8], cursor: &mut usize) -> Result<[u8; 20], ContractError> {
+    if input.len() < *cursor + 20 {
+        return Err(ContractError::InvalidInput);
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&input[*cursor..*cursor + 20]);
+    *cursor += 20;
     Ok(a)
 }
 

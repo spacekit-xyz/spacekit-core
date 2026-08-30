@@ -66,6 +66,12 @@ pub use potw::{
     award_digest, AwardInstruction, PoTWAccumulator, PoTWConfig, PoTWError, PoTWReceipt,
     ReviewerApproval,
 };
+// Host integration for PoTW awards (config + shared accumulator + node wiring).
+pub mod potw_host;
+pub use potw_host::{PoTWHost, PoTWHostConfig};
+// Host bridge that mirrors executed Treasury disbursements to the native ledger.
+pub mod treasury_host;
+pub use treasury_host::{TreasuryHost, TreasuryHostConfig};
 
 // Add VPoS module
 pub mod vpos;
@@ -380,6 +386,12 @@ pub struct ComputeConfig {
     /// Service Reward Accumulator (production emission path).
     #[serde(default)]
     pub sra_config: service_reward_accumulator::SraHostConfig,
+    /// Proof of Tangible Works award host (reviewer-quorum emission path).
+    #[serde(default)]
+    pub potw_config: potw_host::PoTWHostConfig,
+    /// Treasury disbursement bridge (mirrors executed spends to native ledger).
+    #[serde(default)]
+    pub treasury_config: treasury_host::TreasuryHostConfig,
     // Sigmoid bonding curve configuration
     pub sigmoid_bonding_curve: SigmoidBondingCurve,
     // Quarterly reward distribution configuration
@@ -4372,6 +4384,8 @@ impl Default for ComputeConfig {
             consensus_config: SwtchConsensusConfig::default(),
             token_reward_config: TokenRewardConfig::default(),
             sra_config: service_reward_accumulator::SraHostConfig::default(),
+            potw_config: potw_host::PoTWHostConfig::default(),
+            treasury_config: treasury_host::TreasuryHostConfig::default(),
             sigmoid_bonding_curve: SigmoidBondingCurve::default(),
             quarterly_reward_config: QuarterlyRewardConfig::default(),
             swtchvm_state_path: None,

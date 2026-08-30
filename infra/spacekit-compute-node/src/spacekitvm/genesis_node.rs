@@ -140,6 +140,11 @@ pub mod system_contracts {
     pub const DID_REGISTRY: &str = "0x0000000000000000000000000000000000000002";
     /// AstraRewards SKCL contract (SRA CREDIT target).
     pub const ASTRA_REWARDS: &str = "0x0000000000000000000000000000000000000003";
+    /// Treasury SKCL contract (M-of-N governed pool). This address also acts as
+    /// the native custodian of the pool: the host bridge moves disbursed funds
+    /// FROM this address on the spendable ledger, so its native genesis balance
+    /// must equal the balance the contract is INIT'd with.
+    pub const TREASURY: &str = "0x0000000000000000000000000000000000000004";
 }
 
 /// Try to load the DID registry WASM binary from known build paths.
@@ -160,6 +165,16 @@ fn load_astra_rewards_wasm() -> Option<Vec<u8>> {
     )
 }
 
+fn load_treasury_wasm() -> Option<Vec<u8>> {
+    load_system_wasm(
+        &[
+            "spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_treasury.wasm",
+            "../spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_treasury.wasm",
+        ],
+        "Treasury",
+    )
+}
+
 /// Install system contract WASM at well-known addresses if not already present.
 pub fn install_system_contracts(state: &mut crate::spacekitvm::swtchvm_node::SwtchvmState) {
     install_contract_if_missing(
@@ -172,6 +187,7 @@ pub fn install_system_contracts(state: &mut crate::spacekitvm::swtchvm_node::Swt
         system_contracts::ASTRA_REWARDS,
         load_astra_rewards_wasm(),
     );
+    install_contract_if_missing(state, system_contracts::TREASURY, load_treasury_wasm());
 }
 
 fn install_contract_if_missing(
@@ -236,6 +252,20 @@ impl Default for GenesisConfig {
                 balance: 0,
                 nonce: 0,
                 code: load_astra_rewards_wasm(),
+                storage: None,
+                account_type: AccountType::System,
+            },
+        );
+
+        // Treasury — M-of-N governed pool. Genesis native balance is 0 here; the
+        // pool is provisioned operationally (fund this address to match the
+        // balance the contract is INIT'd with) so no supply figure is baked in.
+        alloc.insert(
+            system_contracts::TREASURY.to_string(),
+            GenesisAccount {
+                balance: 0,
+                nonce: 0,
+                code: load_treasury_wasm(),
                 storage: None,
                 account_type: AccountType::System,
             },

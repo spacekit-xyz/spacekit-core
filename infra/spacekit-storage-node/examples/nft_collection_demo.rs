@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //! NFT Collection Management Demo
 //!
@@ -20,7 +20,7 @@ use spacekit_storage_node::{
     CollectionProperties, CollectionQuery, CollectionSortCriteria, FactStorageConfig,
     FactStorageEngine, MintConfig, NftAttribute, NftCollection, NftCollectionManager, NftMetadata,
     NftStorageManager, RoyaltyConfig, RoyaltySplit, SaleData, SocialLinks, StorageNode,
-    StorageNodeConfig, TokenStandard,
+    StorageNodeConfig, TokenStandard, PersistenceConfig,
 };
 
 #[tokio::main]
@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         enable_real_transactions: false,
         #[cfg(feature = "api-server")]
         api_config: None,
+        persistence: PersistenceConfig::default(),
     };
 
     let storage_node = Arc::new(StorageNode::new(config).await?);

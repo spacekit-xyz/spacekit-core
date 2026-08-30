@@ -5494,6 +5494,10 @@ pub struct SwtchvmNode {
     faucet_requests: Arc<RwLock<HashMap<String, FaucetRecord>>>,
     /// Optional SRA host (production ASTRA emission). See `service_reward_accumulator`.
     sra_host: Option<Arc<crate::service_reward_accumulator::SraHost>>,
+    /// Optional PoTW award host (reviewer-quorum emission). See `potw_host`.
+    potw_host: Option<Arc<crate::potw_host::PoTWHost>>,
+    /// Optional Treasury disbursement bridge (native mirror). See `treasury_host`.
+    treasury_host: Option<Arc<crate::treasury_host::TreasuryHost>>,
     /// Locally mined blocks. The standalone process bridges this stream to the real TCP P2P layer.
     mined_blocks_tx: broadcast::Sender<SwtchvmBlock>,
 }
@@ -5613,6 +5617,15 @@ impl SwtchvmNode {
         Ok(Some(normalize_root(&computed) == normalize_root(&committed)))
     }
 
+    /// Current commitment over ALL account state (balance, nonce, code), as the
+    /// operator-sequencer must reproduce and stamp into a bundle's
+    /// `quantum_state_roots` to have it settle `Verified`. Exposed read-only at
+    /// `/rollup/account-root` so a sequencer can fetch the pre-state root and
+    /// verify its own deterministic computation against this node.
+    pub async fn current_account_root(&self) -> String {
+        self.runtime.get_state().read().await.account_root()
+    }
+
     pub async fn apply_faucet(
         &self,
         did: &str,
@@ -5717,6 +5730,8 @@ impl SwtchvmNode {
             chain_id_num: 1337,
             faucet_requests: Arc::new(RwLock::new(HashMap::new())),
             sra_host: None,
+            potw_host: None,
+            treasury_host: None,
             mined_blocks_tx,
         })
     }
@@ -5749,6 +5764,200 @@ impl SwtchvmNode {
 
     pub fn sra_host(&self) -> Option<&Arc<crate::service_reward_accumulator::SraHost>> {
         self.sra_host.as_ref()
+    }
+
+    /// Attach the Proof of Tangible Works award host (enables `/potw/award`).
+    pub fn set_potw_host(&mut self, host: Arc<crate::potw_host::PoTWHost>) {
+        self.potw_host = Some(host);
+    }
+
+    pub fn potw_host(&self) -> Option<&Arc<crate::potw_host::PoTWHost>> {
+        self.potw_host.as_ref()
+    }
+
+    /// Attach the Treasury disbursement bridge (enables `/treasury/disburse`).
+    pub fn set_treasury_host(&mut self, host: Arc<crate::treasury_host::TreasuryHost>) {
+        self.treasury_host = Some(host);
+    }
+
+    pub fn treasury_host(&self) -> Option<&Arc<crate::treasury_host::TreasuryHost>> {
+        self.treasury_host.as_ref()
+    }
+
+    /// Verify a PoTW reviewer-quorum receipt and, on success, credit the
+    /// recipient's **native** (spendable) balance — the same ledger the faucet
+    /// credits and settlement moves, denominated in uASTRA. The reviewer quorum,
+    /// per-work cap, per-epoch budget, and `work_id` replay guard (all enforced
+    /// in [`PoTWHost::authorize`]) are what bound emission; no minting occurs.
+    ///
+    /// Budget/replay state is committed before the credit, so a returned award
+    /// has already consumed its epoch budget and replay slot. The only failure
+    /// possible after that point is a ledger write error (the recipient address
+    /// is validated during verification), which is logged for reconciliation.
+    pub async fn potw_award(
+        &self,
+        receipt: crate::potw::PoTWReceipt,
+    ) -> std::result::Result<crate::potw::AwardInstruction, String> {
+        let host = self
+            .potw_host
+            .as_ref()
+            .ok_or_else(|| "PoTW awards are not enabled on this node".to_string())?;
+        if !host.enabled() {
+            return Err("PoTW awards are not enabled on this node".to_string());
+        }
+
+        // Verify quorum + budget + cap + replay, and commit the budget/replay
+        // state. Returns the (recipient, amount) to credit.
+        let instruction = host.authorize(&receipt).await.map_err(|e| e.to_string())?;
+
+        // Credit the native, spendable balance (uASTRA) — mirrors the faucet.
+        let addr = SwtchvmAddress::from_hex(&instruction.recipient)
+            .map_err(|e| format!("bad PoTW recipient {}: {}", instruction.recipient, e))?;
+        let current = self.runtime.get_account_balance(&addr).await.unwrap_or(0);
+        let next = current
+            .checked_add(instruction.amount)
+            .ok_or_else(|| "recipient balance overflow".to_string())?;
+        if let Err(e) = self.runtime.setup_account_balance(&addr, next).await {
+            tracing::error!(
+                work = %instruction.work_id_hex,
+                recipient = %instruction.recipient,
+                amount = instruction.amount,
+                error = %e,
+                "PoTW award verified and budget-committed but native credit FAILED — reconcile"
+            );
+            return Err(format!("award verified but credit failed: {e}"));
+        }
+        self.runtime.persist_state_if_configured().await;
+
+        tracing::info!(
+            work = %instruction.work_id_hex,
+            recipient = %instruction.recipient,
+            amount = instruction.amount,
+            epoch = instruction.epoch,
+            "PoTW award credited (native, spendable)"
+        );
+        Ok(instruction)
+    }
+
+    /// Mirror an executed Treasury disbursement to the native (spendable) ledger.
+    ///
+    /// Reads the Treasury contract's own `GET_PROPOSAL` state and acts only if it
+    /// reports `executed == 1` (the M-of-N approval lives in the contract). The
+    /// disbursement is claimed atomically before any funds move, so a single
+    /// executed spend can be paid out at most once. Funds move FROM the
+    /// configured custodian address; the call fails (without reserving) if the
+    /// custodian is underfunded. Returns `(recipient, amount)`.
+    pub async fn treasury_disburse(
+        &self,
+        spend_id_hex: &str,
+    ) -> std::result::Result<(String, u128), String> {
+        let host = self
+            .treasury_host
+            .as_ref()
+            .ok_or_else(|| "Treasury bridge is not enabled on this node".to_string())?;
+        if !host.enabled() {
+            return Err("Treasury bridge is not enabled on this node".to_string());
+        }
+
+        let spend_hex = spend_id_hex.trim().trim_start_matches("0x").to_ascii_lowercase();
+        let spend_bytes = hex::decode(&spend_hex).map_err(|e| format!("bad spend_id: {e}"))?;
+        if spend_bytes.len() != 32 {
+            return Err(format!("spend_id must be 32 bytes, got {}", spend_bytes.len()));
+        }
+
+        let contract = SwtchvmAddress::from_hex(&host.config().treasury_contract)
+            .map_err(|e| format!("bad treasury_contract address: {e}"))?;
+        let custodian = SwtchvmAddress::from_hex(&host.config().custodian_address)
+            .map_err(|e| format!("bad custodian address: {e}"))?;
+
+        // Read the proposal from the contract: GET_PROPOSAL (0x31) [spend_id 32].
+        let mut call = Vec::with_capacity(33);
+        call.push(0x31u8);
+        call.extend_from_slice(&spend_bytes);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ctx = SwtchvmContext {
+            caller: custodian,
+            origin: custodian,
+            gas_price: 0,
+            gas_limit: 500_000,
+            gas_used: 0,
+            block_number: self.get_latest_block().number,
+            block_timestamp: now,
+            value: 0,
+        };
+        let result = self
+            .runtime
+            .call_contract_public(&custodian, &contract, &call, ctx)
+            .await
+            .map_err(|e| format!("GET_PROPOSAL call failed: {e}"))?;
+        if !result.success {
+            return Err("unknown spend_id or proposal read reverted".to_string());
+        }
+
+        // Decode: recipient(20) | amount(16 LE) | memo(32) | approvals(8) | executed(1).
+        let data = result.return_data;
+        if data.len() < 77 {
+            return Err(format!("malformed proposal record ({} bytes)", data.len()));
+        }
+        let mut recipient = [0u8; 20];
+        recipient.copy_from_slice(&data[0..20]);
+        let mut amt = [0u8; 16];
+        amt.copy_from_slice(&data[20..36]);
+        let amount = u128::from_le_bytes(amt);
+        let executed = data[76];
+        if executed != 1 {
+            return Err("proposal is not executed yet (needs M-of-N approval)".to_string());
+        }
+        if amount == 0 {
+            return Err("proposal amount is zero".to_string());
+        }
+
+        // Custodian must be able to cover it (friendly pre-check before reserving).
+        let custodian_balance = self.runtime.get_account_balance(&custodian).await.unwrap_or(0);
+        if custodian_balance < amount {
+            return Err(format!(
+                "treasury custodian underfunded: {} < {}",
+                custodian_balance, amount
+            ));
+        }
+
+        // Atomic replay guard: claim the spend before moving any funds.
+        if !host.reserve(&spend_hex).await.map_err(|e| e.to_string())? {
+            return Err("spend already disbursed".to_string());
+        }
+
+        // Native transfer custodian -> recipient (uASTRA, the spendable ledger).
+        let recipient_hex = format!("0x{}", hex::encode(recipient));
+        let recipient_addr = SwtchvmAddress::from_hex(&recipient_hex)
+            .map_err(|e| format!("bad recipient address {recipient_hex}: {e}"))?;
+        if let Err(e) = self
+            .runtime
+            .setup_account_balance(&custodian, custodian_balance - amount)
+            .await
+        {
+            tracing::error!(spend = %spend_hex, error = %e, "treasury debit failed AFTER reserve — reconcile");
+            return Err(format!("custodian debit failed: {e}"));
+        }
+        let recipient_balance = self.runtime.get_account_balance(&recipient_addr).await.unwrap_or(0);
+        let credited = recipient_balance.checked_add(amount).ok_or_else(|| {
+            "recipient balance overflow".to_string()
+        })?;
+        if let Err(e) = self.runtime.setup_account_balance(&recipient_addr, credited).await {
+            tracing::error!(spend = %spend_hex, error = %e, "treasury credit failed AFTER debit — reconcile");
+            return Err(format!("recipient credit failed: {e}"));
+        }
+        self.runtime.persist_state_if_configured().await;
+
+        tracing::info!(
+            spend = %spend_hex,
+            recipient = %recipient_hex,
+            amount,
+            "Treasury disbursement bridged to native ledger"
+        );
+        Ok((recipient_hex, amount))
     }
 
     /// Look up a transaction receipt by its 32-byte hash.
@@ -6436,6 +6645,31 @@ impl SwtchvmNode {
             .and_then(submit_self_custody_bundle_handler)
             .map(Reply::into_response);
 
+        // Proof of Tangible Works award (reviewer-quorum authorized, not
+        // operator-gated — the quorum in the receipt is the authorization).
+        let potw_award = warp::path!("potw" / "award")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_node(node.clone()))
+            .and_then(potw_award_handler)
+            .map(Reply::into_response);
+
+        // Treasury disbursement bridge (operator-gated settlement trigger).
+        let treasury_disburse = warp::path!("treasury" / "disburse")
+            .and(warp::post())
+            .and(rollup_auth.clone())
+            .and(warp::body::json())
+            .and(with_node(node.clone()))
+            .and_then(treasury_disburse_handler)
+            .map(Reply::into_response);
+
+        // Current account_root (read-only) — sequencers fetch pre-state here.
+        let account_root_route = warp::path!("rollup" / "account-root")
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(account_root_handler)
+            .map(Reply::into_response);
+
         let list_bundles = warp::path!("rollup" / "bundles")
             .and(warp::get())
             .and(rollup_auth.clone())
@@ -6507,6 +6741,12 @@ impl SwtchvmNode {
             .or(bundle_status)
             .unify()
             .or(slash_records)
+            .unify()
+            .or(potw_award)
+            .unify()
+            .or(treasury_disburse)
+            .unify()
+            .or(account_root_route)
             .unify();
 
         account_routes
@@ -7373,6 +7613,23 @@ async fn submit_self_custody_bundle_handler(
         ));
     }
 
+    // PQ-only cutover: reject a classically-signed (Ed25519) bundle when the
+    // operator has committed the settlement layer to post-quantum signatures.
+    if !bundle_meets_pq_policy(&bundle) {
+        return Ok(json(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({
+                "status": "Rejected",
+                "error": "PQ-only settlement: classical signature rejected",
+                "algorithm": bundle
+                    .signature
+                    .as_ref()
+                    .map(|s| s.algorithm.clone())
+                    .unwrap_or_default(),
+            }),
+        ));
+    }
+
     // The signature may only move the signer's own funds.
     let signer = match enforce_self_custody(&bundle) {
         Ok(s) => s,
@@ -7432,6 +7689,89 @@ async fn submit_self_custody_bundle_handler(
     }
 }
 
+/// Proof of Tangible Works award submission.
+///
+/// Like `/rollup/submit`, this route is intentionally NOT operator-token gated:
+/// the reviewer quorum carried in the receipt IS the authorization. A valid
+/// award requires `threshold` distinct allow-listed reviewers to have signed the
+/// award digest, and is further bounded by the per-work cap, the per-epoch
+/// budget, and a permanent `work_id` replay guard (all enforced host-side). On
+/// success the recipient's native spendable balance is credited.
+async fn potw_award_handler(
+    receipt: crate::potw::PoTWReceipt,
+    node: Arc<SwtchvmNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use warp::http::StatusCode;
+    use warp::Reply;
+
+    let json = |code: StatusCode, v: serde_json::Value| {
+        warp::reply::with_status(warp::reply::json(&v), code).into_response()
+    };
+
+    match node.potw_award(receipt).await {
+        Ok(instruction) => Ok(json(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "Awarded",
+                "workId": instruction.work_id_hex,
+                "recipient": instruction.recipient,
+                "amount": instruction.amount.to_string(),
+                "epoch": instruction.epoch,
+                "digest": instruction.digest_hex,
+                "reviewers": instruction.approving_reviewers,
+                "epochSpentAfter": instruction.epoch_spent_after.to_string(),
+            }),
+        )),
+        Err(e) => Ok(json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "status": "Rejected", "error": e }),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TreasuryDisburseRequest {
+    /// Hex spend id of an already-executed Treasury proposal.
+    spend_id: String,
+}
+
+/// Bridge an executed Treasury disbursement to the native ledger.
+///
+/// Operator-gated: unlike the reviewer/self-custody routes, this is an
+/// operational settlement trigger. It does not itself authorize a spend — the
+/// M-of-N approval already happened in the contract — it only mirrors an
+/// executed disbursement (verified by reading the contract) to spendable funds,
+/// exactly once.
+async fn treasury_disburse_handler(
+    _auth: (),
+    req: TreasuryDisburseRequest,
+    node: Arc<SwtchvmNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use warp::http::StatusCode;
+    use warp::Reply;
+
+    let json = |code: StatusCode, v: serde_json::Value| {
+        warp::reply::with_status(warp::reply::json(&v), code).into_response()
+    };
+
+    match node.treasury_disburse(&req.spend_id).await {
+        Ok((recipient, amount)) => Ok(json(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "Disbursed",
+                "spendId": req.spend_id,
+                "recipient": recipient,
+                "amount": amount.to_string(),
+            }),
+        )),
+        Err(e) => Ok(json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "status": "Rejected", "error": e }),
+        )),
+    }
+}
+
 async fn validate_rollup_bundle_handler(
     _auth: (),
     bundle: crate::rollup_bridge::RollupBundle,
@@ -7458,7 +7798,12 @@ async fn validate_rollup_bundle_handler(
 
     let reply = match validation {
         Ok(result) => {
-            let basic_ok = result.hash_valid && result.signature_valid && result.key_allowed;
+            // PQ-only cutover also gates the operator/Verified path: a classical
+            // signature cannot yield a Verified settlement when PQ-only is on.
+            let basic_ok = result.hash_valid
+                && result.signature_valid
+                && result.key_allowed
+                && bundle_meets_pq_policy(&bundle);
 
             // Verify-then-settle: re-execute on a clone, check the committed
             // account root, and mark `Verified` only on match. With no committed
@@ -7466,6 +7811,7 @@ async fn validate_rollup_bundle_handler(
             // settlement as `Pending`.
             let mut settled = false;
             let mut verified = false;
+            let mut rejected = false;
             let mut settle_error: Option<String> = None;
             let mut re_exec_results: Vec<ReExecutionResult> = Vec::new();
 
@@ -7495,16 +7841,34 @@ async fn validate_rollup_bundle_handler(
                         });
                     }
                     Ok(Some(false)) => {
-                        // ROLLOUT: mismatch is treated as unproven determinism,
-                        // not fraud — settle optimistically. Flip to reject+slash
-                        // once the Rust<->JS account_root vector passes.
-                        tracing::warn!(
-                            bundle_id = %bundle.bundle_id,
-                            "account_root mismatch — settling optimistically pending determinism proof"
-                        );
-                        match node.settle_rollup_bundle(&bundle).await {
-                            Ok(_) => settled = true,
-                            Err(e) => settle_error = Some(e.to_string()),
+                        // The operator-sequencer's committed account_root does not
+                        // match this node's re-execution. In STRICT finality mode
+                        // this is a determinism/fraud failure: reject and settle
+                        // nothing. The default (rollout) still settles optimistically
+                        // as Pending, so an operator can enable strict finality only
+                        // once their sequencer's account_root is proven to match the
+                        // pinned determinism vector (see `account_root_determinism_vector`).
+                        if strict_account_root() {
+                            rejected = true;
+                            settle_error = Some("account_root mismatch (strict finality)".to_string());
+                            let _ = crate::rollup_registry::track_verified_bundle(
+                                &bundle,
+                                BundleStatus::Rejected,
+                                DEFAULT_CHALLENGE_WINDOW_SECS,
+                            );
+                            tracing::warn!(
+                                bundle_id = %bundle.bundle_id,
+                                "account_root mismatch — REJECTED (strict finality); no settlement"
+                            );
+                        } else {
+                            tracing::warn!(
+                                bundle_id = %bundle.bundle_id,
+                                "account_root mismatch — settling optimistically pending determinism proof"
+                            );
+                            match node.settle_rollup_bundle(&bundle).await {
+                                Ok(_) => settled = true,
+                                Err(e) => settle_error = Some(e.to_string()),
+                            }
                         }
                     }
                     Ok(None) => match node.settle_rollup_bundle(&bundle).await {
@@ -7521,7 +7885,7 @@ async fn validate_rollup_bundle_handler(
                 .as_secs();
             let challenge_window_end = now + DEFAULT_CHALLENGE_WINDOW_SECS;
 
-            let status = if !basic_ok {
+            let status = if !basic_ok || rejected {
                 BundleStatus::Rejected
             } else if verified && settled {
                 BundleStatus::Verified
@@ -7572,6 +7936,12 @@ async fn validate_rollup_bundle_handler(
         .into_response(),
     };
     Ok(reply)
+}
+
+/// Read-only current account_root (operator-sequencer utility + observability).
+async fn account_root_handler(node: Arc<SwtchvmNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let root = node.current_account_root().await;
+    Ok(warp::reply::json(&serde_json::json!({ "accountRoot": root })))
 }
 
 async fn list_rollup_bundles_handler(_: ()) -> Result<impl warp::Reply, warp::Rejection> {
@@ -7747,6 +8117,48 @@ fn with_rollup_auth() -> impl warp::Filter<Extract = ((),), Error = warp::Reject
             }
             Err(warp::reject::custom(AuthError::InvalidDid))
         })
+}
+
+/// Strict account_root finality: when enabled, an operator-submitted bundle whose
+/// committed `account_root` does not match this node's re-execution is REJECTED
+/// (no optimistic settlement). Off by default so operators can enable it only
+/// once their sequencer's `account_root` is proven to match the pinned
+/// determinism vector. Enable with `SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT=1`
+/// (also accepts `true`/`yes`, case-insensitive).
+fn strict_account_root() -> bool {
+    std::env::var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// PQ-only settlement: when enabled, settlement bundles signed with a classical
+/// algorithm (Ed25519) are rejected — only post-quantum signatures (SLH-DSA /
+/// SPHINCS+) settle. This is the enforceable cutover that lets "quantum-safe
+/// settlement" be a guarantee rather than a per-signer property. Off by default
+/// so legacy Ed25519 wallets keep working until an operator flips the switch.
+/// Enable with `SPACEKIT_SETTLEMENT_PQ_ONLY=1` (also `true`/`yes`).
+fn pq_only_settlement() -> bool {
+    std::env::var("SPACEKIT_SETTLEMENT_PQ_ONLY")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// True unless PQ-only mode is on and the bundle's signature is classical.
+fn bundle_meets_pq_policy(bundle: &crate::rollup_bridge::RollupBundle) -> bool {
+    if !pq_only_settlement() {
+        return true;
+    }
+    bundle
+        .signature
+        .as_ref()
+        .map(|s| crate::rollup_bridge::is_post_quantum_algorithm(&s.algorithm))
+        .unwrap_or(false)
 }
 
 fn load_rollup_key_policy() -> Result<crate::rollup_bridge::KeyPolicy, String> {
@@ -8046,6 +8458,91 @@ impl SwtchvmNetworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pinned cross-implementation determinism vector for `account_root()`.
+    ///
+    /// An operator-sequencer (or any future non-Rust sequencer) MUST reproduce
+    /// this exact root for the same accounts, or its bundle's committed
+    /// `quantum_state_roots` will not match this node's re-execution and the
+    /// bundle will not settle `Verified` (and, under strict finality, will be
+    /// rejected). Two accounts, address-sorted:
+    ///   0x11×20: balance 1_000_000, nonce 1, no code
+    ///   0x22×20: balance   500_000, nonce 7, code = b"potw"
+    /// The value is independently reproducible from the documented algorithm
+    /// (domain `SPACEKIT-ACCOUNT-ROOT-v1\n`; per account addr‖bal_le16‖nonce_le8‖
+    /// code_hash, code_hash = SHA-256(code) or 32 zero bytes).
+    #[test]
+    fn account_root_determinism_vector() {
+        let mut state = SwtchvmState::new();
+        {
+            let a = state.get_account_mut(&SwtchvmAddress::new([0x11u8; 20]));
+            a.balance = 1_000_000;
+            a.nonce = 1;
+            a.code = None;
+        }
+        {
+            let b = state.get_account_mut(&SwtchvmAddress::new([0x22u8; 20]));
+            b.balance = 500_000;
+            b.nonce = 7;
+            b.code = Some(b"potw".to_vec());
+        }
+        assert_eq!(
+            state.account_root(),
+            "0xd0764186ec44e32f505fe6512641283f79f93c4a8194ae7634e1ac4089fd471b"
+        );
+    }
+
+    /// Insertion order must not change the root (addresses are sorted first).
+    #[test]
+    fn account_root_is_insertion_order_independent() {
+        let build = |first_low: bool| {
+            let mut s = SwtchvmState::new();
+            let low = ([0x11u8; 20], 1_000_000u128, 1u64, None::<Vec<u8>>);
+            let high = ([0x22u8; 20], 500_000u128, 7u64, Some(b"potw".to_vec()));
+            let order = if first_low {
+                [low.clone(), high.clone()]
+            } else {
+                [high.clone(), low.clone()]
+            };
+            for (addr, bal, nonce, code) in order {
+                let a = s.get_account_mut(&SwtchvmAddress::new(addr));
+                a.balance = bal;
+                a.nonce = nonce;
+                a.code = code;
+            }
+            s.account_root()
+        };
+        assert_eq!(build(true), build(false));
+    }
+
+    #[test]
+    fn strict_account_root_env_flag() {
+        std::env::remove_var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT");
+        assert!(!strict_account_root());
+        std::env::set_var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT", "1");
+        assert!(strict_account_root());
+        std::env::set_var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT", "TRUE");
+        assert!(strict_account_root());
+        std::env::set_var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT", "0");
+        assert!(!strict_account_root());
+        std::env::remove_var("SPACEKIT_ROLLUP_STRICT_ACCOUNT_ROOT");
+    }
+
+    #[test]
+    fn pq_only_settlement_classifier_and_flag() {
+        use crate::rollup_bridge::is_post_quantum_algorithm;
+        assert!(is_post_quantum_algorithm("slh-dsa-sha2-128s"));
+        assert!(is_post_quantum_algorithm("SLH-DSA-SHA2-192s"));
+        assert!(is_post_quantum_algorithm("sphincs-128s"));
+        assert!(!is_post_quantum_algorithm("ed25519"));
+        assert!(!is_post_quantum_algorithm("secp256k1"));
+
+        std::env::remove_var("SPACEKIT_SETTLEMENT_PQ_ONLY");
+        assert!(!pq_only_settlement());
+        std::env::set_var("SPACEKIT_SETTLEMENT_PQ_ONLY", "yes");
+        assert!(pq_only_settlement());
+        std::env::remove_var("SPACEKIT_SETTLEMENT_PQ_ONLY");
+    }
 
     fn signed_http_body(
         signing_key: &k256::ecdsa::SigningKey,

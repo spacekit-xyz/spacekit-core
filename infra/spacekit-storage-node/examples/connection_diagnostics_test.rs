@@ -19,11 +19,10 @@
 //! cargo run --example connection_diagnostics_test --features p2p,database -- --node-id 3 --port 9003 --bootstrap /ip4/127.0.0.1/tcp/9001/p2p/<peer-id-from-node-1>
 //! ```
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use anyhow::Result;
-use spacekit_primitives::v1::identity::QuantumDID;
-use spacekit_storage_node::{NetworkConfig, StorageNode, StorageNodeConfig};
+use spacekit_storage_node::{NetworkConfig, PersistenceConfig, StorageNode, StorageNodeConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -120,6 +119,7 @@ async fn main() -> Result<()> {
         enable_real_transactions: false,
         #[cfg(feature = "api-server")]
         api_config: None,
+        persistence: PersistenceConfig::default(),
     };
 
     let storage_node = Arc::new(StorageNode::new(config).await?);

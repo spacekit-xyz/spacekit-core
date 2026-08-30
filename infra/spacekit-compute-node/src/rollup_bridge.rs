@@ -280,6 +280,15 @@ pub fn validate_rollup_bundle_with_policy(
     Ok(result)
 }
 
+/// Whether a bundle-signature algorithm string is post-quantum. SLH-DSA
+/// (FIPS-205) and SPHINCS+ (round-3) are PQ; Ed25519 (and any classical scheme)
+/// is not. Used to enforce PQ-only settlement so "quantum-safe settlement" is a
+/// checkable guarantee, not a per-signer accident.
+pub fn is_post_quantum_algorithm(algorithm: &str) -> bool {
+    let a = algorithm.trim().to_ascii_lowercase();
+    a.starts_with("slh-dsa") || a.starts_with("sphincs")
+}
+
 /// The PQ address (`0x` + hex(SHA-256(pubkey)[0..20])) implied by a bundle
 /// signature's public key. Matches the frontend `pqAddressFromPublicKey` and
 /// `SwtchvmAddress::from_pq_public_key`, so the address a bundle is signed under
