@@ -17159,10 +17159,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_load_and_verify_did() {
-        let sdk = SpaceKitSDK::with_cache("./identity_cache").unwrap();
+        // Isolate the sled-backed identity cache to a unique temp dir. The shared
+        // relative "./identity_cache" is a test-isolation hazard: `sled::open`
+        // takes an exclusive lock, so it collides with a running node or a
+        // parallel test (making `with_cache(...).unwrap()` panic), and any stale
+        // cached entry would turn the expected miss into a hit. A fresh cache
+        // guarantees a miss → `load_identity` fails with
+        // `IdentityManagerNotInitialized`, which is exactly what this test asserts.
+        let cache_dir =
+            std::env::temp_dir().join(format!("sk_did_verify_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let sdk = SpaceKitSDK::with_cache(cache_dir.to_str().unwrap()).unwrap();
         let did_addr = "0x1234567890123456789012345678901234567890";
         let result = load_and_verify_did(&sdk, did_addr).await;
         assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[tokio::test]
