@@ -60,6 +60,13 @@ pub use rollup_bridge::*;
 pub mod rollup_registry;
 pub use rollup_registry::*;
 
+// Proof of Tangible Works — host-side reviewer-quorum award accumulator.
+pub mod potw;
+pub use potw::{
+    award_digest, AwardInstruction, PoTWAccumulator, PoTWConfig, PoTWError, PoTWReceipt,
+    ReviewerApproval,
+};
+
 // Add VPoS module
 pub mod vpos;
 pub use vpos::*;

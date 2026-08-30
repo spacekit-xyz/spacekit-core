@@ -3,6 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Serializes registry read-modify-write cycles across threads. Without it, two
+/// concurrent submits can both load the old registry and the second save wipes
+/// the first's entry — a lost update that would drop a replay-protection record.
+/// Held across load→mutate→save in every mutating function below.
+fn registry_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedBundle {
@@ -23,7 +35,12 @@ pub struct RollupRegistry {
 }
 
 fn default_registry_path() -> PathBuf {
-    PathBuf::from("temp_blockchain_storage/rollup_registry.json")
+    // Overridable so operators can point the settled-bundle / replay record at a
+    // durable location (the default name reads as ephemeral). Set
+    // SPACEKIT_ROLLUP_REGISTRY_PATH alongside the state snapshot for launch.
+    std::env::var("SPACEKIT_ROLLUP_REGISTRY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("temp_blockchain_storage/rollup_registry.json"))
 }
 
 fn ensure_parent(path: &Path) -> Result<(), String> {
@@ -46,10 +63,16 @@ pub fn save_registry(path: Option<PathBuf>, registry: &RollupRegistry) -> Result
     let path = path.unwrap_or_else(default_registry_path);
     ensure_parent(&path)?;
     let data = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
-    fs::write(path, data).map_err(|e| e.to_string())
+    // Atomic write: write a sibling temp file, then rename over the target. A
+    // crash mid-write can never leave a truncated/corrupt registry (which is the
+    // replay-protection + settled-bundle record). Rename is atomic on one fs.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 pub fn ingest_bundle(bundle: &RollupBundle) -> Result<(), String> {
+    let _guard = registry_lock();
     let mut registry = load_registry(None)?;
     registry
         .bundles
@@ -62,6 +85,25 @@ pub fn get_bundle(bundle_id: &str) -> Result<Option<RollupBundle>, String> {
     Ok(registry.bundles.get(bundle_id).cloned())
 }
 
+/// Atomically claim a bundle id for settlement. Returns `Ok(true)` when this
+/// call was the first to see the id, `Ok(false)` when it was already
+/// reserved/settled. This is the single dedup gate for `/rollup/submit`: doing
+/// the check and the insert under one lock closes the TOCTOU window where two
+/// concurrent identical submits could both pass a separate "already seen?" check
+/// and settle twice.
+pub fn reserve_bundle(bundle: &RollupBundle) -> Result<bool, String> {
+    let _guard = registry_lock();
+    let mut registry = load_registry(None)?;
+    if registry.bundles.contains_key(&bundle.bundle_id) {
+        return Ok(false);
+    }
+    registry
+        .bundles
+        .insert(bundle.bundle_id.clone(), bundle.clone());
+    save_registry(None, &registry)?;
+    Ok(true)
+}
+
 pub fn list_bundles() -> Result<Vec<RollupBundle>, String> {
     let registry = load_registry(None)?;
     Ok(registry.bundles.values().cloned().collect())
@@ -72,6 +114,7 @@ pub fn track_verified_bundle(
     status: BundleStatus,
     challenge_window_secs: u64,
 ) -> Result<(), String> {
+    let _guard = registry_lock();
     let mut registry = load_registry(None)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,6 +132,7 @@ pub fn track_verified_bundle(
 }
 
 pub fn submit_fraud_proof(proof: FraudProof) -> Result<(), String> {
+    let _guard = registry_lock();
     let mut registry = load_registry(None)?;
     let tracked = registry
         .tracked
@@ -124,6 +168,7 @@ pub fn submit_fraud_proof(proof: FraudProof) -> Result<(), String> {
 }
 
 pub fn finalize_bundles() -> Result<Vec<String>, String> {
+    let _guard = registry_lock();
     let mut registry = load_registry(None)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

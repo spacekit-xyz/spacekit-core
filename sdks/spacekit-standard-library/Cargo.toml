@@ -35,5 +35,6 @@ members = [
   "agents/routekit-agent",
   "marketplace/astra-entitlement-ledger",
   "rewards/astra-rewards",
+  "treasury",
   "hello-world", "agents/finance-agent", "system/spacekit-anchor",
 ]

@@ -7351,23 +7351,6 @@ async fn submit_self_custody_bundle_handler(
         warp::reply::with_status(warp::reply::json(&v), code).into_response()
     };
 
-    // Replay protection: a bundle id settles at most once.
-    match crate::rollup_registry::get_bundle(&bundle.bundle_id) {
-        Ok(Some(_)) => {
-            return Ok(json(
-                StatusCode::CONFLICT,
-                serde_json::json!({ "status": "Rejected", "error": "bundle already submitted" }),
-            ));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return Ok(json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "status": "Rejected", "error": e }),
-            ));
-        }
-    }
-
     // Hash + signature must be valid (self-custody: no operator key policy).
     let validation = match validate_rollup_bundle(&bundle) {
         Ok(v) => v,
@@ -7401,10 +7384,28 @@ async fn submit_self_custody_bundle_handler(
         }
     };
 
+    // Atomic replay gate: claim the bundle id BEFORE settling, so two concurrent
+    // identical submits cannot both settle. Only the caller that claims it (true)
+    // proceeds; a duplicate (false) is rejected without touching the ledger.
+    match crate::rollup_registry::reserve_bundle(&bundle) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(json(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "status": "Rejected", "error": "bundle already submitted" }),
+            ));
+        }
+        Err(e) => {
+            return Ok(json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "status": "Rejected", "error": e }),
+            ));
+        }
+    }
+
     // Optimistic settlement — Pending (a browser cannot prove a full-state root).
     match node.settle_rollup_bundle(&bundle).await {
         Ok(transfers) => {
-            let _ = crate::rollup_registry::ingest_bundle(&bundle);
             let _ = crate::rollup_registry::track_verified_bundle(
                 &bundle,
                 BundleStatus::Pending,
