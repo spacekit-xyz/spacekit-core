@@ -1439,7 +1439,7 @@ impl ComputeNode {
         }
 
         // 🌉 TODO: Re-`Initialize LayerZero bridge when we have the full system working
-        // self.initialize_layerzero_bridge().await?;
+        self.initialize_layerzero_bridge().await?;
 
         // Start resource monitoring
         {
@@ -1477,7 +1477,7 @@ impl ComputeNode {
                 "disabled ❌"
             }
         );
-        // tracing::info!("🌉 LayerZero bridge: {}", bridge_status);
+        tracing::info!("🌉 LayerZero bridge: {}", bridge_status);
         tracing::info!(
             "🔗 Network endpoint: {}",
             self.config
@@ -5876,7 +5876,7 @@ mod tests {
 
         let result = &batch_results[0];
         assert!(result.amount_minted > 0);
-        assert!(result.transaction_hash.starts_with("batch_swtch_"));
+        assert!(result.transaction_hash.starts_with("batch_spacekit_"));
 
         println!("✅ Cross-chain quarterly distribution working correctly");
         println!(

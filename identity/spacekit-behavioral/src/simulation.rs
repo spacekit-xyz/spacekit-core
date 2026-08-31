@@ -252,8 +252,15 @@ impl BehavioralSimulation {
             activity.reputation_manipulation_attempts += 1;
         }
         
-        // Degrade service quality
-        activity.success_rate *= 1.0 - fraud_intensity * 0.2;
+        // Degrade service quality. The success-rate reduction is calibrated to the
+        // `calculate_anomaly_score` low-success threshold (0.7): a fully-ramped
+        // fraud user (fraud_intensity → 1.0) must land below it even for a
+        // high-base archetype (Validator ~0.98 → 0.98 * (1 - 0.35) ≈ 0.64 < 0.7).
+        // Lower intensity yields a gradient — poorer performers cross first —
+        // rather than an all-or-nothing flag. (The prior 0.2 factor only worked
+        // when every profile was pinned to exactly 0.7 by the old success-rate
+        // formula; with realistic base rates it no longer reached the threshold.)
+        activity.success_rate *= 1.0 - fraud_intensity * 0.35;
         activity.quality_score *= 1.0 - fraud_intensity * 0.15;
     }
     

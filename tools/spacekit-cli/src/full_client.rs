@@ -1,6 +1,7 @@
 // SpaceKit fat CLI — embedded nodes + optional `~/.spacekit/network/config.toml` overlay.
 
 mod code_session;
+mod repo_lang;
 mod fact_cmd;
 mod identity_cmd;
 mod keymaster_cmd;
@@ -3425,6 +3426,28 @@ enum AgentCommands {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         /// Output path (default: <root-name>.repo.json in the current directory)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Pack the relevant slice of the project graph (structure + file contents) into
+    /// a model-ready context bundle for a task ("add a feature", "fix this bug").
+    Pack {
+        /// Directory to scan
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Task/query keywords used to seed relevance selection
+        #[arg(long)]
+        query: Option<String>,
+        /// Seed file(s) by path or path suffix (repeatable)
+        #[arg(long = "seed")]
+        seeds: Vec<String>,
+        /// Graph hops to expand outward from the seeds
+        #[arg(long, default_value_t = 2)]
+        hops: usize,
+        /// Approx token budget for included file contents
+        #[arg(long, default_value_t = 40000)]
+        budget: usize,
+        /// Output path (default: stdout)
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -16144,11 +16167,10 @@ async fn handle_agent_command(
             code_session::handle_plan(&args)
         }
         AgentCommands::Map { root, out } => {
-            let args = code_session::RepoMapArgs {
-                root: root.clone(),
-                out: out.clone(),
-            };
-            code_session::handle_map(&args)
+            repo_lang::handle_map(root, out)
+        }
+        AgentCommands::Pack { root, query, seeds, hops, budget, out } => {
+            repo_lang::handle_pack(root, query.clone(), seeds.clone(), *hops, *budget, out)
         }
         AgentCommands::RouteCompile { templates, graph, out, verify, lint } => {
             let args = code_session::RouteCompileArgs {
@@ -17159,21 +17181,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_load_and_verify_did() {
-        // Isolate the sled-backed identity cache to a unique temp dir. The shared
-        // relative "./identity_cache" is a test-isolation hazard: `sled::open`
-        // takes an exclusive lock, so it collides with a running node or a
-        // parallel test (making `with_cache(...).unwrap()` panic), and any stale
-        // cached entry would turn the expected miss into a hit. A fresh cache
-        // guarantees a miss → `load_identity` fails with
-        // `IdentityManagerNotInitialized`, which is exactly what this test asserts.
-        let cache_dir =
-            std::env::temp_dir().join(format!("sk_did_verify_cache_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        let sdk = SpaceKitSDK::with_cache(cache_dir.to_str().unwrap()).unwrap();
+        // Construct the SDK WITHOUT a cache. The previous `with_cache(...)` opened
+        // a sled database purely as a side effect, and sled can panic on open
+        // ("failed to allocate critical IO buffer") in constrained/sandboxed
+        // environments — a failure unrelated to what this test checks. A cache-less
+        // SDK skips the cache path entirely, so `load_identity` goes straight to
+        // the contract loader and fails with `IdentityManagerNotInitialized`
+        // (no identity manager configured), which is exactly the error path under
+        // test. No sled, no I/O, deterministic.
+        let sdk = SpaceKitSDK::new();
         let did_addr = "0x1234567890123456789012345678901234567890";
         let result = load_and_verify_did(&sdk, did_addr).await;
         assert!(result.is_err());
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[tokio::test]

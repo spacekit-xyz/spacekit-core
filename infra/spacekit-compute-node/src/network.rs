@@ -114,7 +114,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            network_name: "swtch-compute-network".to_string(),
+            network_name: "spacekit-compute-network".to_string(),
             listen_address: "127.0.0.1".to_string(),
             listen_port: 9000,
             bootstrap_nodes: vec!["127.0.0.1:9001".to_string()],

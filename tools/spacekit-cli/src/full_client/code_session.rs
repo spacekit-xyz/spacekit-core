@@ -3488,6 +3488,62 @@ fn analyze_python_files(files: &[(String, String)]) -> Option<PyRepoAnalysis> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
+/// Adapter used by `repo_lang::build` (the multi-language `agent map`/`pack`) so
+/// Python keeps its full symbol/import extraction. Reuses the existing embedded
+/// `ast` analyzer and import resolver, mapping their results into the
+/// language-neutral `repo_lang::LangFile` model.
+pub(crate) fn python_lang_files(
+    files: &[(String, String)],
+    repo_files: &std::collections::HashSet<String>,
+) -> Vec<(String, super::repo_lang::LangFile)> {
+    use super::repo_lang::{Imp, LangFile, Sym};
+    let mut out = Vec::new();
+    let analysis = match analyze_python_files(files) {
+        Some(a) => a,
+        None => return out,
+    };
+    for (rel, pf) in &analysis.files {
+        let mut lf = LangFile { lang: "python".to_string(), ..Default::default() };
+        for func in &pf.functions {
+            lf.symbols.push(Sym {
+                kind: "function".into(),
+                name: func.name.clone(),
+                line: func.line,
+                calls: func.calls.clone(),
+                ..Default::default()
+            });
+        }
+        for class in &pf.classes {
+            lf.symbols.push(Sym {
+                kind: "class".into(),
+                name: class.name.clone(),
+                line: class.line,
+                ..Default::default()
+            });
+            for m in &class.methods {
+                lf.symbols.push(Sym {
+                    kind: "method".into(),
+                    name: m.name.clone(),
+                    line: m.line,
+                    container: Some(class.name.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        for imp in &pf.imports {
+            match resolve_py_import(rel, &imp.module, imp.level, repo_files) {
+                Some(target) => lf.imports.push(Imp { target, kind: "path".into() }),
+                None => {
+                    let disp = format!("{}{}", ".".repeat(imp.level), imp.module);
+                    lf.imports.push(Imp { target: disp, kind: "module".into() });
+                }
+            }
+        }
+        out.push((rel.clone(), lf));
+    }
+    out
+}
+
 fn lang_for(path: &str) -> &'static str {
     let ext = Path::new(path)
         .extension()

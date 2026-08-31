@@ -49,7 +49,7 @@ impl MLOperationRegistry {
         // Register built-in operations
         // TODO: Add option to spec to initialize operations
         // migrage to growformer agent operations
-        // registry.register_builtin_operations();
+        registry.register_builtin_operations();
 
         registry
     }

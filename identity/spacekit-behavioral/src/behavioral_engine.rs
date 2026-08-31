@@ -308,9 +308,15 @@ impl BehavioralEngine {
             UserArchetype::BaseUser | UserArchetype::Other => 0.92,
         };
         
-        let consistency_factor = personality.consistency as f64 / 10.0;
+        // Consistency is a small modifier around the archetype's base rate, not a
+        // multiplier. Perfect consistency (10) leaves the base rate intact; lower
+        // consistency trims it only slightly. The previous `consistency / 10.0`
+        // factor (0.3–0.6 for most archetypes) drove every profile below the 0.7
+        // clamp, so the base rate never showed through and success_rate was pinned
+        // to exactly 0.7 for everyone — masking the archetype entirely.
+        let consistency_factor = 0.90 + (personality.consistency as f64 / 100.0);
         let variation = rng.gen_range(-0.05..0.03);
-        
+
         (base_rate * consistency_factor + variation).max(0.7).min(1.0)
     }
     
@@ -688,7 +694,11 @@ mod tests {
         let activity = engine.generate_activity_data(&personality, 1, 10, &mut rng);
         
         assert!(activity.transactions_per_hour > 0.0);
+        // Developer base rate is 0.95, trimmed only slightly by consistency +
+        // variation, so it lands well above 0.8 and at/under 1.0 — a real bound,
+        // not the old `> 0.65` that merely tested the 0.7 clamp floor.
         assert!(activity.success_rate > 0.8);
+        assert!(activity.success_rate <= 1.0);
         assert!(!activity.service_usage.is_empty());
     }
     

@@ -60,3 +60,11 @@ thiserror = { version = "1.0" }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 wat = "1.256.0"
+
+# ── spacekit agent map/pack: multi-language project graph (added) ──
+tree-sitter            = "0.27.0"
+tree-sitter-c-sharp    = "0.23.5"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-rust       = "0.24.2"
+tree-sitter-bicep      = "1.1.0"
+regex                  = "1.13"
