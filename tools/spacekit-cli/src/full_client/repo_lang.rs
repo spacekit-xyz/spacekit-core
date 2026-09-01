@@ -15,7 +15,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
-// Python delegated to the existing analyzer (preserves prior behavior).
+// In the spacekit-cli tree this is `use super::code_session::python_lang_files;`
+// (kept as a crate path here so the module compiles standalone in the prototype).
 use super::code_session::python_lang_files;
 
 // Language-neutral structural analysis for the repo map.
@@ -476,7 +477,8 @@ fn clean_sql_name(s: &str) -> String {
 // extends/implements(base->symbol), calls(callee->symbol), tests(test->target).
 
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RepoNode {
     pub id: String,
     pub kind: String,
@@ -490,7 +492,8 @@ pub struct RepoNode {
     #[serde(skip_serializing_if = "Option::is_none")] pub lines: Option<usize>,
     #[serde(skip_serializing_if = "std::ops::Not::not")] pub test: bool,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RepoEdge {
     #[serde(rename = "type")] pub etype: String,
     pub from: String,
@@ -498,7 +501,7 @@ pub struct RepoEdge {
     #[serde(skip_serializing_if = "Option::is_none")] pub rel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub external: Option<bool>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct RepoMap {
     pub schema: String,
     pub root: String,
@@ -532,7 +535,8 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String,bool,PathBuf)>) {
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || REPO_IGNORE.contains(&name.as_str()) { continue; }
+        // Skip dotfiles/dirs except `.github` (CI workflows live there).
+        if (name.starts_with('.') && name != ".github") || REPO_IGNORE.contains(&name.as_str()) { continue; }
         let abs = e.path();
         let is_dir = abs.is_dir();
         let rel = abs.strip_prefix(root).unwrap_or(&abs).to_string_lossy().replace('\\',"/");
@@ -593,6 +597,8 @@ pub fn build(root: &Path) -> RepoMap {
             "rust" => analyze_rust(&src),
             "bicep" => analyze_bicep(&src),
             "sql" => analyze_sql(&src),
+            "msbuild" if rel.ends_with(".csproj") => analyze_csproj(&src, rel),
+            "yaml" if is_pipeline_file(rel) => analyze_pipeline(&src),
             "python" => { py_files.push((rel.clone(), src)); continue; }
             _ => continue,
         };
@@ -879,6 +885,316 @@ pub fn handle_pack(root: &Path, query: Option<String>, seeds: Vec<String>, hops:
     match out {
         Some(p) => { std::fs::write(p, &bundle)?; println!("context-pack -> {}", p.display()); }
         None => println!("{}", bundle),
+    }
+    Ok(())
+}
+
+// ─────────────────────────── .csproj (MSBuild) ───────────────────────────
+pub fn analyze_csproj(src: &str, rel: &str) -> LangFile {
+    use regex::Regex;
+    let mut out = LangFile { lang: "msbuild".into(), ..Default::default() };
+    let stem = Path::new(rel).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    out.symbols.push(Sym { kind: "project".into(), name: stem, line: 1, ..Default::default() });
+    let pr = Regex::new(r#"(?i)<ProjectReference\s+[^>]*Include\s*=\s*"([^"]+)""#).unwrap();
+    for c in pr.captures_iter(src) {
+        out.imports.push(Imp { target: c[1].replace('\\', "/"), kind: "path".into() });
+    }
+    let pk = Regex::new(r#"(?i)<PackageReference\s+[^>]*Include\s*=\s*"([^"]+)""#).unwrap();
+    for c in pk.captures_iter(src) {
+        out.imports.push(Imp { target: c[1].to_string(), kind: "module".into() });
+    }
+    out
+}
+
+// ─────────────────────────── Pipelines (YAML) ───────────────────────────
+// Azure Pipelines (stages/jobs/steps, `template:`, `extends`) and GitHub Actions
+// (jobs map, `uses:`). Line numbers are recovered by locating the name in source.
+pub fn is_pipeline_file(rel: &str) -> bool {
+    let l = rel.to_lowercase();
+    let base = Path::new(rel).file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    base.starts_with("azure-pipelines")
+        || l.contains(".github/workflows/")
+        || l.contains("/pipelines/") || l.starts_with("pipelines/")
+        || l.contains("/.pipelines/") || l.starts_with(".pipelines/")
+        || l.contains("/.azuredevops/")
+        || base.ends_with(".pipeline.yml") || base.ends_with(".pipeline.yaml")
+}
+fn line_of_str(src: &str, needle: &str) -> usize {
+    match src.find(needle) { Some(i) => src[..i].bytes().filter(|&b| b == b'\n').count() + 1, None => 1 }
+}
+fn is_local_yaml_ref(s: &str) -> bool {
+    let l = s.to_lowercase();
+    s.starts_with("./") || s.starts_with("../") || l.ends_with(".yml") || l.ends_with(".yaml")
+}
+pub fn analyze_pipeline(src: &str) -> LangFile {
+    let mut out = LangFile { lang: "pipeline".into(), ..Default::default() };
+    let val: serde_yaml::Value = match serde_yaml::from_str(src) { Ok(v) => v, Err(_) => return out };
+    let mut seen_imp: HashSet<String> = HashSet::new();
+    walk_pipeline(&val, src, &mut out, &mut seen_imp);
+    out
+}
+fn walk_pipeline(v: &serde_yaml::Value, src: &str, out: &mut LangFile, seen: &mut HashSet<String>) {
+    use serde_yaml::Value;
+    match v {
+        Value::Mapping(m) => {
+            for (k, val) in m {
+                let key = k.as_str().unwrap_or("");
+                match key {
+                    "stage" => if let Some(name) = val.as_str() {
+                        out.symbols.push(Sym { kind: "pipeline_stage".into(), name: name.into(), line: line_of_str(src, name), ..Default::default() });
+                    },
+                    "job" | "deployment" => if let Some(name) = val.as_str() {
+                        out.symbols.push(Sym { kind: "pipeline_job".into(), name: name.into(), line: line_of_str(src, name), ..Default::default() });
+                    },
+                    "template" => if let Some(t) = val.as_str() {
+                        if seen.insert(t.to_string()) {
+                            let kind = if is_local_yaml_ref(t) { "path" } else { "module" };
+                            out.imports.push(Imp { target: t.into(), kind: kind.into() });
+                        }
+                    },
+                    "uses" => if let Some(t) = val.as_str() {
+                        if seen.insert(t.to_string()) {
+                            let kind = if is_local_yaml_ref(t) { "path" } else { "module" };
+                            out.imports.push(Imp { target: t.into(), kind: kind.into() });
+                        }
+                    },
+                    "jobs" => {
+                        // GitHub Actions: `jobs` is a map of job-id -> job. Azure: a sequence.
+                        if let Value::Mapping(jm) = val {
+                            for (jk, jv) in jm {
+                                if let Some(name) = jk.as_str() {
+                                    out.symbols.push(Sym { kind: "pipeline_job".into(), name: name.into(), line: line_of_str(src, name), ..Default::default() });
+                                }
+                                walk_pipeline(jv, src, out, seen);
+                            }
+                        } else { walk_pipeline(val, src, out, seen); }
+                    },
+                    _ => walk_pipeline(val, src, out, seen),
+                }
+            }
+        }
+        Value::Sequence(seq) => { for it in seq { walk_pipeline(it, src, out, seen); } }
+        _ => {}
+    }
+}
+
+// ══════════════════════════ RAG helpers: structure / chunks / nav ══════════════════════════
+
+fn container_depth(container: &Option<String>) -> usize {
+    match container { Some(c) if !c.is_empty() => c.split('.').count(), _ => 0 }
+}
+fn is_chunk_kind(kind: &str) -> bool {
+    matches!(kind,
+        "class"|"interface"|"struct"|"enum"|"record"|"trait"|"function"|"module"|"project"
+        |"sql_table"|"sql_view"|"sql_proc"|"sql_function"|"sql_trigger"|"sql_type"
+        |"bicep_resource"|"bicep_module"|"pipeline_stage"|"pipeline_job")
+}
+fn is_code_lang(lang: &str) -> bool {
+    matches!(lang, "csharp"|"typescript"|"tsx"|"javascript"|"rust"|"sql"|"bicep"|"yaml"|"python"|"msbuild")
+}
+fn def_kinds_for_outline(kind: &str) -> bool { is_chunk_kind(kind) }
+
+/// Compact "always-include" skeleton: the directory tree with a one-line symbol
+/// summary per file. Small enough to prepend to every prompt.
+pub fn render_structure(map: &RepoMap) -> String {
+    let mut file_syms: BTreeMap<&str, Vec<&RepoNode>> = BTreeMap::new();
+    for n in &map.nodes {
+        if n.kind != "dir" && n.kind != "file" {
+            if let Some(f) = &n.file { file_syms.entry(f.as_str()).or_default().push(n); }
+        }
+    }
+    let mut files: Vec<&RepoNode> = map.nodes.iter().filter(|n| n.kind == "file").collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut o = String::new();
+    o.push_str(&format!("# {} — structure ({} files, {} symbols)\n\n```\n",
+        map.root.rsplit('/').next().unwrap_or(&map.root),
+        map.stats.get("files").unwrap_or(&0), map.stats.get("symbols").unwrap_or(&0)));
+    for f in files {
+        let p = f.path.clone().unwrap_or_default();
+        let syms = file_syms.get(p.as_str()).map(|v| {
+            let mut names: Vec<String> = v.iter()
+                .filter(|s| def_kinds_for_outline(&s.kind))
+                .map(|s| format!("{} {}", s.kind, s.name)).collect();
+            names.dedup(); names.truncate(10);
+            names.join(", ")
+        }).unwrap_or_default();
+        let t = if f.test { " [test]" } else { "" };
+        o.push_str(&format!("{}{}\n", p, t));
+        if !syms.is_empty() { o.push_str(&format!("    {}\n", syms)); }
+    }
+    o.push_str("```\n");
+    o
+}
+
+/// Per-symbol chunk export (JSONL) for a vector store. One row per top-level
+/// definition with its source slice, structural metadata, and graph edges.
+/// Chunk spans are derived from symbol start lines + container nesting depth,
+/// so a class chunk includes its methods without needing end positions.
+pub fn export_chunks(root: &Path, map: &RepoMap) -> String {
+    // group symbols by file, keep only nodes with a line
+    let mut by_file: BTreeMap<String, Vec<&RepoNode>> = BTreeMap::new();
+    for n in &map.nodes {
+        if n.kind != "dir" && n.kind != "file" {
+            if let (Some(f), Some(_)) = (&n.file, n.line) { by_file.entry(f.clone()).or_default().push(n); }
+        }
+    }
+    // file lang + edges index
+    let file_lang: HashMap<&str, &str> = map.nodes.iter()
+        .filter(|n| n.kind == "file")
+        .filter_map(|n| n.path.as_deref().zip(n.lang.as_deref())).collect();
+    // non-contains edges grouped by originating file, so each chunk can pull the
+    // edges of its symbol, its members, and its file in one pass.
+    let mut edges_by_file: HashMap<String, Vec<&RepoEdge>> = HashMap::new();
+    for e in &map.edges {
+        if e.etype == "contains" { continue; }
+        // originating file: from "file:<rel>" or "sym:<rel>::..."
+        let rel = e.from.strip_prefix("file:").map(|s| s.to_string())
+            .or_else(|| e.from.strip_prefix("sym:").and_then(|s| s.split("::").next()).map(|s| s.to_string()));
+        if let Some(rel) = rel { edges_by_file.entry(rel).or_default().push(e); }
+    }
+    let mut out = String::new();
+    for (rel, mut syms) in by_file {
+        let lang = *file_lang.get(rel.as_str()).unwrap_or(&"other");
+        if !is_code_lang(lang) { continue; }
+        let src = match std::fs::read_to_string(root.join(&rel)) { Ok(s) => s, Err(_) => continue };
+        let lines: Vec<&str> = src.lines().collect();
+        syms.sort_by_key(|s| s.line.unwrap_or(0));
+        // chunk-worthy symbols in this file
+        let defs: Vec<&&RepoNode> = syms.iter().filter(|s| is_chunk_kind(&s.kind)).collect();
+        if defs.is_empty() {
+            // whole-file chunk for code files with no top-level defs
+            let code = src.trim_end();
+            out.push_str(&chunk_json(&format!("file:{}", rel), "file", &file_stem(&rel), &rel, lang, None, 1, code, edges_by_file.get(&rel).map(|v| v.as_slice()).unwrap_or(&[])));
+            out.push('\n');
+            continue;
+        }
+        for d in &defs {
+            let start = d.line.unwrap_or(1);
+            let depth = container_depth(&d.container);
+            // end = next symbol at same-or-shallower depth after start, else EOF
+            let end = syms.iter()
+                .filter(|s| s.line.unwrap_or(0) > start && container_depth(&s.container) <= depth)
+                .map(|s| s.line.unwrap_or(0))
+                .min()
+                .map(|l| l.saturating_sub(1))
+                .unwrap_or(lines.len());
+            let s0 = start.saturating_sub(1);
+            let e0 = end.min(lines.len()).max(start);
+            let code = lines.get(s0..e0).map(|sl| sl.join("\n")).unwrap_or_default();
+            out.push_str(&chunk_json(&d.id, &d.kind, &d.name, &rel, lang, d.container.as_deref(), start, code.trim_end(), edges_by_file.get(&rel).map(|v| v.as_slice()).unwrap_or(&[])));
+            out.push('\n');
+        }
+    }
+    out
+}
+fn file_stem(rel: &str) -> String { Path::new(rel).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default() }
+fn chunk_json(id: &str, kind: &str, name: &str, file: &str, lang: &str, container: Option<&str>, line: usize, code: &str, all_edges: &[&RepoEdge]) -> String {
+    // roll up edges on this symbol AND its members (ids prefixed with "<id>."),
+    // plus the file-level imports/references so each chunk knows its dependencies.
+    let self_prefix = format!("{}.", id);
+    let file_id = format!("file:{}", file);
+    let mut rels: Vec<serde_json::Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for e in all_edges {
+        let on_symbol = e.from == id || e.from.starts_with(&self_prefix);
+        let on_file = e.from == file_id;
+        if on_symbol || on_file {
+            let key = format!("{}|{}|{:?}", e.etype, e.to, e.rel);
+            if seen.insert(key) {
+                rels.push(serde_json::json!({ "type": e.etype, "to": e.to, "rel": e.rel, "external": e.external, "scope": if on_symbol {"symbol"} else {"file"} }));
+            }
+        }
+    }
+    serde_json::json!({
+        "id": id, "kind": kind, "name": name, "file": file, "lang": lang,
+        "container": container, "line": line, "edges": rels, "code": code,
+    }).to_string()
+}
+
+// ─── nav: agent query surface over a (saved or freshly built) map ───
+pub fn load_map(path: &Path) -> Result<RepoMap, Box<dyn Error>> {
+    let s = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&s)?)
+}
+pub fn nav_list(map: &RepoMap, dir: &str) -> String {
+    let key = if dir == "." || dir.is_empty() { "dir:.".to_string() } else { format!("dir:{}", dir.trim_end_matches('/')) };
+    let mut o = String::new();
+    let mut kids: Vec<(&str, &RepoNode)> = map.edges.iter()
+        .filter(|e| e.etype == "contains" && e.from == key)
+        .filter_map(|e| map.nodes.iter().find(|n| n.id == e.to).map(|n| (n.kind.as_str(), n)))
+        .collect();
+    kids.sort_by(|a, b| (a.0 != "dir").cmp(&(b.0 != "dir")).then(a.1.path.cmp(&b.1.path)));
+    for (k, n) in kids {
+        let p = n.path.clone().unwrap_or_default();
+        if k == "dir" { o.push_str(&format!("{}/\n", p)); }
+        else { o.push_str(&format!("{}  ({}{})\n", p, n.lang.clone().unwrap_or_default(), if n.test {", test"} else {""})); }
+    }
+    if o.is_empty() { o.push_str(&format!("(nothing under {})\n", dir)); }
+    o
+}
+pub fn nav_open(root: &Path, map: &RepoMap, file: &str, with_code: bool) -> String {
+    let node = map.nodes.iter().find(|n| n.kind == "file" && n.path.as_deref() == Some(file)
+        || n.kind == "file" && n.path.as_deref().map(|p| p.ends_with(file)).unwrap_or(false));
+    let Some(node) = node else { return format!("no such file: {}\n", file) };
+    let rel = node.path.clone().unwrap_or_default();
+    let fid = format!("file:{}", rel);
+    let mut o = format!("# {}  ({})\n\n## symbols\n", rel, node.lang.clone().unwrap_or_default());
+    let mut syms: Vec<&RepoNode> = map.nodes.iter().filter(|n| n.file.as_deref() == Some(rel.as_str())).collect();
+    syms.sort_by_key(|s| s.line.unwrap_or(0));
+    for s in &syms { o.push_str(&format!("  {:>5}  {} {}{}\n", s.line.unwrap_or(0), s.kind, s.name, s.container.as_ref().map(|c| format!("  <{}>", c)).unwrap_or_default())); }
+    o.push_str("\n## edges\n");
+    for e in map.edges.iter().filter(|e| e.etype != "contains" && (e.from == fid || e.to == fid || e.from.starts_with(&format!("sym:{}::", rel)) || e.to.starts_with(&format!("sym:{}::", rel)))) {
+        o.push_str(&format!("  {} {} -> {}{}\n", e.etype, e.from, e.to, e.rel.as_ref().map(|r| format!(" ({})", r)).unwrap_or_default()));
+    }
+    if with_code {
+        if let Ok(src) = std::fs::read_to_string(root.join(&rel)) {
+            o.push_str(&format!("\n## code\n```{}\n{}\n```\n", node.lang.clone().unwrap_or_default(), src.trim_end()));
+        }
+    }
+    o
+}
+pub fn nav_neighbors(map: &RepoMap, target: &str) -> String {
+    // match a node by id, file path, or symbol name
+    let ids: Vec<&str> = map.nodes.iter().filter(|n|
+        n.id == target
+        || n.path.as_deref() == Some(target)
+        || (n.name == target && n.kind != "dir" && n.kind != "file")
+        || n.id.ends_with(&format!("::{}", target))
+    ).map(|n| n.id.as_str()).collect();
+    if ids.is_empty() { return format!("no node matching: {}\n", target); }
+    let mut o = String::new();
+    for id in ids {
+        o.push_str(&format!("## {}\n", id));
+        for e in &map.edges {
+            if e.etype == "contains" { continue; }
+            if e.from == id { o.push_str(&format!("  -> {} {}{}\n", e.etype, e.to, e.rel.as_ref().map(|r| format!(" ({})", r)).unwrap_or_default())); }
+            else if e.to == id { o.push_str(&format!("  <- {} {}{}\n", e.etype, e.from, e.rel.as_ref().map(|r| format!(" ({})", r)).unwrap_or_default())); }
+        }
+    }
+    o
+}
+
+// ─── entry points ───
+pub fn handle_structure(root: &Path, out: &Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    let map = build(root);
+    let s = render_structure(&map);
+    match out { Some(p) => { std::fs::write(p, &s)?; println!("structure -> {}", p.display()); }, None => println!("{}", s) }
+    Ok(())
+}
+pub fn handle_chunks(root: &Path, out: &Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+    let map = build(root);
+    let s = export_chunks(root, &map);
+    let n = s.lines().filter(|l| !l.is_empty()).count();
+    match out { Some(p) => { std::fs::write(p, &s)?; println!("chunks -> {} ({} chunks)", p.display(), n); }, None => println!("{}", s) }
+    Ok(())
+}
+pub fn handle_nav(root: &Path, map_path: &Option<PathBuf>, list: &Option<String>, open: &Option<String>, neighbors: &Option<String>, code: bool) -> Result<(), Box<dyn Error>> {
+    let map = match map_path { Some(p) => load_map(p)?, None => build(root) };
+    if let Some(d) = list { print!("{}", nav_list(&map, d)); }
+    if let Some(f) = open { print!("{}", nav_open(root, &map, f, code)); }
+    if let Some(t) = neighbors { print!("{}", nav_neighbors(&map, t)); }
+    if list.is_none() && open.is_none() && neighbors.is_none() {
+        return Err("nav: pass one of --list <dir>, --open <file>, --neighbors <name>".into());
     }
     Ok(())
 }

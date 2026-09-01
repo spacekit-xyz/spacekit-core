@@ -3428,6 +3428,42 @@ enum AgentCommands {
         /// Output path (default: <root-name>.repo.json in the current directory)
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Emit only the compact structure skeleton (tree + per-file symbol summary)
+        /// instead of the full JSON graph — an always-include prompt block for RAG.
+        #[arg(long)]
+        structure: bool,
+    },
+    /// Export per-symbol chunks (JSONL) for a vector store: one row per top-level
+    /// definition with its source, structural metadata, and graph edges.
+    Chunks {
+        /// Directory to scan
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Output path (default: stdout)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Query the project graph like a filesystem/agent index: list a directory,
+    /// open a file (symbols + edges), or show a symbol's neighbors.
+    Nav {
+        /// Directory to scan when --map is not given
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Use a prebuilt map JSON (from `agent map`) instead of scanning
+        #[arg(long)]
+        map: Option<PathBuf>,
+        /// List the immediate children of this directory
+        #[arg(long)]
+        list: Option<String>,
+        /// Open this file: its symbols and edges (add --code for contents)
+        #[arg(long)]
+        open: Option<String>,
+        /// Show graph neighbors of this file/symbol name
+        #[arg(long)]
+        neighbors: Option<String>,
+        /// With --open, also print the file contents
+        #[arg(long)]
+        code: bool,
     },
     /// Pack the relevant slice of the project graph (structure + file contents) into
     /// a model-ready context bundle for a task ("add a feature", "fix this bug").
@@ -16166,8 +16202,14 @@ async fn handle_agent_command(
             };
             code_session::handle_plan(&args)
         }
-        AgentCommands::Map { root, out } => {
-            repo_lang::handle_map(root, out)
+        AgentCommands::Map { root, out, structure } => {
+            if *structure { repo_lang::handle_structure(root, out) } else { repo_lang::handle_map(root, out) }
+        }
+        AgentCommands::Chunks { root, out } => {
+            repo_lang::handle_chunks(root, out)
+        }
+        AgentCommands::Nav { root, map, list, open, neighbors, code } => {
+            repo_lang::handle_nav(root, map, list, open, neighbors, *code)
         }
         AgentCommands::Pack { root, query, seeds, hops, budget, out } => {
             repo_lang::handle_pack(root, query.clone(), seeds.clone(), *hops, *budget, out)
