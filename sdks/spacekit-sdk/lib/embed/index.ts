@@ -86,3 +86,5 @@ export {
 } from "./spkg.js";
 
 export { injectSdkBridgeIntoHtml } from "./injectShim.js";
+
+export { decodeContentRef, isDecodableCompression } from "./decompress.js";

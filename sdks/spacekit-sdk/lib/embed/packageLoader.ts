@@ -1,3 +1,4 @@
+import { decodeContentRef } from "./decompress.js";
 import { injectSdkBridgeIntoHtml } from "./injectShim.js";
 import type { AppPackageJSON, ContentRef, EmbedEndpoints, LoadedWebPackage } from "./types.js";
 
@@ -193,7 +194,10 @@ export async function loadWebPackage(
   return assembleWebPackage(pkg, options, async (ref) => {
     const factIdHex = toHex(ref.fact_id);
     if (!factIdHex || factIdHex === "0".repeat(64)) return null;
-    return fetchContentRefBytes(storageBase, factIdHex, fetchOpts);
+    const raw = await fetchContentRefBytes(storageBase, factIdHex, fetchOpts);
+    if (!raw) return null;
+    // Storage may hold this ref compressed; run/hash the decompressed bytes.
+    return decodeContentRef(raw, ref.compression);
   });
 }
 
@@ -233,7 +237,13 @@ async function assembleWebPackage(
 
   await Promise.all(
     pkg.content_refs.map(async (ref) => {
-      const bytes = await resolveBytes(ref);
+      let bytes: Uint8Array | null;
+      try {
+        bytes = await resolveBytes(ref);
+      } catch (err) {
+        integrityErrors.push(`${ref.path} (${err instanceof Error ? err.message : String(err)})`);
+        return;
+      }
       if (!bytes) {
         integrityErrors.push(`${ref.path} (missing)`);
         return;
@@ -395,7 +405,10 @@ export async function loadVerifiedPackageFiles(
   return assembleVerifiedFiles(pkg, async (ref) => {
     const factIdHex = toHex(ref.fact_id);
     if (!factIdHex || factIdHex === "0".repeat(64)) return null;
-    return fetchContentRefBytes(storageBase, factIdHex, fetchOpts);
+    const raw = await fetchContentRefBytes(storageBase, factIdHex, fetchOpts);
+    if (!raw) return null;
+    // Storage may hold this ref compressed; run/hash the decompressed bytes.
+    return decodeContentRef(raw, ref.compression);
   });
 }
 
@@ -408,7 +421,13 @@ async function assembleVerifiedFiles(
 
   await Promise.all(
     pkg.content_refs.map(async (ref) => {
-      const bytes = await resolveBytes(ref);
+      let bytes: Uint8Array | null;
+      try {
+        bytes = await resolveBytes(ref);
+      } catch (err) {
+        integrityErrors.push(`${ref.path} (${err instanceof Error ? err.message : String(err)})`);
+        return;
+      }
       if (!bytes) {
         integrityErrors.push(`${ref.path} (missing)`);
         return;
