@@ -122,8 +122,11 @@ pub struct FactStorageConfig {
     pub max_fact_size: u64,
     /// Enable compression for fact content
     pub enable_compression: bool,
-    /// Compression algorithm to use
+    /// Compression algorithm for NEW writes (may be changed freely; records are tagged).
     pub compression_algorithm: CompressionAlgorithm,
+    /// Algorithm used to read UNTAGGED (pre-framing) records. Pin to the codec those
+    /// records were written with, historically `Gzip`. Do not change once data exists.
+    pub legacy_read_algorithm: CompressionAlgorithm,
     /// Enable content deduplication
     pub enable_deduplication: bool,
     /// Cache size for verification results
@@ -181,6 +184,53 @@ fn decompress_with_algorithm(data: &[u8], algorithm: &CompressionAlgorithm) -> R
             decompressor.read_to_end(&mut decompressed)?;
             Ok(decompressed)
         }
+    }
+}
+
+/// Magic prefix marking a self-describing compressed record: `SKC1` ++ tag ++ payload.
+/// Legacy records written before this framing have no prefix and are decoded with
+/// `FactStorageConfig::legacy_read_algorithm`.
+const SKC_FRAME_MAGIC: &[u8; 4] = b"SKC1";
+
+fn compression_tag(algorithm: &CompressionAlgorithm) -> u8 {
+    match algorithm {
+        CompressionAlgorithm::None => 0,
+        CompressionAlgorithm::Gzip => 1,
+        CompressionAlgorithm::Zstd => 2,
+        CompressionAlgorithm::Lz4 => 3,
+        CompressionAlgorithm::Brotli => 4,
+    }
+}
+
+fn compression_from_tag(tag: u8) -> Result<CompressionAlgorithm> {
+    Ok(match tag {
+        0 => CompressionAlgorithm::None,
+        1 => CompressionAlgorithm::Gzip,
+        2 => CompressionAlgorithm::Zstd,
+        3 => CompressionAlgorithm::Lz4,
+        4 => CompressionAlgorithm::Brotli,
+        other => return Err(anyhow!("unknown compression tag {other}")),
+    })
+}
+
+/// Frame a record self-describingly: magic ++ tag ++ codec(payload).
+fn encode_framed(data: &[u8], algorithm: &CompressionAlgorithm) -> Result<Vec<u8>> {
+    let body = compress_with_algorithm(data, algorithm)?;
+    let mut out = Vec::with_capacity(SKC_FRAME_MAGIC.len() + 1 + body.len());
+    out.extend_from_slice(SKC_FRAME_MAGIC);
+    out.push(compression_tag(algorithm));
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Decode a record. Tagged records dispatch on their own codec; untagged (legacy)
+/// records use the pinned `legacy` algorithm, never the current new-write codec.
+fn decode_framed(data: &[u8], legacy: &CompressionAlgorithm) -> Result<Vec<u8>> {
+    if data.len() >= SKC_FRAME_MAGIC.len() + 1 && &data[..SKC_FRAME_MAGIC.len()] == SKC_FRAME_MAGIC {
+        let algorithm = compression_from_tag(data[SKC_FRAME_MAGIC.len()])?;
+        decompress_with_algorithm(&data[SKC_FRAME_MAGIC.len() + 1..], &algorithm)
+    } else {
+        decompress_with_algorithm(data, legacy)
     }
 }
 
@@ -744,11 +794,11 @@ impl FactStorageEngine {
     }
 
     fn compress_content(&self, data: &[u8]) -> Result<Vec<u8>> {
-        compress_with_algorithm(data, &self.config.compression_algorithm)
+        encode_framed(data, &self.config.compression_algorithm)
     }
 
     fn decompress_content(&self, data: &[u8]) -> Result<Vec<u8>> {
-        decompress_with_algorithm(data, &self.config.compression_algorithm)
+        decode_framed(data, &self.config.legacy_read_algorithm)
     }
 
     fn hash_access_policy(&self, policy: &AccessPolicy) -> Result<[u8; 32]> {
@@ -2499,6 +2549,7 @@ impl Default for FactStorageConfig {
             max_fact_size: 100 * 1024 * 1024, // 100MB
             enable_compression: true,
             compression_algorithm: CompressionAlgorithm::Gzip,
+            legacy_read_algorithm: CompressionAlgorithm::Gzip,
             enable_deduplication: true,
             verification_cache_size: 10000,
             enable_auto_indexing: true,
@@ -2575,5 +2626,36 @@ mod fact_content_codec_tests {
             decompress_with_algorithm(&gzip, &CompressionAlgorithm::Gzip).unwrap(),
             data
         );
+    }
+
+    #[test]
+    fn framed_records_are_self_describing() {
+        let data = b"fact payload ".repeat(500);
+        for algo in [
+            CompressionAlgorithm::None, CompressionAlgorithm::Gzip, CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4, CompressionAlgorithm::Brotli,
+        ] {
+            let framed = encode_framed(&data, &algo).unwrap();
+            // Legacy pin is irrelevant for tagged records:
+            let back = decode_framed(&framed, &CompressionAlgorithm::Zstd).unwrap();
+            assert_eq!(back, data, "roundtrip {algo:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_untagged_records_use_the_pinned_algorithm() {
+        let data = b"legacy payload ".repeat(500);
+        let untagged = compress_with_algorithm(&data, &CompressionAlgorithm::Gzip).unwrap();
+        // Reads with the pinned legacy algo even though new writes may be Zstd:
+        assert_eq!(decode_framed(&untagged, &CompressionAlgorithm::Gzip).unwrap(), data);
+    }
+
+    #[test]
+    fn migration_gzip_to_zstd_reads_mixed_data() {
+        let data = b"mixed payload ".repeat(500);
+        let new_write = encode_framed(&data, &CompressionAlgorithm::Zstd).unwrap(); // config moved to Zstd
+        let old_write = compress_with_algorithm(&data, &CompressionAlgorithm::Gzip).unwrap(); // pre-existing
+        assert_eq!(decode_framed(&new_write, &CompressionAlgorithm::Gzip).unwrap(), data);
+        assert_eq!(decode_framed(&old_write, &CompressionAlgorithm::Gzip).unwrap(), data);
     }
 }

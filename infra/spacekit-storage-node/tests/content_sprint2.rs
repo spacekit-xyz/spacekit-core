@@ -307,6 +307,7 @@ fn store_retrieve_roundtrips_ppv_access_policy() {
         max_fact_size: 10_000_000,
         enable_compression: false,
         compression_algorithm: CompressionAlgorithm::None,
+        legacy_read_algorithm: CompressionAlgorithm::None,
         enable_deduplication: false,
         verification_cache_size: 100,
         enable_auto_indexing: false,

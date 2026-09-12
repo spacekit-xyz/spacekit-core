@@ -3718,9 +3718,13 @@ mod tests {
             Some("database_master_key".to_string())
         );
 
-        // Test quantum encryption configuration
+        // Each Database owns its directory: the blobs/meta/refs `.redb` sidecars are
+        // keyed to the data dir (not the JSON filename) and hold an exclusive lock
+        // while open, so co-locating databases in one dir fails the second open with
+        // "Database already open. Cannot acquire lock." Give each its own temp dir.
+        let quantum_dir = tempdir().unwrap();
         let quantum_db = Database::new_with_quantum_encryption(
-            temp_dir.path().join("quantum_test.json").to_str().unwrap(),
+            quantum_dir.path().join("quantum_test.json").to_str().unwrap(),
             Algorithm::Kyber512,
             CipherSuite::ChaCha20,
         )
@@ -3739,8 +3743,9 @@ mod tests {
             ..Default::default()
         };
 
+        let unencrypted_dir = tempdir().unwrap();
         let unencrypted_db = Database::with_config(
-            temp_dir
+            unencrypted_dir
                 .path()
                 .join("unencrypted_test.json")
                 .to_str()

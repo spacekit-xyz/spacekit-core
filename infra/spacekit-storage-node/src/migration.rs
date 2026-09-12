@@ -415,6 +415,15 @@ pub fn sign_manifest_role(
     keypair: &OperatorSigningKeypair,
     now: u64,
 ) -> Result<()> {
+    // `schema_version` is part of the canonical signed payload, so the source
+    // export attestation must upgrade the manifest to v2 BEFORE signing —
+    // otherwise the signature (and signed_payload_hash) cover the v1 payload
+    // while any later verify recomputes the v2 payload and always fails. A
+    // destination counter-sign on a v1 inbound bundle must not force v2 (that
+    // would require source_operator on import), so only source bumps.
+    if role == "source_operator" {
+        manifest.schema_version = SCHEMA_VERSION_V2.to_string();
+    }
     let hash_bytes = message_hash_bytes(manifest);
     let sig = spacekit_primitives::v1::crypto::quantum::sign_sphincs_detached(
         &hash_bytes,
@@ -430,11 +439,6 @@ pub fn sign_manifest_role(
         signature: hex::encode(sig.signature_bytes),
         signed_at: now,
     });
-    // Only source export attestation upgrades the manifest to v2. Destination counter-sign
-    // on a v1 inbound bundle must not force v2 (would require source_operator on import).
-    if role == "source_operator" {
-        manifest.schema_version = SCHEMA_VERSION_V2.to_string();
-    }
     Ok(())
 }
 

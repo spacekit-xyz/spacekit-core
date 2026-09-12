@@ -31,29 +31,29 @@
 //! tempfile     = "3"
 //! ```
 //!
-//! ## Quick start
-//!
-//! ```no_run
-//! use std::path::Path;
-//! use streaming::{file_stream, ByteRange, StreamingConfig};
-//!
-//! # async fn demo() -> std::io::Result<()> {
-//! // Whole file, default 64 KiB chunks
-//! let (stream, meta) = file_stream(
-//!     Path::new("movie.mp4"),
-//!     StreamingConfig::default(),
-//!     None,
-//! ).await?;
-//!
-//! // A byte range (e.g. from an HTTP Range header)
-//! let (range_stream, range_meta) = file_stream(
-//!     Path::new("movie.mp4"),
-//!     StreamingConfig::default(),
-//!     Some(ByteRange { start: 1024, end: Some(8191) }),
-//! ).await?;
-//! # let _ = (stream, meta, range_stream, range_meta); Ok(()) }
-//! ```
-//!
+// ! ## Quick start
+// !
+// ! ```rust,ignore
+// ! use std::path::Path;
+// ! use streaming::{file_stream, ByteRange, StreamingConfig};
+// !
+// ! # async fn demo() -> std::io::Result<()> {
+// ! // Whole file, default 64 KiB chunks
+// ! let (stream, meta) = file_stream(
+// !     Path::new("movie.mp4"),
+// !     StreamingConfig::default(),
+// !     None,
+// ! ).await?;
+// !
+// ! // A byte range (e.g. from an HTTP Range header)
+// ! let (range_stream, range_meta) = file_stream(
+// !     Path::new("movie.mp4"),
+// !     StreamingConfig::default(),
+// !     Some(ByteRange { start: 1024, end: Some(8191) }),
+// ! ).await?;
+// ! # let _ = (stream, meta, range_stream, range_meta); Ok(()) }
+// ! ```
+// !
 //! ## With axum
 //!
 //! ```ignore
