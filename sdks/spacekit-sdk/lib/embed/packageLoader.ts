@@ -320,3 +320,120 @@ export function revokeLoadedWebPackage(loaded: LoadedWebPackage): void {
   URL.revokeObjectURL(loaded.blobUrl);
   for (const url of loaded.blobAssetUrls) URL.revokeObjectURL(url);
 }
+
+export interface VerifiedPackageFile {
+  bytes: Uint8Array;
+  /** Resolved MIME type for serving (e.g. text/html, application/wasm). */
+  mime: string;
+}
+
+export interface VerifiedWebPackageFiles {
+  pkg: AppPackageJSON;
+  appId: string;
+  creatorDid: string;
+  /** Package-relative path → verified bytes + MIME. */
+  files: Map<string, VerifiedPackageFile>;
+  integrityErrors: string[];
+}
+
+function resolveMime(ref: ContentRef): string {
+  let mime = mimeFor(ref.content_type);
+  if (mime === "application/octet-stream") mime = mimeFromPath(ref.path);
+  if (/\.html?$/i.test(ref.path)) mime = "text/html";
+  return mime;
+}
+
+/**
+ * Fetch and fully verify a web package, returning the raw file bytes rather than
+ * a `blob:` bundle.
+ *
+ * This runs the same network path and SHA-256 integrity checks as
+ * {@link loadWebPackage} (reusing the same helpers), but hands the verified bytes
+ * back so a caller — the service-worker runtime — can serve them from a real,
+ * cross-origin-isolated same-origin path with HTTP-style caching and streaming.
+ */
+export async function loadVerifiedPackageFiles(
+  storageBase: string,
+  appId: string,
+): Promise<VerifiedWebPackageFiles> {
+  const fetchOpts: RequestInit = { cache: "no-store" };
+
+  // Prefer the atomic .spkg archive (verified end-to-end by openSpkg).
+  const packageRes = await fetch(
+    `${storageBase}/packages/apps/${encodeURIComponent(appId)}`,
+    fetchOpts,
+  );
+  if (packageRes.status === 200) {
+    const { openSpkg } = await import("./spkg.js");
+    const opened = await openSpkg(await packageRes.arrayBuffer());
+    return assembleVerifiedFiles(opened.package, async (ref) => opened.files[ref.path] ?? null);
+  }
+  if (![404, 405, 501].includes(packageRes.status)) {
+    throw new Error(
+      `Package fetch failed (${packageRes.status}${packageRes.statusText ? ` ${packageRes.statusText}` : ""})`,
+    );
+  }
+
+  // Fall back to the manifest fact + per-ref content streams.
+  const manifestRes = await fetchWithRetry(
+    `${storageBase}/facts/${encodeURIComponent(appId)}`,
+    fetchOpts,
+  );
+  if (!manifestRes.ok) throw new Error(`App manifest fetch failed (${manifestRes.status})`);
+  const manifestFact = await manifestRes.json();
+
+  const factContent = manifestFact.content;
+  let pkg: AppPackageJSON;
+  if (factContent?.Json?.data) {
+    pkg = factContent.Json.data as AppPackageJSON;
+  } else if (manifestFact.manifest) {
+    pkg = manifestFact as unknown as AppPackageJSON;
+  } else {
+    throw new Error("Unexpected manifest format — no Json.data or manifest field");
+  }
+
+  return assembleVerifiedFiles(pkg, async (ref) => {
+    const factIdHex = toHex(ref.fact_id);
+    if (!factIdHex || factIdHex === "0".repeat(64)) return null;
+    return fetchContentRefBytes(storageBase, factIdHex, fetchOpts);
+  });
+}
+
+async function assembleVerifiedFiles(
+  pkg: AppPackageJSON,
+  resolveBytes: (ref: ContentRef) => Promise<Uint8Array | null>,
+): Promise<VerifiedWebPackageFiles> {
+  const files = new Map<string, VerifiedPackageFile>();
+  const integrityErrors: string[] = [];
+
+  await Promise.all(
+    pkg.content_refs.map(async (ref) => {
+      const bytes = await resolveBytes(ref);
+      if (!bytes) {
+        integrityErrors.push(`${ref.path} (missing)`);
+        return;
+      }
+      const expectedHash = contentHashHex(ref.hash);
+      if (!expectedHash) {
+        integrityErrors.push(`${ref.path} (invalid expected SHA-256)`);
+        return;
+      }
+      const actualHash = await sha256Hex(bytes);
+      if (actualHash !== expectedHash) {
+        integrityErrors.push(
+          `${ref.path} (SHA-256 mismatch: expected ${expectedHash}, got ${actualHash})`,
+        );
+        return;
+      }
+      files.set(ref.path, { bytes, mime: resolveMime(ref) });
+    }),
+  );
+
+  return {
+    pkg,
+    appId: pkg.app_id ? toHex(pkg.app_id) : "local-preview",
+    creatorDid: parseCreatorDid(pkg.creator_did),
+    files,
+    integrityErrors,
+  };
+}

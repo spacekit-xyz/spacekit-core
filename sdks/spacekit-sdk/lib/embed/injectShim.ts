@@ -128,7 +128,7 @@ export function injectSdkBridgeIntoHtml(
   config: EmbedShimConfig,
 ): string {
   html = rewriteAssetRefs(html, assetUrls);
-  const { appId, parentOrigin, endpoints, identityDid, kyberWasmBase64, contentFit } = config;
+  const { appId, parentOrigin, endpoints, identityDid, kyberWasmBase64, contentFit, sameOriginPassthrough } = config;
   const packagedWasm = packagedWasmBlobUrl(assetUrls);
   const embedConfig = {
     parentOrigin,
@@ -150,6 +150,32 @@ export function injectSdkBridgeIntoHtml(
   var pending={},nextId=1;
   window.__SPACEKIT_EMBED__=${JSON.stringify(embedConfig)};
   var embedApiBase=${embedApiBaseJson};
+  var skSameOriginPassthrough=${JSON.stringify(!!sameOriginPassthrough)};
+  // Per-frame KV fast path: an in-frame write-through cache over the "storage"
+  // module (localStorage-backed in the host). get() resolves from memory after
+  // the first read; set()/delete() update memory instantly and persist in the
+  // background — so a game touching storage in its loop never blocks on a
+  // cross-frame postMessage round-trip. This app is the sole writer of its own
+  // host-scoped keys, so cache-first reads stay consistent for it. (list/blob
+  // calls stay live; postMessage ordering keeps a set→list read consistent.)
+  var skKv=Object.create(null);
+  function skKvGet(k){
+    k=String(k);
+    if(k in skKv)return Promise.resolve(skKv[k]);
+    return window.spacekit.call("storage","get",{key:k}).then(function(v){skKv[k]=v;return v;});
+  }
+  function skKvSet(k,v){
+    k=String(k);
+    skKv[k]=(v===undefined?null:v);
+    window.spacekit.call("storage","set",{key:k,value:v}).catch(function(){});
+    return Promise.resolve(true);
+  }
+  function skKvDelete(k){
+    k=String(k);
+    skKv[k]=null;
+    window.spacekit.call("storage","delete",{key:k}).catch(function(){});
+    return Promise.resolve(true);
+  }
   function skRewriteEmbedUrl(url){
     if(!embedApiBase)return String(url);
     var u=String(url);
@@ -210,17 +236,17 @@ export function injectSdkBridgeIntoHtml(
       sseClose:function(id){return window.spacekit.call("http","sseClose",{id:id})},
     },
     storage:{
-      get:function(k){return window.spacekit.call("storage","get",{key:k})},
-      set:function(k,v){return window.spacekit.call("storage","set",{key:k,value:v})},
+      get:function(k){return skKvGet(k)},
+      set:function(k,v){return skKvSet(k,v)},
       list:function(p){return window.spacekit.call("storage","list",{prefix:p||""})},
-      delete:function(k){return window.spacekit.call("storage","delete",{key:k})},
+      delete:function(k){return skKvDelete(k)},
       ready:function(){return window.spacekit.call("storage","ready",{})},
       putBlob:function(blob){return window.spacekit.call("storage","putBlob",{blob:blob})},
       getBlob:function(cid){return window.spacekit.call("storage","getBlob",{cid:cid})},
-      putRecord:function(k,v){return window.spacekit.call("storage","putRecord",{key:k,value:v})},
-      getRecord:function(k){return window.spacekit.call("storage","getRecord",{key:k})},
+      putRecord:function(k,v){return skKvSet(k,v).then(function(){return String(k)})},
+      getRecord:function(k){return skKvGet(k)},
       listRecords:function(p){return window.spacekit.call("storage","listRecords",{prefix:p||""})},
-      deleteRecord:function(k){return window.spacekit.call("storage","deleteRecord",{key:k})},
+      deleteRecord:function(k){return skKvDelete(k)},
     },
     messaging:{
       publish:function(topic,msg){return window.spacekit.call("messaging","publish",{topic:topic,msg:msg})},
@@ -300,6 +326,10 @@ export function injectSdkBridgeIntoHtml(
       var parsed=new URL(url,window.location.href);
       if(parsed.protocol!=="http:"&&parsed.protocol!=="https:")return origFetch(input,init);
       if(parsed.pathname.endsWith(".wasm"))return origFetch(input,init);
+      // Service-worker runtime: the app is served from a real same-origin path,
+      // so its own asset fetches must hit that origin (and the SW cache), not be
+      // proxied to the host API as SDK http calls.
+      if(skSameOriginPassthrough&&parsed.origin===window.location.origin)return origFetch(input,init);
     }catch(_e){return origFetch(input,init);}
     return window.spacekit.http.fetch(url,init||{});
   };

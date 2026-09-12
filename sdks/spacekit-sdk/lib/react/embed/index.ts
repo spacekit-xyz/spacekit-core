@@ -13,3 +13,14 @@ export type {
   EmbeddedSdkBridge,
   LoadedWebPackage,
 } from "../../embed/index.js";
+
+// Service-worker app runtime: an opt-in `loadPackage` that serves apps from a
+// real, cross-origin-isolated, cache-backed path instead of a `blob:` bundle.
+export {
+  createSpacekitServiceWorkerLoader,
+  spacekitServiceWorkerLoader,
+  isServiceWorkerRuntimeSupported,
+  resolveRuntimeTier,
+  type AppRuntimeTier,
+  type ServiceWorkerLoaderConfig,
+} from "../../embed/index.js";

@@ -58,8 +58,20 @@ export {
   loadWebPackage,
   loadWebPackageFromLocal,
   revokeLoadedWebPackage,
+  loadVerifiedPackageFiles,
   type LoadWebPackageOptions,
+  type VerifiedPackageFile,
+  type VerifiedWebPackageFiles,
 } from "./packageLoader.js";
+
+export {
+  createSpacekitServiceWorkerLoader,
+  spacekitServiceWorkerLoader,
+  isServiceWorkerRuntimeSupported,
+  resolveRuntimeTier,
+  type AppRuntimeTier,
+  type ServiceWorkerLoaderConfig,
+} from "./serviceWorkerRuntime.js";
 
 export {
   SPKG_MAX_ENTRIES,
