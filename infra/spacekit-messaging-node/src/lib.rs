@@ -1010,9 +1010,21 @@ fn parse_algorithm_str(value: &str) -> Algorithm {
 mod tests {
     use super::*;
 
+    // MessagingConfig::default()'s storage_path is a fixed relative path
+    // ("./data/messaging"), and HistoryStore holds an exclusive lock on the
+    // redb file under it while open. Tests running in parallel (the default
+    // test runner) that all use the default path collide on that lock, so
+    // each test needs its own isolated storage_path.
+    fn isolated_config() -> (tempfile::TempDir, MessagingConfig) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = MessagingConfig::default();
+        config.storage.storage_path = temp_dir.path().to_str().unwrap().to_string();
+        (temp_dir, config)
+    }
+
     #[tokio::test]
     async fn test_messaging_node_creation() {
-        let config = MessagingConfig::default();
+        let (_temp_dir, config) = isolated_config();
         let node = MessagingNode::new(config).await.unwrap();
 
         assert!(!node.is_running().await);
@@ -1020,7 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_user_registration() {
-        let config = MessagingConfig::default();
+        let (_temp_dir, config) = isolated_config();
         let node = MessagingNode::new(config).await.unwrap();
 
         let user = node
@@ -1039,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_creation() {
-        let config = MessagingConfig::default();
+        let (_temp_dir, config) = isolated_config();
         let node = MessagingNode::new(config).await.unwrap();
 
         // Register a user first
@@ -1069,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_messaging() {
-        let config = MessagingConfig::default();
+        let (_temp_dir, config) = isolated_config();
         let node = MessagingNode::new(config).await.unwrap();
 
         // Real keys, not placeholder bytes: without the `quantum` feature,
@@ -1116,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_conversation_creation() {
-        let config = MessagingConfig::default();
+        let (_temp_dir, config) = isolated_config();
         let node = MessagingNode::new(config).await.unwrap();
 
         // Register two users
