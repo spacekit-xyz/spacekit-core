@@ -49,6 +49,8 @@ fn decode_u64(data: &[u8]) -> u64 {
 }
 
 #[tokio::test]
+#[ignore = "needs a prebuilt wasm artifact; scripts/build_contracts.sh can't currently \
+            produce it, its source contract crate isn't in this repo, see BUG-008"]
 async fn astra_erc20_contract_smoke() -> anyhow::Result<()> {
     let wasm = load_wasm("astra_erc20_contract.wasm");
     let runtime = SwtchvmRuntime::new(false)?;
@@ -94,6 +96,8 @@ async fn astra_erc20_contract_smoke() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "needs a prebuilt wasm artifact; scripts/build_contracts.sh can't currently \
+            produce it, its source contract crate isn't in this repo, see BUG-008"]
 async fn astra_erc721_contract_smoke() -> anyhow::Result<()> {
     let wasm = load_wasm("astra_erc721_contract.wasm");
     let runtime = SwtchvmRuntime::new(false)?;
