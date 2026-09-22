@@ -1775,6 +1775,7 @@ pub async fn get_fact_storage_engine(
         max_fact_size: 100 * 1024 * 1024 * 1024, // 100GB
         enable_compression: true,
         compression_algorithm: CompressionAlgorithm::Gzip,
+        legacy_read_algorithm: CompressionAlgorithm::Gzip,
         enable_deduplication: true,
         verification_cache_size: 10000,
         enable_auto_indexing: true,
