@@ -1072,12 +1072,18 @@ mod tests {
         let config = MessagingConfig::default();
         let node = MessagingNode::new(config).await.unwrap();
 
+        // Real keys, not placeholder bytes: without the `quantum` feature,
+        // send_direct_message encrypts via ECIES, which needs a real secp256k1
+        // public key (65 bytes), not an arbitrary short Vec.
+        let (_alice_sk, alice_pk) = ecies::utils::generate_keypair();
+        let (_bob_sk, bob_pk) = ecies::utils::generate_keypair();
+
         // Register two users
         let alice = node
             .register_user(
                 "did:example:alice".to_string(),
                 "Alice".to_string(),
-                vec![1, 2, 3, 4],
+                alice_pk.serialize().to_vec(),
                 Algorithm::Kyber1024,
             )
             .await
@@ -1087,7 +1093,7 @@ mod tests {
             .register_user(
                 "did:example:bob".to_string(),
                 "Bob".to_string(),
-                vec![5, 6, 7, 8],
+                bob_pk.serialize().to_vec(),
                 Algorithm::Kyber1024,
             )
             .await

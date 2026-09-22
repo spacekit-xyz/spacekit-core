@@ -404,7 +404,10 @@ impl AccessControlManager {
             // Apply consistency bonus
             let consistency_bonus = (messaging.consistency_score * 200.0) as i64;
 
-            Ok(base_score + consistency_bonus - 500) // Center around 0
+            // Center around 0: at the neutral defaults (quality_score = 0.5,
+            // consistency_score = 0.5) base_score is 500 and consistency_bonus is
+            // 100, so both need to be recentered, not just base_score.
+            Ok(base_score + consistency_bonus - 600) // Center around 0
         } else {
             Ok(0) // Neutral
         }
@@ -486,6 +489,11 @@ impl AccessControlManager {
                 profile.participant_score.updated_at = Utc::now();
             }
 
+            // get_reputation_score takes its own write lock via
+            // get_or_create_profile; that lock isn't reentrant, so it must be
+            // released here first or this deadlocks on every call.
+            drop(profiles);
+
             let current_score = self.get_reputation_score(did).await?;
 
             println!(
@@ -495,12 +503,9 @@ impl AccessControlManager {
 
             // Auto-ban if score too low (add to blacklist without recursion)
             if current_score < -100 {
-                let did_clone = did.to_string();
-                drop(profiles);
-
                 let mut blacklist = self.blacklist.write().await;
-                blacklist.insert(did_clone.clone());
-                println!("🚫 Auto-banned user {} - Low reputation score", did_clone);
+                blacklist.insert(did.to_string());
+                println!("🚫 Auto-banned user {} - Low reputation score", did);
             }
         }
 
