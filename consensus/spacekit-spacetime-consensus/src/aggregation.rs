@@ -3,16 +3,22 @@
 //! Given rotors R₁, …, Rₙ with reputation-derived weights w₁, …, wₙ, the
 //! weighted Fréchet mean R* minimizes
 //!
-//!     Σᵢ wᵢ · d(R*, Rᵢ)²
+//! ```text
+//! Σᵢ wᵢ · d(R*, Rᵢ)²
+//! ```
 //!
 //! where d is the geodesic distance on Spin⁺(1,3). The minimizer satisfies
 //! the first-order condition
 //!
-//!     Σᵢ wᵢ · log(R*⁻¹ Rᵢ) = 0
+//! ```text
+//! Σᵢ wᵢ · log(R*⁻¹ Rᵢ) = 0
+//! ```
 //!
 //! which gives the iterative update
 //!
-//!     R* ← R* · exp( (1/W) · Σᵢ wᵢ · log(R*⁻¹ Rᵢ) )      with W = Σ wᵢ
+//! ```text
+//! R* ← R* · exp( (1/W) · Σᵢ wᵢ · log(R*⁻¹ Rᵢ) )      with W = Σ wᵢ
+//! ```
 //!
 //! For rotors close to the identity (e.g., consensus on small state deltas
 //! between adjacent blocks), this converges quadratically in 3–6 iterations.
