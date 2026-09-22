@@ -416,6 +416,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_spacekitvm_storage_contract_operations() {
+        // A real Kyber1024 keypair, store_file encrypts against it for real
+        // (quantum feature), an arbitrary hex string isn't a valid public key.
+        let quantum_crypto = QuantumCrypto::new(
+            spacekit_primitives::v1::crypto::quantum::Algorithm::Kyber1024,
+            spacekit_primitives::v1::crypto::quantum::CipherSuite::AES256,
+        );
+        let (owner_public_key, _owner_private_key) = quantum_crypto
+            .generate_keypair(spacekit_primitives::v1::crypto::quantum::Algorithm::Kyber1024)
+            .await
+            .unwrap();
+
         let config = SpacekitvmStorageConfig {
             data_dir: tempdir().unwrap().path().to_str().unwrap().to_string(),
             ..Default::default()
@@ -424,7 +435,10 @@ mod tests {
         let mut contract = SpacekitvmStorageNode::new(config).await.unwrap();
 
         // Test initialization
-        let init_config = SpacekitvmStorageConfig::default();
+        let init_config = SpacekitvmStorageConfig {
+            owner_public_key_hex: Some(hex::encode(&owner_public_key)),
+            ..Default::default()
+        };
         assert!(contract.initialize(init_config).await.is_ok());
 
         // Test file storage
@@ -441,11 +455,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_storage_factory() {
+        // The factory presets all default to the same relative data_dir, so each
+        // storage node must be dropped (releasing its redb locks) before the next
+        // one opens the same directory, same pattern as database/mod.rs's "each
+        // Database owns its directory ... give each its own temp dir" note, just
+        // done via sequential drop since these presets don't take a data_dir param.
         let quantum_storage = SpacekitvmStorageFactory::create_quantum_safe_storage().await;
         assert!(quantum_storage.is_ok());
+        drop(quantum_storage);
 
         let distributed_storage = SpacekitvmStorageFactory::create_distributed_storage().await;
         assert!(distributed_storage.is_ok());
+        drop(distributed_storage);
 
         let reputation_storage = SpacekitvmStorageFactory::create_reputation_storage().await;
         assert!(reputation_storage.is_ok());
