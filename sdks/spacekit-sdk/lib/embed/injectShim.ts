@@ -1,4 +1,13 @@
+import { LOCAL_STORAGE_SHIM_PREFIX } from "./protocol.js";
 import type { EmbedShimConfig } from "./types.js";
+
+/** JSON safe to inline in a <script>: no `</script>` breakout, no raw line separators. */
+function scriptJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .split(String.fromCharCode(0x2028)).join("\\u2028")
+    .split(String.fromCharCode(0x2029)).join("\\u2029");
+}
 
 function normalizeAssetPath(ref: string): string {
   return ref.replace(/^\.\//, "").replace(/^\//, "");
@@ -148,8 +157,13 @@ export function injectSdkBridgeIntoHtml(
   const script = `<script>
 (function(){
   var pending={},nextId=1;
-  window.__SPACEKIT_EMBED__=${JSON.stringify(embedConfig)};
-  var embedApiBase=${embedApiBaseJson};
+  // Bridge transport: the MessagePort the frame bootstrap received from the
+  // host. Calls never go through window.postMessage, so nothing is broadcast.
+  var skPort=window.__skPort||null;
+  var skLocalSeed=window.__skLocalSeed||null;
+  try{delete window.__skPort;delete window.__skLocalSeed;}catch(_e){window.__skPort=undefined;window.__skLocalSeed=undefined;}
+  window.__SPACEKIT_EMBED__=${scriptJson(embedConfig)};
+  var embedApiBase=${scriptJson(JSON.parse(embedApiBaseJson))};
   var skSameOriginPassthrough=${JSON.stringify(!!sameOriginPassthrough)};
   // Per-frame KV fast path: an in-frame write-through cache over the "storage"
   // module (localStorage-backed in the host). get() resolves from memory after
@@ -185,12 +199,13 @@ export function injectSdkBridgeIntoHtml(
     return u;
   }
   window.spacekit={
-    appId:${JSON.stringify(appId)},
+    appId:${scriptJson(appId)},
     call:function(mod,method,params){
       return new Promise(function(res,rej){
+        if(!skPort){rej(new Error("SpaceKit bridge is not connected"));return;}
         var id=nextId++;
         pending[id]={resolve:res,reject:rej};
-        parent.postMessage({type:"spacekit-sdk-call",id:id,module:mod,method:method,params:params},"*");
+        skPort.postMessage({t:"call",id:id,module:String(mod),method:String(method),params:params||{}});
       });
     },
     http:{
@@ -298,26 +313,58 @@ export function injectSdkBridgeIntoHtml(
       delete:function(collection,id){return window.spacekit.call("documents","delete",{collection:collection,id:id})},
     },
   };
-  window.addEventListener("message",function(e){
-    if(e.data&&e.data.type==="spacekit-sdk-response"&&pending[e.data.id]){
-      var p=pending[e.data.id];delete pending[e.data.id];
-      if(e.data.error)p.reject(new Error(e.data.error));else p.resolve(e.data.result);
+  function skOnHostMessage(d){
+    if(!d)return;
+    if(d.t==="res"&&pending[d.id]){
+      var p=pending[d.id];delete pending[d.id];
+      if(d.error)p.reject(new Error(d.error));else p.resolve(d.result);
+      return;
     }
-    if(e.data&&e.data.type==="spacekit-sdk-event"){
+    if(d.t==="event"){
       if(window.__skTopicSubs){
-        var subs=window.__skTopicSubs[e.data.topic];
-        if(subs)subs.forEach(function(s){s.cb(e.data.msg)});
+        var subs=window.__skTopicSubs[d.topic];
+        if(subs)subs.forEach(function(s){s.cb(d.msg)});
       }
-      if(window.__skSseStreams&&e.data.topic&&String(e.data.topic).indexOf("__sse:")===0){
-        var stream=window.__skSseStreams[e.data.topic.slice(6)];
+      if(window.__skSseStreams&&d.topic&&String(d.topic).indexOf("__sse:")===0){
+        var stream=window.__skSseStreams[d.topic.slice(6)];
         if(stream){
-          var msg=e.data.msg||{};
+          var msg=d.msg||{};
           if(msg.type==="message"&&stream.onmessage)stream.onmessage({data:msg.data});
           if(msg.type==="error"&&stream.onerror)stream.onerror({});
         }
       }
     }
-  });
+  }
+  if(skPort){skPort.onmessage=function(e){skOnHostMessage(e.data)};}
+  // Opaque-origin frames have no Web Storage. Give apps that use
+  // localStorage/sessionStorage directly a working in-memory Storage, with
+  // localStorage persisted through the app-scoped storage module.
+  function skMemoryStorage(seed,persist){
+    var data=Object.create(null);
+    if(seed)for(var k in seed)if(Object.prototype.hasOwnProperty.call(seed,k))data[k]=String(seed[k]);
+    function keys(){return Object.keys(data)}
+    return {
+      get length(){return keys().length},
+      key:function(i){var ks=keys();return i>=0&&i<ks.length?ks[i]:null},
+      getItem:function(k){k=String(k);return k in data?data[k]:null},
+      setItem:function(k,v){k=String(k);v=String(v);data[k]=v;if(persist)persist(k,v)},
+      removeItem:function(k){k=String(k);delete data[k];if(persist)persist(k,null)},
+      clear:function(){var ks=keys();for(var i=0;i<ks.length;i++){delete data[ks[i]];if(persist)persist(ks[i],null)}},
+    };
+  }
+  function skStorageUsable(name){
+    try{var s=window[name];var t="__sk_probe__";s.setItem(t,t);s.removeItem(t);return true}catch(_e){return false}
+  }
+  if(!skStorageUsable("localStorage")){
+    var skLs=skMemoryStorage(skLocalSeed,function(k,v){
+      window.spacekit.call("storage","set",{key:${JSON.stringify(LOCAL_STORAGE_SHIM_PREFIX)}+k,value:v}).catch(function(){});
+    });
+    try{Object.defineProperty(window,"localStorage",{configurable:true,get:function(){return skLs}})}catch(_e){}
+  }
+  if(!skStorageUsable("sessionStorage")){
+    var skSs=skMemoryStorage(null,null);
+    try{Object.defineProperty(window,"sessionStorage",{configurable:true,get:function(){return skSs}})}catch(_e){}
+  }
   var origFetch=window.fetch.bind(window);
   window.fetch=function(input,init){
     var url=typeof input==="string"?input:(input&&input.url?input.url:String(input));

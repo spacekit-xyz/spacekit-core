@@ -3,6 +3,12 @@ import {
   acquireAppDataSdkBridge,
   createLocalStorageEmbedHost,
   createStorageOriginResolver,
+  defaultTrustedOrigins,
+  type AppMountState,
+  type CapabilityPolicy,
+  type IsolationMode,
+  type TrustPolicy,
+  type VerifiedFilesLoader,
   type EmbedEndpoints,
   type EmbedHostServices,
   type EmbeddedHttpHandler,
@@ -11,7 +17,12 @@ import {
   type StorageOriginResolverOptions,
 } from "../../embed/index.js";
 import EmbedAppLoading from "./EmbedAppLoading.js";
-import { SpacekitAppFrame, type SpacekitPackageLoader } from "./SpacekitAppFrame.js";
+import {
+  SpacekitAppFrame,
+  type SpacekitAppFrameProps,
+  type SpacekitFrameTheme,
+  type SpacekitPackageLoader,
+} from "./SpacekitAppFrame.js";
 
 export interface SpacekitEmbeddedAppProps {
   appId: string;
@@ -37,7 +48,25 @@ export interface SpacekitEmbeddedAppProps {
     storageOrigin: string,
     manifestName: string,
   ) => EmbeddedSdkBridge;
+  /** @deprecated Ignored; use `loadFiles`. */
   loadPackage?: SpacekitPackageLoader;
+  /** Override package loading; must return verified files. */
+  loadFiles?: VerifiedFilesLoader;
+  /** See `SpacekitAppFrame`. Defaults to `"origin"` with `appOrigin`, else `"opaque"`. */
+  isolation?: IsolationMode;
+  appOrigin?: string | ((appIdHex: string) => string);
+  frameHostPath?: string;
+  /**
+   * Capability policy. `trustedOrigins` also decides where the default identity
+   * host attaches the viewer's credentials; it defaults to this page's origin
+   * plus the origins in `endpoints`.
+   */
+  capabilities?: CapabilityPolicy;
+  trustPolicy?: TrustPolicy;
+  onStateChange?: (state: AppMountState) => void;
+  theme?: Partial<SpacekitFrameTheme>;
+  renderPermissions?: SpacekitAppFrameProps["renderPermissions"];
+  className?: string;
   fullscreen?: boolean;
   embedded?: boolean;
   active?: boolean;
@@ -71,6 +100,16 @@ export const SpacekitEmbeddedApp: FC<SpacekitEmbeddedAppProps> = ({
   endpoints,
   acquireBridge,
   loadPackage,
+  loadFiles,
+  isolation,
+  appOrigin,
+  frameHostPath,
+  capabilities,
+  trustPolicy,
+  onStateChange,
+  theme,
+  renderPermissions,
+  className,
   fullscreen,
   embedded,
   active = true,
@@ -79,9 +118,38 @@ export const SpacekitEmbeddedApp: FC<SpacekitEmbeddedAppProps> = ({
 }) => {
   const [storageOrigin, setStorageOrigin] = useState<string | null>(null);
 
+  const trustedKey = JSON.stringify([
+    capabilities?.trustedOrigins ?? null,
+    endpoints?.apiBase,
+    endpoints?.messagingBase,
+    endpoints?.reposApiBase,
+    endpoints?.workspacesApiBase,
+  ]);
+  const trustedOrigins = useMemo(
+    () =>
+      capabilities?.trustedOrigins ??
+      defaultTrustedOrigins([
+        endpoints?.apiBase,
+        endpoints?.messagingBase,
+        endpoints?.reposApiBase,
+        endpoints?.workspacesApiBase,
+      ]),
+    [trustedKey], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const policy = useMemo<CapabilityPolicy>(
+    () => ({ ...capabilities, trustedOrigins }),
+    [JSON.stringify(capabilities ?? {}), trustedOrigins], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
   const host = useMemo(
-    () => (services ? null : createLocalStorageEmbedHost(hostOptions)),
-    [services, hostOptions],
+    () =>
+      services
+        ? null
+        : createLocalStorageEmbedHost({
+            ...hostOptions,
+            credentialedOrigins: hostOptions?.credentialedOrigins ?? trustedOrigins,
+          }),
+    [services, hostOptions, trustedOrigins],
   );
 
   const resolvedServices = services ?? host!.services;
@@ -146,6 +214,17 @@ export const SpacekitEmbeddedApp: FC<SpacekitEmbeddedAppProps> = ({
       contentFit={contentFit}
       acquireBridge={bridgeFactory}
       loadPackage={loadPackage}
+      loadFiles={loadFiles}
+      isolation={isolation}
+      appOrigin={appOrigin}
+      frameHostPath={frameHostPath}
+      capabilities={policy}
+      trustPolicy={trustPolicy}
+      onStateChange={onStateChange}
+      theme={theme}
+      renderPermissions={renderPermissions}
+      className={className}
+      loadingLabel={loadingLabel}
     />
   );
 };

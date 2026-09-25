@@ -412,6 +412,26 @@ export async function loadVerifiedPackageFiles(
   });
 }
 
+/**
+ * Verify an in-memory package (Desktop project preview, encrypted local cache)
+ * with the same SHA-256 checks as {@link loadVerifiedPackageFiles}.
+ * `files` maps package-relative paths to raw bytes (Uint8Array or base64 string).
+ */
+export async function verifyLocalPackageFiles(
+  pkg: AppPackageJSON,
+  files: Record<string, Uint8Array | string>,
+): Promise<VerifiedWebPackageFiles> {
+  return assembleVerifiedFiles(pkg, async (ref) => {
+    const value = files[ref.path];
+    if (value == null) return null;
+    if (typeof value !== "string") return value;
+    const bin = atob(value);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  });
+}
+
 async function assembleVerifiedFiles(
   pkg: AppPackageJSON,
   resolveBytes: (ref: ContentRef) => Promise<Uint8Array | null>,

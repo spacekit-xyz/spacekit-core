@@ -115,6 +115,78 @@ const input = concatBytes([
 console.log('Input:', toHex(input));
 ```
 
+## Hosting SpaceKit apps
+
+Run published web packages (`.spkg`) inside your own site or network. Apps run in an isolated frame. They can't read your page's storage, cookies, session or DOM, and they reach the viewer's identity only through a permission-checked bridge. The wire protocol is specified in [`SPACEKIT-EMBED-PROTOCOL.md`](../spacekit-apps/SPACEKIT-EMBED-PROTOCOL.md).
+
+### React
+
+```tsx
+import { SpacekitEmbeddedApp, allowPublishers } from "@spacekit/sdk/react/embed";
+
+<SpacekitEmbeddedApp
+  appId={appId}
+  storageOrigins={["https://storage.example.com"]}
+  fullscreen
+  // Optional hardening for private deployments:
+  capabilities={{ network: "manifest", trustedOrigins: ["https://api.example.com"] }}
+  trustPolicy={allowPublishers(["did:key:z6Mk…"])}
+  // Optional: real storage per app on a dedicated origin (see the protocol spec, section 8)
+  // appOrigin="https://{app}.apps.example-usercontent.com"
+/>
+```
+
+### Any framework (custom element)
+
+```html
+<script type="module">
+  import { defineSpacekitAppElement } from "@spacekit/sdk/embed/element";
+  defineSpacekitAppElement({ storageOrigins: ["https://storage.example.com"] });
+</script>
+<spacekit-app app-id="3fa0…c1" style="height: 640px"></spacekit-app>
+```
+
+### Plain JavaScript
+
+```ts
+import { mountSpacekitApp, createLocalStorageEmbedHost, acquireAppDataSdkBridge } from "@spacekit/sdk/embed";
+
+const host = createLocalStorageEmbedHost();
+const handle = mountSpacekitApp(document.getElementById("app")!, {
+  appId,
+  storageOrigin: "https://storage.example.com",
+  services: host.services,
+  acquireBridge: (id, origin) => acquireAppDataSdkBridge(host.services, host.httpHandler, id, origin),
+  requestPermissions: async ({ manifest, permissions }) => confirm(`${manifest.name} asks to:\n${permissions.join("\n")}`),
+});
+// later: handle.unmount()
+```
+
+### Inside an app
+
+```ts
+import { getSpacekit } from "@spacekit/sdk/guest";
+const sk = getSpacekit();
+await sk.storage.set("highScore", 1200);
+```
+
+### Isolation modes
+
+| `isolation` | What the app gets | Infrastructure |
+|---|---|---|
+| `"opaque"` (default) | Opaque origin. `localStorage` is shimmed onto the bridge. No IndexedDB or cookies. | None |
+| `"origin"` | Its own real origin (optionally one per app), with full storage | An app origin serving `spacekit-frame.html`. Generate it with `npx spacekit-frame-host --allow https://your.site` |
+| `"unsafe-same-origin"` | Your page's origin and everything on it | For your own code only |
+
+Games keep `SharedArrayBuffer` / WASM threads in every mode, as long as the host page is cross-origin isolated (COOP `same-origin` + COEP `require-corp`).
+
+### Upgrading from the pre-v1 frame
+
+- `loadPackage` is ignored (blob-URL loaders cannot be isolated). Pass `loadFiles`, which returns verified files, for example with `verifyLocalPackageFiles(pkg, files)` for a local or encrypted cache.
+- `createSpacekitServiceWorkerLoader` is deprecated. It served apps from the host origin.
+- Apps no longer receive the session token (`identity.authHeaders`) or overwrite the signed-in DID. `http.fetch` attaches host credentials only to trusted origins: your page origin plus `capabilities.trustedOrigins` / `endpoints`.
+- The React frame takes `theme`, `className` and `renderPermissions` for your own look and consent UI.
+
 ## Exports
 
 | Module | Description |
@@ -125,6 +197,11 @@ console.log('Input:', toHex(input));
 | `@spacekit/sdk/kyber` | Kyber post-quantum encryption |
 | `@spacekit/sdk/encoding` | Binary encoding utilities |
 | `@spacekit/sdk/react` | React hooks and provider |
+| `@spacekit/sdk/embed` | Framework-agnostic app host (`mountSpacekitApp`), package loading and verification, capability policy |
+| `@spacekit/sdk/embed/element` | `<spacekit-app>` custom element |
+| `@spacekit/sdk/react/embed` | `SpacekitEmbeddedApp` / `SpacekitAppFrame` React components |
+| `@spacekit/sdk/guest` | Types and accessor for `window.spacekit`, for use inside apps |
+| `@spacekit/sdk/frame-host/spacekit-frame.html` | Frame-host page template for `isolation: "origin"` (placeholder host; regenerate with `spacekit-frame-host`) |
 | `@spacekit/sdk/styles` | Default CSS styles |
 
 ## API Reference
@@ -167,7 +244,7 @@ console.log('Input:', toHex(input));
 ## Requirements
 
 - Node.js 18+
-- React 18+ (for React integration)
+- React 18+ (only for the React entry points; `embed`, `embed/element` and `guest` have no React dependency)
 - Modern browser with WebAssembly support
 
 ## License

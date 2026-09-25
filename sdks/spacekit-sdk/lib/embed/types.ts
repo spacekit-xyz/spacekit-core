@@ -83,6 +83,13 @@ export interface EmbedHostServices {
 }
 
 export interface HttpBridgeHost {
+  /**
+   * Whether the host may attach its own credentials (session token, owner DID,
+   * cookies) to a request for `url`. Requests that fail this check are sent
+   * with only the app's own headers and `credentials: "omit"`. Defaults to
+   * same-origin with the host page.
+   */
+  isCredentialedUrl?(url: string): boolean;
   mergeFetchHeaders(url: string, headers: Record<string, string>): Record<string, string>;
   getSessionToken(): string | null;
   /** When true, retry the request once with refreshed auth headers after a 401. */

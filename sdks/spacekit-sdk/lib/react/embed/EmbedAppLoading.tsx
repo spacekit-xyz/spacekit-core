@@ -3,13 +3,21 @@ import { type CSSProperties, type FC } from "react";
 export interface EmbedAppLoadingProps {
   embedded?: boolean;
   label?: string;
+  /** Spinner color. */
+  accent?: string;
+  /** Label color. */
+  color?: string;
+  fontFamily?: string;
 }
 
 const EmbedAppLoading: FC<EmbedAppLoadingProps> = ({
   embedded = false,
   label = "Loading app…",
+  accent = "#22d3ee",
+  color,
+  fontFamily,
 }) => {
-  const font = embedded ? '"Hanken Grotesk", sans-serif' : "'DM Sans', sans-serif";
+  const font = fontFamily ?? (embedded ? '"Hanken Grotesk", sans-serif' : "'DM Sans', sans-serif");
 
   const wrap: CSSProperties = {
     display: "flex",
@@ -25,7 +33,7 @@ const EmbedAppLoading: FC<EmbedAppLoadingProps> = ({
     fontFamily: font,
     fontWeight: 600,
     letterSpacing: "-0.01em",
-    color: embedded ? "#9aa3b5" : "#94a3b8",
+    color: color ?? (embedded ? "#9aa3b5" : "#94a3b8"),
   };
 
   return (
@@ -36,13 +44,14 @@ const EmbedAppLoading: FC<EmbedAppLoadingProps> = ({
           cy="14"
           r="11"
           fill="none"
-          stroke="rgba(34, 211, 238, 0.14)"
+          stroke={accent}
+          strokeOpacity={0.14}
           strokeWidth="2.5"
         />
         <path
           d="M14 3a11 11 0 0 1 11 11"
           fill="none"
-          stroke="#22d3ee"
+          stroke={accent}
           strokeWidth="2.5"
           strokeLinecap="round"
         >

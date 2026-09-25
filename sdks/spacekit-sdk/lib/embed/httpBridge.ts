@@ -29,12 +29,35 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(parts.join(""));
 }
 
+function resolveUrl(url: string): string {
+  try {
+    return new URL(url, typeof window !== "undefined" ? window.location.href : undefined).href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Host credentials go only to origins the host vouches for. Without an explicit
+ * `isCredentialedUrl`, that is the host page's own origin.
+ */
+function isCredentialedUrl(host: HttpBridgeHost, url: string): boolean {
+  if (host.isCredentialedUrl) return host.isCredentialedUrl(resolveUrl(url));
+  if (typeof window === "undefined") return false;
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
 export async function handleEmbeddedHttpFetch(
   host: HttpBridgeHost,
   params: Record<string, unknown>,
 ): Promise<EmbeddedFetchResult> {
   const url = String(params.url ?? "");
   if (!url) throw new Error("http.fetch requires url");
+  const resolvedUrl = resolveUrl(url);
 
   const init = (params.init ?? {}) as {
     method?: string;
@@ -42,7 +65,9 @@ export async function handleEmbeddedHttpFetch(
     body?: string;
   };
 
-  const headers = host.mergeFetchHeaders(url, { ...(init.headers ?? {}) });
+  const credentialed = isCredentialedUrl(host, url);
+  const appHeaders = { ...(init.headers ?? {}) };
+  const headers = credentialed ? host.mergeFetchHeaders(url, appHeaders) : appHeaders;
   const bodyEncoding = headers["X-Body-Encoding"] ?? headers["x-body-encoding"];
   delete headers["X-Body-Encoding"];
   delete headers["x-body-encoding"];
@@ -62,10 +87,11 @@ export async function handleEmbeddedHttpFetch(
   const method = init.method ?? "GET";
 
   async function doFetch(requestHeaders: Record<string, string>): Promise<Response> {
-    return fetch(url, {
+    return fetch(resolvedUrl, {
       method,
       headers: requestHeaders,
       body: fetchBody,
+      credentials: credentialed ? "same-origin" : "omit",
     });
   }
 
@@ -78,6 +104,7 @@ export async function handleEmbeddedHttpFetch(
   }
 
   if (
+    credentialed &&
     res.status === 401 &&
     host.shouldRetryUnauthorized?.(url, headers) &&
     host.refreshFetchHeaders
@@ -92,7 +119,7 @@ export async function handleEmbeddedHttpFetch(
     }
   }
 
-  if (res.status === 401 && host.getSessionToken() && host.isSessionExpiredError) {
+  if (credentialed && res.status === 401 && host.getSessionToken() && host.isSessionExpiredError) {
     const errBody = await res.clone().json().catch(() => null);
     if (host.isSessionExpiredError(errBody)) {
       host.onSessionExpired?.("Your session expired. Sign in again to continue.");
@@ -148,7 +175,9 @@ export function createEmbeddedHttpHandler(host: HttpBridgeHost): EmbeddedHttpHan
       const url = String(params.url ?? "");
       if (!url) throw new Error("http.sseSubscribe requires url");
       const id = safeUUID();
-      const es = new EventSource(url);
+      const es = new EventSource(resolveUrl(url), {
+        withCredentials: false,
+      });
       sseStreams.set(id, es);
       es.onmessage = (event) => {
         push(`__sse:${id}`, { type: "message", data: event.data });
