@@ -108,6 +108,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Request authentication: Ed25519 did:key login signatures (src/request_auth.rs)
 ed25519-dalek = "2"
+# SLH-DSA (FIPS 205) logins for quantum did:key identities; same versions as
+# spacekit-primitives and identity/wasm-did, so the lock file needs no new crates.
+slh-dsa = "0.2.0-rc.4"
+signature = "3.0.0-rc.10"
 
 # Storage and hashing
 blake3 = "1.0"

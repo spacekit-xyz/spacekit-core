@@ -15,14 +15,30 @@
  * ```
  */
 
-import type { AppCredentialRequest, AppCredentials } from "./types.js";
+import type {
+  AppCredentialRequest,
+  AppCredentials,
+  SubscriptionRecordRequest,
+  SubscriptionStatus,
+} from "./types.js";
+
+export type StorageSignatureAlgorithm = "ed25519" | "slh-dsa-sha2-128s" | "slh-dsa-sha2-192s";
 
 export interface StorageSigner {
   did: string;
-  /** Hex Ed25519 public key (32 bytes). */
+  /** Hex public key (Ed25519: 32 bytes; SLH-DSA-SHA2-128s: 32; -192s: 48). */
   publicKeyHex: string;
-  /** Ed25519 signature over the exact message bytes. */
+  /** Defaults to "ed25519". SLH-DSA is FIPS 205 (kit.space quantum identities). */
+  algorithm?: StorageSignatureAlgorithm;
+  /** Signature over the exact message bytes. */
   sign(message: Uint8Array): Promise<Uint8Array>;
+}
+
+/** A node session obtained some other way (e.g. from the website API). */
+export interface StorageSession {
+  token: string;
+  did: string;
+  expiresAt: number;
 }
 
 export interface StorageAuthClientOptions {
@@ -32,7 +48,14 @@ export interface StorageAuthClientOptions {
    * The signed-in viewer's signer, or null when nobody is signed in (apps then
    * run without storage credentials). Called when a new session is needed.
    */
-  getSigner(): Promise<StorageSigner | null>;
+  getSigner?(): Promise<StorageSigner | null>;
+  /**
+   * Alternative to `getSigner` for viewers whose DID has no key the node can
+   * check (e.g. `did:spacekit:user:*` accounts signed in to the website API):
+   * return a node session minted by a trusted service. See
+   * `websiteStorageSession`.
+   */
+  getSession?(): Promise<StorageSession | null>;
   fetchImpl?: typeof fetch;
 }
 
@@ -88,7 +111,14 @@ export function createStorageAuthClient(options: StorageAuthClientOptions): Stor
   }
 
   async function login(): Promise<string | null> {
-    const signer = await options.getSigner();
+    if (options.getSession) {
+      const s = await options.getSession();
+      if (!s) return null;
+      session = { did: s.did, authorization: `Bearer ${s.token}`, expiresAt: s.expiresAt };
+      appTokens.clear();
+      return session.authorization;
+    }
+    const signer = options.getSigner ? await options.getSigner() : null;
     if (!signer) return null;
     if (fresh(session) && session.did === signer.did) return session.authorization;
     const ch = await postJson("/api/auth/challenge", { did: signer.did });
@@ -99,7 +129,7 @@ export function createStorageAuthClient(options: StorageAuthClientOptions): Stor
     const issued = await postJson("/api/auth/session", {
       did: signer.did,
       challenge,
-      algorithm: "ed25519",
+      algorithm: signer.algorithm ?? "ed25519",
       public_key_hex: signer.publicKeyHex,
       signature_hex: toHex(signature),
     });
@@ -162,5 +192,67 @@ export function createStorageAuthClient(options: StorageAuthClientOptions): Stor
       session = null;
       appTokens.clear();
     },
+  };
+}
+
+/**
+ * `getSession` for viewers signed in to the website API (passkey / magic link):
+ * trades their bearer session for a storage-node session via
+ * `POST {apiBase}/api/auth/storage-token`.
+ */
+export function websiteStorageSession(options: {
+  apiBase: string;
+  /** The viewer's website-API bearer token, or null when signed out. */
+  getBearer(): string | null | Promise<string | null>;
+  fetchImpl?: typeof fetch;
+}): () => Promise<StorageSession | null> {
+  const doFetch = options.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  return async () => {
+    const bearer = await options.getBearer();
+    if (!bearer) return null;
+    const res = await doFetch(`${trimSlash(options.apiBase)}/api/auth/storage-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${bearer}` },
+      body: "{}",
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { token?: string; did?: string; expires_at?: number };
+    if (!json.token || !json.did) return null;
+    return { token: json.token, did: json.did, expiresAt: Number(json.expires_at) || 0 };
+  };
+}
+
+/**
+ * `recordSubscription` backed by the website API
+ * (`POST {apiBase}/api/apps/:appId/subscriptions`), which verifies the payment
+ * on-chain and writes the record as a trusted service.
+ */
+export function createSubscriptionRecorder(options: {
+  apiBase: string;
+  /** Authorization for the viewer, e.g. `storageAuth.sessionAuthorization`. */
+  authorization(): Promise<string | null>;
+  fetchImpl?: typeof fetch;
+}): (req: SubscriptionRecordRequest) => Promise<SubscriptionStatus> {
+  const doFetch = options.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  return async (req) => {
+    const authorization = await options.authorization();
+    if (!authorization) throw new Error("Sign in before subscribing");
+    const res = await doFetch(
+      `${trimSlash(options.apiBase)}/api/apps/${encodeURIComponent(req.appId)}/subscriptions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authorization },
+        body: JSON.stringify({
+          publisher_did: req.publisherDid,
+          amount_cents: req.amountCents,
+          period_days: req.periodDays,
+          tx_hash: req.txHash,
+          payer_address: req.payerAddress,
+        }),
+      },
+    );
+    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok) throw new Error(String(json.error ?? `subscription failed (${res.status})`));
+    return json as unknown as SubscriptionStatus;
   };
 }

@@ -14,6 +14,7 @@ export type {
   LoadedWebPackage,
   MarketplacePurchaseRecord,
   SubscriptionPaymentRequest,
+  SubscriptionRecordRequest,
   SubscriptionPaymentResult,
   SubscriptionStatus,
 } from "./types.js";
@@ -155,8 +156,12 @@ export {
 
 export {
   createStorageAuthClient,
+  createSubscriptionRecorder,
+  websiteStorageSession,
   type StorageAuthClient,
   type StorageAuthClientOptions,
+  type StorageSession,
+  type StorageSignatureAlgorithm,
   type StorageSigner,
 } from "./storageAuth.js";
 

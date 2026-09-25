@@ -61,12 +61,24 @@ export interface MarketplacePurchaseRecord {
   payerAddress?: string;
 }
 
+/** Payment details the host hands to its subscription service for verification. */
+export interface SubscriptionRecordRequest {
+  appId: string;
+  publisherDid: string;
+  amountCents: number;
+  periodDays: number;
+  txHash: string;
+  payerAddress?: string;
+}
+
 export interface SubscriptionStatus {
   active: boolean;
   expiresAt: number | null;
   viewerDid: string | null;
   amountCents?: number;
   reason?: string;
+  /** True when a server verified the payment behind the record. */
+  verified?: boolean;
 }
 
 /** What an app's bridge asks the host for when it needs to act for the viewer. */
@@ -112,6 +124,13 @@ export interface EmbedHostServices {
    * or the host cannot mint them. Called often; cache inside.
    */
   getAppCredentials?(req: AppCredentialRequest): Promise<AppCredentials | null>;
+  /**
+   * Have a trusted service verify the payment and record the subscription
+   * (e.g. website-api `POST /api/apps/:appId/subscriptions`). Storage nodes
+   * refuse subscription records written by clients, so without this hook
+   * `payments.subscribe` fails after payment.
+   */
+  recordSubscription?(req: SubscriptionRecordRequest): Promise<SubscriptionStatus>;
 }
 
 /** Per-call context the bridge passes to the HTTP handler. */

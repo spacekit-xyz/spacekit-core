@@ -385,6 +385,87 @@ pub fn ed25519_key_matches_did(did: &str, public_key: &[u8]) -> bool {
     }
 }
 
+/// Signature schemes a login may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAlgorithm {
+    Ed25519,
+    /// FIPS 205 SLH-DSA-SHA2-128s (32-byte public key, 7856-byte signature).
+    SlhDsaSha2_128s,
+    /// FIPS 205 SLH-DSA-SHA2-192s (48-byte public key, 16224-byte signature).
+    SlhDsaSha2_192s,
+}
+
+impl LoginAlgorithm {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ed25519" => Some(Self::Ed25519),
+            "slh-dsa-sha2-128s" => Some(Self::SlhDsaSha2_128s),
+            "slh-dsa-sha2-192s" => Some(Self::SlhDsaSha2_192s),
+            _ => None,
+        }
+    }
+
+    fn amr(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "sig:ed25519",
+            Self::SlhDsaSha2_128s => "sig:slh-dsa-sha2-128s",
+            Self::SlhDsaSha2_192s => "sig:slh-dsa-sha2-192s",
+        }
+    }
+}
+
+/// Whether an SLH-DSA public key is the key behind `did`. kit.space writes
+/// quantum identities as `did:key:zQ3s` + the first 44 hex chars of the key.
+pub fn slh_dsa_key_matches_did(did: &str, public_key: &[u8]) -> bool {
+    let Some(suffix) = did.strip_prefix("did:key:zQ3s") else {
+        return false;
+    };
+    let pk_hex = hex::encode(public_key);
+    pk_hex.len() >= 44
+        && suffix.len() == 44
+        && constant_time_eq(suffix.to_ascii_lowercase().as_bytes(), &pk_hex.as_bytes()[..44])
+}
+
+fn verify_slh<P: slh_dsa::ParameterSet>(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
+    use signature::Verifier;
+    let vk = slh_dsa::VerifyingKey::<P>::try_from(public_key).map_err(|_| anyhow!("invalid SLH-DSA public key"))?;
+    let sig = slh_dsa::Signature::<P>::try_from(signature).map_err(|_| anyhow!("bad SLH-DSA signature length"))?;
+    vk.verify(message, &sig).map_err(|_| anyhow!("signature does not verify"))
+}
+
+/// Verify a login signature and that the key is the one behind `did`.
+pub fn verify_login_signature(
+    algorithm: LoginAlgorithm,
+    did: &str,
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    match algorithm {
+        LoginAlgorithm::Ed25519 => {
+            if !ed25519_key_matches_did(did, public_key) {
+                return Err(anyhow!("public key does not match the DID"));
+            }
+            let pk: [u8; 32] = public_key.try_into().map_err(|_| anyhow!("bad public key length"))?;
+            let sig: [u8; 64] = signature.try_into().map_err(|_| anyhow!("bad signature length"))?;
+            ed25519_dalek::VerifyingKey::from_bytes(&pk)
+                .map_err(|_| anyhow!("invalid public key"))?
+                .verify_strict(message, &ed25519_dalek::Signature::from_bytes(&sig))
+                .map_err(|_| anyhow!("signature does not verify"))
+        }
+        LoginAlgorithm::SlhDsaSha2_128s | LoginAlgorithm::SlhDsaSha2_192s => {
+            if !slh_dsa_key_matches_did(did, public_key) {
+                return Err(anyhow!("public key does not match the DID"));
+            }
+            if algorithm == LoginAlgorithm::SlhDsaSha2_128s {
+                verify_slh::<slh_dsa::Sha2_128s>(public_key, message, signature)
+            } else {
+                verify_slh::<slh_dsa::Sha2_192s>(public_key, message, signature)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionLoginRequest {
     pub did: String,
@@ -424,22 +505,12 @@ pub fn login(cfg: &AuthConfig, req: &SessionLoginRequest, now: u64) -> Result<Is
     if cfg.is_protected(&req.did) {
         return Err(anyhow!("this DID cannot log in with a signature"));
     }
-    if !req.algorithm.eq_ignore_ascii_case("ed25519") {
-        return Err(anyhow!("unsupported signature algorithm: {}", req.algorithm));
-    }
+    let algorithm = LoginAlgorithm::parse(&req.algorithm)
+        .ok_or_else(|| anyhow!("unsupported signature algorithm: {}", req.algorithm))?;
     let pk = hex::decode(req.public_key_hex.trim()).context("public_key_hex")?;
-    if !ed25519_key_matches_did(&req.did, &pk) {
-        return Err(anyhow!("public key does not match the DID"));
-    }
     let sig = hex::decode(req.signature_hex.trim()).context("signature_hex")?;
-    let pk: [u8; 32] = pk.try_into().map_err(|_| anyhow!("bad public key length"))?;
-    let sig: [u8; 64] = sig.try_into().map_err(|_| anyhow!("bad signature length"))?;
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| anyhow!("invalid public key"))?;
-    vk.verify_strict(
-        login_message(&req.did, req.challenge.trim()).as_bytes(),
-        &ed25519_dalek::Signature::from_bytes(&sig),
-    )
-    .map_err(|_| anyhow!("signature does not verify"))?;
+    let message = login_message(&req.did, req.challenge.trim());
+    verify_login_signature(algorithm, &req.did, &pk, message.as_bytes(), &sig)?;
 
     // One login per challenge.
     {
@@ -454,7 +525,7 @@ pub fn login(cfg: &AuthConfig, req: &SessionLoginRequest, now: u64) -> Result<Is
         .ttl_seconds
         .unwrap_or(DEFAULT_SESSION_TTL_SECONDS)
         .clamp(60, MAX_SESSION_TTL_SECONDS);
-    issue(cfg, &req.did, "sig:ed25519", None, now, ttl)
+    issue(cfg, &req.did, algorithm.amr(), None, now, ttl)
 }
 
 fn issue(
@@ -630,6 +701,23 @@ fn document_op(method: &str, path: &str) -> Option<(&'static str, String)> {
     }
 }
 
+/// App collections whose name continues with `__` after the app prefix
+/// (`app_<appId>___subscriptions`, …) hold records only trusted services or the
+/// namespace owner may write, such as verified subscriptions.
+pub fn is_reserved_app_collection(collection: &str) -> bool {
+    let Some(rest) = collection.strip_prefix("app_") else {
+        return false;
+    };
+    match rest.split_once('_') {
+        Some((app, tail)) => !app.is_empty() && app.bytes().all(|b| b.is_ascii_hexdigit()) && tail.starts_with("__"),
+        None => false,
+    }
+}
+
+fn is_reserved_write(method: &str, path: &str) -> bool {
+    matches!(document_op(method, path), Some(("put" | "delete", c)) if is_reserved_app_collection(&c))
+}
+
 /// The DID a scoped token may act as for this request.
 fn scoped_did(claims: &TokenClaims, scope: &AppScope, method: &str, path: &str) -> Result<String, AuthFailure> {
     let (op, collection) = document_op(method, path)
@@ -637,6 +725,9 @@ fn scoped_did(claims: &TokenClaims, scope: &AppScope, method: &str, path: &str) 
     let prefix = scope.collection_prefix();
     if !collection.starts_with(&prefix) || collection.len() == prefix.len() {
         return Err(AuthFailure::OutOfScope(format!("collection must start with {prefix}")));
+    }
+    if (op == "put" || op == "delete") && is_reserved_app_collection(&collection) {
+        return Err(AuthFailure::OutOfScope("reserved collections are written by trusted services only".into()));
     }
     match &scope.act_as {
         Some(owner) if owner != &claims.sub => {
@@ -675,6 +766,10 @@ pub fn authenticate(
                 return Ok(did.to_string());
             }
             if cfg.mode == DidAuthMode::Legacy && !cfg.is_protected(did) {
+                // A bare claim cannot be the namespace owner writing verified records.
+                if is_reserved_write(method, path) {
+                    return Err(AuthFailure::BareDidRejected);
+                }
                 return Ok(did.to_string());
             }
             Err(AuthFailure::BareDidRejected)
@@ -997,6 +1092,58 @@ mod tests {
         assert_eq!(did_from_authorization(&c, &untouched, 6), None);
         // The minted token is short-lived.
         assert_eq!(did_from_authorization(&c, &normalized, 5 + 61), None);
+    }
+
+    #[test]
+    fn slh_dsa_login() {
+        use signature::{Keypair, Signer};
+        let c = cfg(DidAuthMode::Strict);
+        let sk = slh_dsa::SigningKey::<slh_dsa::Sha2_128s>::slh_keygen_internal(&[1u8; 16], &[2u8; 16], &[3u8; 16]);
+        let pk = sk.verifying_key().to_bytes();
+        let did = format!("did:key:zQ3s{}", &hex::encode(pk.as_slice())[..44]);
+        let (challenge, _) = mint_challenge(&c, &did, 100).unwrap();
+        let sig = sk.sign(login_message(&did, &challenge).as_bytes());
+        let mut req = SessionLoginRequest {
+            did: did.clone(),
+            challenge,
+            algorithm: "slh-dsa-sha2-128s".into(),
+            public_key_hex: hex::encode(pk.as_slice()),
+            signature_hex: hex::encode(sig.to_bytes().as_slice()),
+            ttl_seconds: None,
+        };
+        let issued = login(&c, &req, 100).unwrap();
+        assert_eq!(verify_token(&c, &issued.token, 101).unwrap().amr, "sig:slh-dsa-sha2-128s");
+        // Same key cannot claim an Ed25519 DID, and a wrong algorithm label fails.
+        req.algorithm = "slh-dsa-sha2-192s".into();
+        assert!(login(&c, &req, 100).is_err());
+        req.algorithm = "rsa".into();
+        assert!(login(&c, &req, 100).is_err());
+    }
+
+    #[test]
+    fn reserved_app_collections() {
+        let app = "ab".repeat(32);
+        assert!(is_reserved_app_collection(&format!("app_{app}___subscriptions")));
+        assert!(!is_reserved_app_collection(&format!("app_{app}_scores")));
+        assert!(!is_reserved_app_collection("__subscriptions"));
+        let legacy = cfg(DidAuthMode::Legacy);
+        let owner = "did:spacekit:user:pub";
+        let h = format!("DID {owner}");
+        let reserved = format!("/api/documents/app_{app}___subscriptions/did_x");
+        // Bare claims cannot write reserved records; reads still work in legacy.
+        assert_eq!(authenticate(&legacy, Some(&h), None, "PUT", &reserved, 1), Err(AuthFailure::BareDidRejected));
+        assert_eq!(authenticate(&legacy, Some(&h), None, "GET", &reserved, 1).unwrap(), owner);
+        // The service may write them.
+        assert_eq!(authenticate(&legacy, Some(&h), Some("svc-secret"), "PUT", &reserved, 1).unwrap(), owner);
+        // App tokens may read but not write them, even acting as the publisher.
+        let parent = TokenClaims { v: 1, sub: "did:key:z6Mkviewer".into(), iat: 0, exp: 10_000, amr: "sig:ed25519".into(), scope: None };
+        let t = delegate(&legacy, &parent, &DelegateRequest { app_id: app.clone(), act_as: Some(owner.into()), ttl_seconds: None }, 1).unwrap();
+        let bh = format!("Bearer {}", t.token);
+        assert!(authenticate(&legacy, Some(&bh), None, "PUT", &reserved, 2).is_err());
+        assert_eq!(authenticate(&legacy, Some(&bh), None, "GET", &reserved, 2).unwrap(), owner);
+        // The owner's own unscoped session may write (e.g. grant a free subscription).
+        let own = service_token(&legacy, &ServiceTokenRequest { did: owner.into(), ttl_seconds: None, app_id: None, act_as: None }, 1).unwrap();
+        assert_eq!(authenticate(&legacy, Some(&format!("Bearer {}", own.token)), None, "PUT", &reserved, 2).unwrap(), owner);
     }
 
     #[test]

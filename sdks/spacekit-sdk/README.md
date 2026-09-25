@@ -201,6 +201,8 @@ const host = createLocalStorageEmbedHost({
 
 A host with its own API adds `apiAuthorization`, for example from the website-api's `POST /api/auth/app-token`.
 
+For viewers signed in to your API rather than holding a `did:key`, pass `getSession: websiteStorageSession({ apiBase, getBearer })` instead of `getSigner`. Paid apps need `recordSubscription: createSubscriptionRecorder({ apiBase, authorization })`, so that a server verifies the payment before the subscription is recorded.
+
 ### Signed packages
 
 Publishers sign with `spacekit app package … --sign-key <seed-file>`. Hosts check the signature in their trust policy:

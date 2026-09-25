@@ -20,7 +20,8 @@ use warp::http::StatusCode;
 use warp::reply::Response;
 use warp::{Filter, Reply};
 
-const MAX_AUTH_BODY_BYTES: u64 = 16 * 1024;
+// SLH-DSA-SHA2-192s signatures are 16 KiB (32 KiB as hex).
+const MAX_AUTH_BODY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ChallengeRequest {

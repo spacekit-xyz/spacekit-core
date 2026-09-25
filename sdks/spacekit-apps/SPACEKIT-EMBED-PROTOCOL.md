@@ -103,7 +103,7 @@ The guard receives each call first. It either rejects it, which becomes a `res` 
 | `identity.did` / `getState` | none | Reveals the viewer DID to the app. |
 | `identity.setState` | `identity:write` | `myDid` is always removed unless the host sets `allowIdentityOverride`. |
 | `identity.authHeaders` | `identity:auth-headers` | Hands over the session token. Refused unless the host sets `exposeAuthHeaders`, a legacy option. |
-| `payments.status` / `config` / `subscribe` / `charge` | none | The host's payment UI asks the viewer to confirm. |
+| `payments.status` / `config` / `subscribe` / `charge` | none | The host's payment UI asks the viewer to confirm. `subscribe` needs the host's `recordSubscription` hook: a trusted service verifies the payment and writes the record (§11). Without the hook it fails before any payment is taken. |
 | `messaging.publish` / `subscribe` | none | Local to the frame (loopback). |
 | `messaging.send` / `list` | `messaging` | |
 | `http.fetch` / `sseSubscribe` / `sseClose` | see §6.2 | |
@@ -154,7 +154,7 @@ Apps never receive the viewer's key or session. Credentials are attached host-si
 - `storageAuthorization`: an app token from the storage node (`POST /api/auth/delegate`). The node accepts it only for `/api/documents/app_<appId>_*`. When it acts in the publisher's namespace, only `get` and `put` work; `list` and `delete` are the owner's. The bridge uses it for `documents.*`.
 - `apiAuthorization`: an app token from the host API (website-api `POST /api/auth/app-token`, one hour, app documents only). `http.fetch` to trusted origins sends it instead of the session, without cookies.
 
-`createStorageAuthClient` (`@spacekit/sdk/embed`) implements the storage side for hosts whose viewer has an Ed25519 `did:key`. It signs the node's login challenge and caches the session and per-app tokens.
+`createStorageAuthClient` (`@spacekit/sdk/embed`) implements the storage side. For viewers with an Ed25519 or SLH-DSA `did:key`, it signs the node's login challenge (`getSigner`). For accounts signed in to the website API, it takes a node session from `POST /api/auth/storage-token` (`getSession: websiteStorageSession(…)`). Either way it caches the session and the per-app tokens.
 
 **Fallback.** Without app credentials, the host attaches the viewer's own session to **trusted origins** only: its page origin plus `capabilities.trustedOrigins` / `credentialedOrigins`, and in the React and element wrappers the origins in `endpoints`. That means the session token, the `owner-did` header and same-origin cookies. Set `forwardViewerSession: false` to stop this. The documents bridge falls back to a bare `DID <publisher>` header, which storage nodes in strict mode reject.
 
@@ -240,8 +240,7 @@ The signature is Ed25519 over the UTF-8 bytes of `"SpaceKit package signature v1
 
 ## 11. Known gaps
 
-- **Subscription records are client-asserted.** `payments.subscribe` writes the subscription record through the bridge after the host's payment UI returns a transaction hash. The node does not check that payment. Verify it server-side (the website-api already verifies marketplace payments) before relying on subscriptions for paid access.
-- **Non-Ed25519 identities.** Storage login supports Ed25519 `did:key` only. SLH-DSA and `did:spacekit:*` SPHINCS+ users authenticate through a backend holding the storage secret, or keep bare-DID auth until their client migrates.
+- **Subscriptions: price is set by the app.** Subscriptions are server-verified: the SpaceKit Pay transaction must route at least `amount_cents` to the publisher, each transaction counts once, and only a trusted service writes the record. If the app has a marketplace listing, the listing sets the publisher and the minimum price. Without a listing, the app names the price in `payments.subscribe`. So apps should check `amountCents` (and `verified`) in `payments.status` against their own price.
 - **Asset URLs.** Asset paths are rewritten only in the entry HTML. Relative `url()` references in CSS and relative ES-module imports between chunks do not resolve from `blob:` URLs. This is the same as before v1.
 
 ## 12. Compatibility

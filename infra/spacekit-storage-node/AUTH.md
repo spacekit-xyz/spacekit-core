@@ -10,7 +10,7 @@ Before this change, `Authorization: DID <did>` (or `Bearer <did>`) *was* the ide
 
 | Credential | How a client gets it | What it can do |
 |---|---|---|
-| `Authorization: Bearer sktok1.…` session token | Sign a challenge with the DID's Ed25519 key (below) | Act as that DID on any route |
+| `Authorization: Bearer sktok1.…` session token | Sign a challenge with the DID's key (Ed25519 or SLH-DSA, below), or get one from a backend (`POST /api/auth/service-token`, e.g. the website-api's `/api/auth/storage-token`) | Act as that DID on any route |
 | `Authorization: Bearer sktok1.…` app token | `POST /api/auth/delegate` with a session token | Only `/api/documents/app_<appId>_*`. With `act_as`, only `get`/`put` into that namespace; `list`/`delete` are the owner's. |
 | `Authorization: DID <did>` + `X-Storage-Secret` | Trusted backends that hold the secret (website-api) | Act as any DID |
 | `Authorization: DID <did>` alone | Nothing to get | Only in `SPACEKIT_DID_AUTH=legacy` mode, and never for protected DIDs |
@@ -25,15 +25,18 @@ Tokens are HMAC-signed by the node (`blake3` keyed hash). Session tokens last up
 POST /api/auth/challenge  { "did": "did:key:z6Mk…" }
   → { "challenge": "skch1.…", "message": "SpaceKit storage login\nDID: …\nChallenge: …", "expires_at": … }
 
-client signs `message` (UTF-8 bytes) with its Ed25519 key
+client signs `message` (UTF-8 bytes) with its key
 
-POST /api/auth/session    { "did", "challenge", "public_key_hex", "signature_hex", "algorithm": "ed25519" }
+POST /api/auth/session    { "did", "challenge", "public_key_hex", "signature_hex",
+                            "algorithm": "ed25519" | "slh-dsa-sha2-128s" | "slh-dsa-sha2-192s" }
   → { "token": "sktok1.…", "did", "expires_at" }
 ```
 
 - The DID must be the `did:key` of `public_key_hex`: the W3C multibase form, or kit.space's short form (`did:key:z6Mk` followed by the first 44 hex characters of the key).
 - Challenges are stateless (HMAC-signed), expire after 120 s, and each works once per process.
-- Other signature schemes are refused for now, including SLH-DSA and `did:spacekit:*` SPHINCS+ keys. Those users authenticate through a backend that holds the secret, or keep the legacy header until the node is strict.
+- SLH-DSA (FIPS 205) logins are for kit.space quantum identities. Their DID is `did:key:zQ3s` followed by the first 44 hex characters of the public key; SHA2-128s keys are 32 bytes and SHA2-192s keys 48. The node uses the same `slh-dsa` crate as `identity/wasm-did`, and a signature from that WASM verifies here.
+- `did:spacekit:user:*` accounts have no key the node can check. They sign in to the website-api (passkey or magic link), which mints them a node session through `POST /api/auth/storage-token`. In the SDK that is `websiteStorageSession`.
+- Login bodies may be up to 64 KiB, because SLH-DSA-192s signatures are 16 KiB (32 KiB as hex).
 - `@spacekit/sdk/embed` has a client for this flow: `createStorageAuthClient`.
 
 ## Other endpoints
@@ -52,6 +55,10 @@ POST /api/auth/session    { "did", "challenge", "public_key_hex", "signature_hex
   - Without it, in strict mode: refused.
 - SPKG uploads verify any `signatures/*.json` publisher signature and reject invalid ones (`src/spkg_signature.rs`). `SPACEKIT_REQUIRE_SIGNED_PACKAGES=true` also rejects unsigned uploads.
 - `AppStorageEngine::verify_app` no longer reports a non-empty SPHINCS+ signature as valid.
+- **Reserved app collections.** Collections named `app_<appId>___*` hold records only trusted services or the namespace owner may write, such as verified subscriptions (`app_<appId>___subscriptions`).
+  - Service assertions can write them, and so can the owner's own unscoped session.
+  - App-scoped tokens can only read them.
+  - Bare DID claims are refused, even in legacy mode.
 
 ## Configuration
 

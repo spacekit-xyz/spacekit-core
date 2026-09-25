@@ -196,6 +196,8 @@ export interface LocalEmbedHostOptions extends LocalIdentityHostOptions {
    * tokens) so embedded apps never receive the viewer's own session.
    */
   appCredentials?: (req: AppCredentialRequest) => Promise<AppCredentials | null>;
+  /** Verify and record app subscriptions (see `createSubscriptionRecorder`). */
+  recordSubscription?: EmbedHostServices["recordSubscription"];
   /** See `HttpBridgeHost.forwardViewerSession`. Defaults to true. */
   forwardViewerSession?: boolean;
 }
@@ -248,6 +250,7 @@ export function createLocalStorageEmbedHost(
     },
     handleIdentity: identity.handleIdentity,
     ...(options.appCredentials ? { getAppCredentials: options.appCredentials } : {}),
+    ...(options.recordSubscription ? { recordSubscription: options.recordSubscription } : {}),
     ...options.services,
   };
 
