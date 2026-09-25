@@ -19,6 +19,7 @@ mod network_profile;
 mod network_supervisor;
 mod project_scaffold;
 mod spkg;
+mod spkg_signature;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

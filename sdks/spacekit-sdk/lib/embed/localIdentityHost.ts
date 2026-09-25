@@ -10,6 +10,8 @@
 
 import { createEmbeddedHttpHandler } from "./httpBridge.js";
 import type {
+  AppCredentialRequest,
+  AppCredentials,
   EmbedHostServices,
   EmbeddedHttpHandler,
   HttpBridgeHost,
@@ -189,6 +191,13 @@ export interface LocalEmbedHostOptions extends LocalIdentityHostOptions {
    * Every other origin gets the app's request without host credentials.
    */
   credentialedOrigins?: string[];
+  /**
+   * Issue app-scoped credentials (storage-node app tokens, host API app
+   * tokens) so embedded apps never receive the viewer's own session.
+   */
+  appCredentials?: (req: AppCredentialRequest) => Promise<AppCredentials | null>;
+  /** See `HttpBridgeHost.forwardViewerSession`. Defaults to true. */
+  forwardViewerSession?: boolean;
 }
 
 /**
@@ -212,6 +221,7 @@ export function createLocalStorageEmbedHost(
   }
 
   const httpBridgeHost: HttpBridgeHost = {
+    forwardViewerSession: options.forwardViewerSession ?? true,
     isCredentialedUrl(url) {
       try {
         return credentialed.has(new URL(url).origin);
@@ -237,6 +247,7 @@ export function createLocalStorageEmbedHost(
       return identity.loadDid();
     },
     handleIdentity: identity.handleIdentity,
+    ...(options.appCredentials ? { getAppCredentials: options.appCredentials } : {}),
     ...options.services,
   };
 

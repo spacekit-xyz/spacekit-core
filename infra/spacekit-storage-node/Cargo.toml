@@ -106,6 +106,9 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Request authentication: Ed25519 did:key login signatures (src/request_auth.rs)
+ed25519-dalek = "2"
+
 # Storage and hashing
 blake3 = "1.0"
 hex = "0.4"

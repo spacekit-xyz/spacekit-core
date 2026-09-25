@@ -72,6 +72,13 @@ pub mod access_policy;
 // Short-lived upload tokens for browser/blob clients (Stream A item 4).
 pub mod upload_token;
 
+// Request authentication: signed-login session tokens, app-scoped tokens,
+// service assertions, and the legacy bare-DID switch.
+pub mod request_auth;
+
+// Ed25519 publisher signatures carried in SPKG archives.
+pub mod spkg_signature;
+
 // Prometheus text metrics from agentic health (Stream F).
 pub mod operator_metrics;
 

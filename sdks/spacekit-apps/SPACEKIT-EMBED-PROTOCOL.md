@@ -41,7 +41,7 @@ The package's bytes never become `blob:` URLs owned by the host. A sandboxed, op
 ## 3. Loading sequence
 
 1. **Fetch and verify.** The host fetches the package (`GET {storage}/packages/apps/{appId}` as `.spkg`, falling back to `GET {storage}/facts/{appId}` plus per-file streams). It checks every file's SHA-256 against the manifest and, for `.spkg`, the manifest checksum. Any mismatch stops the load.
-2. **Trust policy.** If the host has a `trustPolicy`, it is called with `{ appId, creatorDid, manifest, storageOrigin }`. Anything other than `true` stops the load; a string is shown as the reason. `allowPublishers([...dids])` is a ready-made allowlist.
+2. **Trust policy.** If the host has a `trustPolicy`, it is called with `{ appId, creatorDid, manifest, storageOrigin, signatures, signedBy }` (§10). Anything other than `true` stops the load; a string is shown as the reason. `allowPublishers([...dids])` is a ready-made allowlist.
 3. **Consent.** If `manifest.permissions` is non-empty, the host shows the viewer what the app asks for (§6) and waits. If the viewer refuses, or the host has no consent UI, the load stops.
 4. **Bridge.** Only now does the host create the bridge and give it the owner DID (`creator_did`).
 5. **Frame.** The host inserts the iframe for the chosen mode and runs the handshake (§4).
@@ -124,9 +124,13 @@ In the package manifest, `permissions` is an array. The host accepts these shape
   "identity:write",
   "network:api.example.com",
   { "type": "network", "hosts": ["*.example.org", "https://cdn.example.net"] },
-  { "Network": { "hosts": ["tiles.example.com"] } }
+  { "Network": { "allowed_hosts": ["tiles.example.com"] } },
+  { "Identity": { "read_only": false } },
+  "Camera"
 ]
 ```
+
+The last three are what `spacekit app package --permission network:tiles.example.com --permission identity:write --permission camera` writes (the Rust `Permission` enum). `Camera`, `Microphone`, `Geolocation` and `Clipboard { write: true }` also turn on the matching iframe `allow` feature once the viewer grants them.
 
 `network` with no hosts means any host. The consent prompt lists one plain-language line per entry, such as "Connect to api.example.com" or "Send and read messages as you".
 
@@ -144,7 +148,17 @@ Orgs running third-party apps should use `"manifest"`. The default is `"open"` o
 
 ### 6.3 Credentials
 
-The host attaches its credentials only to **trusted origins**: its own page origin plus any it lists in `capabilities.trustedOrigins` / `credentialedOrigins`. The credentials are the session token (`Authorization: Bearer …`), the `owner-did` header and same-origin cookies. The React and element wrappers also trust the origins in `endpoints`. For every other origin, the app's request goes out with only the headers the app set, and with `credentials: "omit"`.
+Apps never receive the viewer's key or session. Credentials are attached host-side, and only where they belong.
+
+**App-scoped credentials (preferred).** A host implements `EmbedHostServices.getAppCredentials({ appId, publisherDid, storageOrigin })`, or passes `appCredentials` to `createLocalStorageEmbedHost`. It returns up to two `Authorization` values:
+- `storageAuthorization`: an app token from the storage node (`POST /api/auth/delegate`). The node accepts it only for `/api/documents/app_<appId>_*`. When it acts in the publisher's namespace, only `get` and `put` work; `list` and `delete` are the owner's. The bridge uses it for `documents.*`.
+- `apiAuthorization`: an app token from the host API (website-api `POST /api/auth/app-token`, one hour, app documents only). `http.fetch` to trusted origins sends it instead of the session, without cookies.
+
+`createStorageAuthClient` (`@spacekit/sdk/embed`) implements the storage side for hosts whose viewer has an Ed25519 `did:key`. It signs the node's login challenge and caches the session and per-app tokens.
+
+**Fallback.** Without app credentials, the host attaches the viewer's own session to **trusted origins** only: its page origin plus `capabilities.trustedOrigins` / `credentialedOrigins`, and in the React and element wrappers the origins in `endpoints`. That means the session token, the `owner-did` header and same-origin cookies. Set `forwardViewerSession: false` to stop this. The documents bridge falls back to a bare `DID <publisher>` header, which storage nodes in strict mode reject.
+
+Other origins always get only the headers the app set, with `credentials: "omit"`.
 
 ## 7. Guest environment
 
@@ -207,16 +221,30 @@ mountSpacekitApp(el, {
 
 `EmbedHostServices` is the seam for the org's identity. `getViewerDid`, `getIdentityDid` and `handleIdentity` can be backed by any SSO, and the default localStorage host is only one implementation.
 
-## 10. Known gaps
+## 10. Publisher signatures
 
-These are outside the embed layer and still open:
+An `.spkg` may carry `signatures/publisher.json`:
 
-- **Trusted API requests act as the viewer.** An app can call any route on a trusted origin with the viewer's session. The fix is on the server: per-app, scoped tokens (the `spacekit-session-keys` contract is a candidate), with the bridge exchanging them instead of forwarding the session. Until then, keep `trustedOrigins` to APIs that apps legitimately need.
-- **Publisher authenticity.** Hashes prove files match the manifest, not who published it. The `.spkg` `signatures/` entries are skipped, and the storage node's `verify_app` treats any non-empty signature as valid. Until signatures are checked, use `trustPolicy` for anything sensitive.
-- **Storage node document auth.** `documents.*` authenticates to the storage node with `Authorization: DID <ownerDid>`, which any client can claim.
+```json
+{ "v": 1, "alg": "ed25519", "did": "did:key:z6Mk…", "public_key": "<64 hex>", "signature": "<128 hex>" }
+```
+
+The signature is Ed25519 over the UTF-8 bytes of `"SpaceKit package signature v1\n" + hex(sha256(manifest.json))`. The manifest lists every payload hash and the aggregate checksum, so the signature covers the whole package. `did` must be the `did:key` of `public_key`.
+
+- **Signing:** `spacekit app package … --sign-key <seed-hex-file>`.
+- **Storage node:** rejects uploads carrying an invalid signature. With `SPACEKIT_REQUIRE_SIGNED_PACKAGES=true`, it also rejects unsigned ones.
+- **SDK:** `openSpkg` throws on an invalid signature. Trust policies receive `signatures` and `signedBy`, the DIDs whose signatures verified. `allowPublishers([dids])` requires a signature by a listed DID by default. `requireSignedPackages()` accepts any valid signature.
+- **Legacy uploads:** packages loaded through the legacy facts path are unsigned (`signedBy: []`).
+
+`creator_did` in the manifest is a claim, not proof. Base trust decisions on `signedBy`.
+
+## 11. Known gaps
+
+- **Subscription records are client-asserted.** `payments.subscribe` writes the subscription record through the bridge after the host's payment UI returns a transaction hash. The node does not check that payment. Verify it server-side (the website-api already verifies marketplace payments) before relying on subscriptions for paid access.
+- **Non-Ed25519 identities.** Storage login supports Ed25519 `did:key` only. SLH-DSA and `did:spacekit:*` SPHINCS+ users authenticate through a backend holding the storage secret, or keep bare-DID auth until their client migrates.
 - **Asset URLs.** Asset paths are rewritten only in the entry HTML. Relative `url()` references in CSS and relative ES-module imports between chunks do not resolve from `blob:` URLs. This is the same as before v1.
 
-## 11. Compatibility
+## 12. Compatibility
 
 - The guest shim is injected by the host, so packages built for the old bridge need no rebuild. They behave differently only if they call `identity.authHeaders`, write `myDid`, or depend on IndexedDB, cookies or service workers in opaque mode.
 - Removed from the old bridge: replies broadcast with `postMessage("*")`, `identity.authHeaders` by default, app-controlled `myDid` writes, and credentials sent to any URL.

@@ -2,6 +2,7 @@
 //!
 
 pub mod agentic_routes;
+pub mod auth_routes;
 pub mod content_routes;
 mod envelope_delivery;
 pub mod keymaster_routes;
@@ -103,6 +104,8 @@ pub enum AuthError {
     InvalidFormat,
     #[error("Invalid DID format")]
     InvalidDid,
+    #[error("Not authorized: {0}")]
+    Rejected(String),
 }
 
 /// Rate limit errors
@@ -751,6 +754,9 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
 
     /// Start the HTTP API server
     pub async fn start(&self, server_config: ServerConfig) -> Result<()> {
+        // Request authentication (tokens, service secret, legacy DID mode).
+        let auth_config = crate::request_auth::init(self.data_dir.as_deref());
+        tracing::info!(mode = auth_config.mode.as_str(), "storage node request auth");
         let api_listen_port = server_config.port;
         let db = self.db.clone();
         let public_key = server_config.public_key.clone();
@@ -1749,9 +1755,13 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
 
         let did_register_route = warp::path!("api" / "did" / "register")
             .and(warp::post())
+            .and(warp::header::optional::<String>("x-storage-secret"))
+            .and(warp::body::content_length_limit(MAX_JSON_BODY_BYTES))
             .and(warp::body::json())
             .and(with_db(db.clone()))
             .and_then(handle_did_register);
+
+        let auth_api_routes = auth_routes::routes();
 
         let did_resolve_route = warp::path!("api" / "did" / "resolve" / String)
             .and(warp::get())
@@ -1761,7 +1771,8 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
         // Combine all routes (session_key_route and file_content_route must come before download_file_route
         // because they have more specific paths: /files/{id}/session-key vs /files/{id})
         // delete_file_route must come before download_file_route since they share path but differ by method
-        let routes = did_register_route
+        let routes = auth_api_routes
+            .or(did_register_route)
             .or(did_resolve_route)
             .or(did_route)
             .or(signup_route)
@@ -1887,6 +1898,8 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
                 .boxed(),
         };
 
+        // Auth failures answer 401 with the reason instead of warp's default 500.
+        let routes = routes.recover(recover_auth_rejection).unify();
         let routes = routes.with(cors).with(warp::log("spacekit-storage-api"));
 
         // Check HOST environment variable, default to 0.0.0.0 for container/VPC deployments
@@ -1910,6 +1923,16 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
 }
 
 // Helper filters
+
+async fn recover_auth_rejection(err: Rejection) -> Result<Box<dyn Reply>, Rejection> {
+    if let Some(e) = err.find::<AuthError>() {
+        return Ok(boxed_reply(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+            warp::http::StatusCode::UNAUTHORIZED,
+        )));
+    }
+    Err(err)
+}
 
 fn with_db(
     db: Arc<Database>,
@@ -2045,50 +2068,68 @@ struct ServerSendRequest {
     message: String,
 }
 
-/// DID-based authentication filter
-/// Expects: Authorization: DID <did:spacekit:user:alice>
+/// Authentication filter for routes that need an identity.
+///
+/// Accepts, in order (see `crate::request_auth`):
+/// - `Authorization: Bearer sktok1.…` session or app-scoped tokens (scoped tokens
+///   are checked against the request's method and path),
+/// - `Authorization: DID <did>` with a valid `X-Storage-Secret` (trusted backends),
+/// - `Authorization: DID <did>` alone, only in `SPACEKIT_DID_AUTH=legacy` mode and
+///   never for protected DIDs such as `did:spacekit:admin:*`.
 fn with_did_auth() -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
-    warp::header::<String>("authorization")
-        .and_then(|auth_header: String| async move {
-            // Support both "DID <did>" and "Bearer <did>" formats
-            let did = if auth_header.starts_with("DID ") {
-                auth_header.strip_prefix("DID ").unwrap().trim().to_string()
-            } else if auth_header.starts_with("Bearer ") {
-                auth_header
-                    .strip_prefix("Bearer ")
-                    .unwrap()
-                    .trim()
-                    .to_string()
-            } else {
-                return Err(warp::reject::custom(AuthError::InvalidFormat));
-            };
-
-            // Basic DID format validation
-            if did.starts_with("did:") && did.len() > 10 {
-                Ok(did)
-            } else {
-                Err(warp::reject::custom(AuthError::InvalidDid))
-            }
-        })
-        .or_else(|_| async move { Err(warp::reject::custom(AuthError::MissingHeader)) })
+    warp::header::optional::<String>("authorization")
+        .and(warp::header::optional::<String>("x-storage-secret"))
+        .and(warp::method())
+        .and(warp::path::full())
+        .and_then(
+            |auth: Option<String>,
+             secret: Option<String>,
+             method: Method,
+             path: warp::path::FullPath| async move {
+                match crate::request_auth::authenticate_request(
+                    auth.as_deref(),
+                    secret.as_deref(),
+                    method.as_str(),
+                    path.as_str(),
+                ) {
+                    Ok(did) => Ok(did),
+                    Err(crate::request_auth::AuthFailure::Missing) => {
+                        Err(warp::reject::custom(AuthError::MissingHeader))
+                    }
+                    Err(crate::request_auth::AuthFailure::Malformed) => {
+                        Err(warp::reject::custom(AuthError::InvalidFormat))
+                    }
+                    Err(other) => Err(warp::reject::custom(AuthError::Rejected(other.to_string()))),
+                }
+            },
+        )
 }
 
-/// Optional `Authorization` header (raw value).
+/// Optional `Authorization` header for handlers that parse it themselves.
+/// A backend's `DID <did>` + valid `X-Storage-Secret` is converted into a
+/// short-lived session token first, so those handlers see a real credential.
 fn with_optional_auth_header() -> impl Filter<Extract = (Option<String>,), Error = Rejection> + Clone
 {
     warp::header::optional::<String>("authorization")
+        .and(warp::header::optional::<String>("x-storage-secret"))
+        .map(|auth: Option<String>, secret: Option<String>| {
+            crate::request_auth::normalize_service_authorization(
+                crate::request_auth::config(),
+                auth,
+                secret.as_deref(),
+                unix_now_secs(),
+            )
+        })
 }
 
-/// Optional `Authorization: DID` (no rejection when absent).
+/// Optional identity (no rejection when absent or not accepted).
 fn with_optional_requester_did(
 ) -> impl Filter<Extract = (Option<String>,), Error = Rejection> + Clone {
-    warp::header::optional::<String>("authorization").map(|auth: Option<String>| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        crate::upload_token::optional_requester_did(auth.as_deref(), None, now)
-    })
+    warp::header::optional::<String>("authorization")
+        .and(warp::header::optional::<String>("x-storage-secret"))
+        .map(|auth: Option<String>, secret: Option<String>| {
+            crate::request_auth::authenticate_request_optional(auth.as_deref(), secret.as_deref())
+        })
 }
 
 /// Rate limiting filter
@@ -7859,6 +7900,7 @@ async fn handle_get_apps_by_creator(
 /// Body: { "did": "did:spacekit:testnet:abc...", "document": { ... } }
 /// Stores the DID document in the database under `did_registry` collection.
 async fn handle_did_register(
+    storage_secret: Option<String>,
     body: serde_json::Value,
     db: Arc<Database>,
 ) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
@@ -7885,6 +7927,30 @@ async fn handle_did_register(
         .unwrap_or_else(|| body.clone());
 
     let doc_id = did.replace(':', "_");
+
+    // The registry is where other services look up a DID's keys, so an
+    // unauthenticated write would let anyone substitute keys. Trusted backends
+    // (valid X-Storage-Secret) may register or update any DID. Without the
+    // secret: never in strict mode, and in legacy mode only a first
+    // registration (no overwrites).
+    let auth_cfg = crate::request_auth::config();
+    if !auth_cfg.service_secret_matches(storage_secret.as_deref()) {
+        let already_registered = matches!(
+            db.get_document("system", "did_registry", &doc_id),
+            Ok(Some(_))
+        );
+        if auth_cfg.mode == crate::request_auth::DidAuthMode::Strict || already_registered {
+            let message = if already_registered {
+                "DID is already registered; updates require the registry service"
+            } else {
+                "DID registration requires the registry service (X-Storage-Secret)"
+            };
+            return Ok(boxed_reply(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({ "error": message })),
+                warp::http::StatusCode::FORBIDDEN,
+            )));
+        }
+    }
     let now = chrono::Utc::now();
     let record = DocumentRecord {
         owner_did: "system".to_string(),

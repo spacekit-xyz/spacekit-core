@@ -3085,6 +3085,49 @@ enum ContentCommands {
     GrowformerPaidSoak,
 }
 
+/// Parse `--permission` flags into manifest permissions. Several
+/// `network:<host>` flags merge into one `Network` entry.
+fn parse_app_permissions(
+    flags: &[String],
+) -> Result<Vec<spacekit_primitives::v1::app::Permission>, String> {
+    use spacekit_primitives::v1::app::Permission;
+    let mut out = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    let mut any_network = false;
+    for flag in flags {
+        let flag = flag.trim();
+        let (kind, arg) = match flag.split_once(':') {
+            Some((k, a)) => (k.trim().to_ascii_lowercase(), Some(a.trim())),
+            None => (flag.to_ascii_lowercase(), None),
+        };
+        match (kind.as_str(), arg) {
+            ("network", Some(host)) if !host.is_empty() => hosts.push(host.to_string()),
+            ("network", _) => any_network = true,
+            ("identity", Some("write")) => out.push(Permission::Identity { read_only: false }),
+            ("identity", _) => out.push(Permission::Identity { read_only: true }),
+            ("camera", None) => out.push(Permission::Camera),
+            ("microphone", None) => out.push(Permission::Microphone),
+            ("geolocation", None) => out.push(Permission::Geolocation),
+            ("notifications", None) => out.push(Permission::Notifications),
+            ("background", None) => out.push(Permission::Background),
+            ("clipboard", a) => out.push(Permission::Clipboard { write: a == Some("write") }),
+            ("wallet" | "payments", _) => out.push(Permission::Wallet { max_amount: None }),
+            ("storage", _) => out.push(Permission::Storage { max_bytes: None }),
+            ("", _) => return Err("empty --permission".into()),
+            (name, _) => out.push(Permission::Custom {
+                name: name.to_string(),
+                description: arg.unwrap_or(name).to_string(),
+            }),
+        }
+    }
+    if any_network || !hosts.is_empty() {
+        out.push(Permission::Network {
+            allowed_hosts: if any_network { Vec::new() } else { hosts },
+        });
+    }
+    Ok(out)
+}
+
 #[derive(Subcommand, Debug)]
 enum AppCommands {
     /// Package an app directory into an AppPackage
@@ -3132,6 +3175,18 @@ enum AppCommands {
         /// Keywords for search (comma-separated)
         #[arg(long)]
         keywords: Option<String>,
+
+        /// Sign the package with this Ed25519 key (file holding the 32-byte seed
+        /// as hex, e.g. a kit.space recovery key). Hosts can then require the
+        /// signer's did:key in their trust policy.
+        #[arg(long, value_name = "FILE")]
+        sign_key: Option<String>,
+
+        /// Permission the app requests from hosts (repeatable), e.g.
+        /// `network:api.example.com`, `identity:write`, `camera`, `clipboard:write`.
+        /// Hosts show these to the viewer and refuse anything undeclared.
+        #[arg(long = "permission", value_name = "PERMISSION")]
+        permissions: Vec<String>,
     },
 
     /// Deploy an AppPackage to the storage network
@@ -14200,8 +14255,17 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
             compression,
             icon,
             keywords,
+            sign_key,
+            permissions,
         } => {
             println!("📦 Packaging app...");
+            let package_signer = match sign_key {
+                Some(path) => Some(
+                    crate::spkg_signature::load_signing_key(std::path::Path::new(path))
+                        .map_err(|e| format!("--sign-key: {e}"))?,
+                ),
+                None => None,
+            };
             println!("   Source: {}", source.green());
             println!("   Name: {}", name.cyan());
             println!("   Version: {}", version.yellow());
@@ -14385,7 +14449,7 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
                 description: description.clone().unwrap_or_default(),
                 tagline: None,
                 entry_points,
-                permissions: Vec::new(),
+                permissions: parse_app_permissions(permissions)?,
                 content_types: content_refs
                     .iter()
                     .map(|r| r.content_type.clone())
@@ -14453,7 +14517,18 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
                 }
             }
             let output_file = std::fs::File::create(&output_path)?;
-            crate::spkg::write(output_file, &app_package, &package_files)?;
+            crate::spkg::write_signed(
+                output_file,
+                &app_package,
+                &package_files,
+                package_signer.as_ref(),
+            )?;
+            if let Some(key) = &package_signer {
+                println!(
+                    "   Signed by: {}",
+                    crate::spkg_signature::did_key_for(&key.verifying_key().to_bytes()).cyan()
+                );
+            }
 
             println!("\n✅ App packaged successfully!");
             println!("   Output: {}", output_path.green());

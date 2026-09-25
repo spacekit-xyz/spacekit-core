@@ -73,6 +73,17 @@ pub fn write<W: Write + Seek>(
     package: &AppPackage,
     files: &PackageFiles,
 ) -> Result<W> {
+    write_signed(destination, package, files, None)
+}
+
+/// Like [`write`], and when `signer` is given also writes
+/// `signatures/publisher.json` (see `crate::spkg_signature`).
+pub fn write_signed<W: Write + Seek>(
+    destination: W,
+    package: &AppPackage,
+    files: &PackageFiles,
+    signer: Option<&ed25519_dalek::SigningKey>,
+) -> Result<W> {
     validate_contents(package, files)?;
     if files.len().saturating_add(2) > MAX_ENTRIES {
         bail!("SPKG contains more than {MAX_ENTRIES} entries");
@@ -101,6 +112,11 @@ pub fn write<W: Write + Seek>(
     archive.write_all(MIMETYPE)?;
     archive.start_file("manifest.json", deflated)?;
     archive.write_all(&manifest)?;
+    if let Some(key) = signer {
+        let signature = crate::spkg_signature::sign(&manifest, key);
+        archive.start_file(crate::spkg_signature::SIGNATURE_ENTRY, stored)?;
+        archive.write_all(&serde_json::to_vec_pretty(&signature)?)?;
+    }
 
     // BTreeMap iteration gives a stable lexical payload order.
     for (path, data) in files {
@@ -113,6 +129,14 @@ pub fn write<W: Write + Seek>(
 
 /// Read and validate an SPKG v1 archive.
 pub fn read<R: Read + Seek>(source: R) -> Result<(AppPackage, PackageFiles)> {
+    read_with_signers(source).map(|(package, files, _)| (package, files))
+}
+
+/// Like [`read`], also returning the DIDs of valid publisher signatures. Any
+/// `signatures/*.json` entry that does not verify fails the read.
+pub fn read_with_signers<R: Read + Seek>(
+    source: R,
+) -> Result<(AppPackage, PackageFiles, Vec<String>)> {
     let mut archive = ZipArchive::new(source).context("open SPKG ZIP archive")?;
     if archive.len() > MAX_ENTRIES {
         bail!("SPKG contains more than {MAX_ENTRIES} entries");
@@ -123,6 +147,7 @@ pub fn read<R: Read + Seek>(source: R) -> Result<(AppPackage, PackageFiles)> {
 
     let mut seen = HashSet::with_capacity(archive.len());
     let mut manifest = None;
+    let mut signature_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut files = PackageFiles::new();
     let mut total_size = 0_u64;
 
@@ -187,6 +212,9 @@ pub fn read<R: Read + Seek>(source: R) -> Result<(AppPackage, PackageFiles)> {
                     name.strip_prefix("signatures/")
                         .expect("prefix was checked"),
                 )?;
+                if name.ends_with(".json") {
+                    signature_entries.push((name.clone(), data));
+                }
             }
             _ => {
                 let path = name
@@ -201,10 +229,16 @@ pub fn read<R: Read + Seek>(source: R) -> Result<(AppPackage, PackageFiles)> {
     }
 
     let manifest = manifest.ok_or_else(|| anyhow::anyhow!("SPKG is missing manifest.json"))?;
+    let mut signers = Vec::with_capacity(signature_entries.len());
+    for (name, data) in &signature_entries {
+        let did = crate::spkg_signature::verify(&manifest, data)
+            .with_context(|| format!("invalid SPKG signature {name}"))?;
+        signers.push(did);
+    }
     let package =
         serde_json::from_slice(&manifest).context("parse AppPackage from SPKG manifest")?;
     validate_contents(&package, &files)?;
-    Ok((package, files))
+    Ok((package, files, signers))
 }
 
 pub fn validate_payload_path(path: &str) -> Result<()> {
@@ -324,6 +358,26 @@ mod tests {
             writer.write_all(b"signature").unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn signed_round_trip_and_tampered_signature() {
+        let mut files = PackageFiles::new();
+        files.insert("index.html".to_owned(), b"<html></html>".to_vec());
+        let package = package(&files);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let archive = write_signed(Cursor::new(Vec::new()), &package, &files, Some(&key))
+            .unwrap()
+            .into_inner();
+        let (_, _, signers) = read_with_signers(Cursor::new(&archive)).unwrap();
+        assert_eq!(
+            signers,
+            vec![crate::spkg_signature::did_key_for(&key.verifying_key().to_bytes())]
+        );
+        let (_, _, unsigned) =
+            read_with_signers(Cursor::new(write(Cursor::new(Vec::new()), &package, &files).unwrap().into_inner()))
+                .unwrap();
+        assert!(unsigned.is_empty());
     }
 
     #[test]

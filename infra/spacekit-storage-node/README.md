@@ -290,6 +290,8 @@ Equivalent **TOML** knobs (ports, persistence paths, discovery) ship alongside e
 
 ## Security & monitoring
 
+**Request authentication:** document, query and file routes accept signed-login session tokens, app-scoped tokens, or `DID` + `X-Storage-Secret` from trusted backends. Bare `Authorization: DID …` headers are a legacy fallback (`SPACEKIT_DID_AUTH=legacy`, never for `did:spacekit:admin:*`). See [`AUTH.md`](AUTH.md) for the endpoints, settings and rollout.
+
 Summaries: **[documentation/security/security-architecture.md](documentation/security/security-architecture.md)** · **[documentation/security/security-quick-reference.md](documentation/security/security-quick-reference.md)** · **[documentation/ENCRYPTION_AND_SECURITY.md](documentation/ENCRYPTION_AND_SECURITY.md)**.
 
 Public perimeter guidance: terminate TLS/WAF/rate-limit at the reverse proxy—the in-process limiters intentionally complement, not replace, edge controls.

@@ -180,6 +180,35 @@ await sk.storage.set("highScore", 1200);
 
 Games keep `SharedArrayBuffer` / WASM threads in every mode, as long as the host page is cross-origin isolated (COOP `same-origin` + COEP `require-corp`).
 
+### Credentials for apps
+
+Apps should never carry the viewer's session. Give the host app-scoped credentials instead:
+
+```ts
+import { createStorageAuthClient, createLocalStorageEmbedHost } from "@spacekit/sdk/embed";
+
+// Viewer holds an Ed25519 did:key: sign the storage node's login challenge once,
+// then mint per-app tokens that only reach that app's documents.
+const storageAuth = createStorageAuthClient({
+  storageOrigin: "https://storage.example.com",
+  getSigner: async () => (signedIn ? { did, publicKeyHex, sign: (m) => ed25519.signAsync(m, privateKey) } : null),
+});
+const host = createLocalStorageEmbedHost({
+  appCredentials: storageAuth.appCredentials,
+  forwardViewerSession: false, // once your API issues app tokens (apiAuthorization)
+});
+```
+
+A host with its own API adds `apiAuthorization`, for example from the website-api's `POST /api/auth/app-token`.
+
+### Signed packages
+
+Publishers sign with `spacekit app package … --sign-key <seed-file>`. Hosts check the signature in their trust policy:
+
+```ts
+trustPolicy={allowPublishers(["did:key:z6Mk…"])} // must be signed by a listed key
+```
+
 ### Upgrading from the pre-v1 frame
 
 - `loadPackage` is ignored (blob-URL loaders cannot be isolated). Pass `loadFiles`, which returns verified files, for example with `verifyLocalPackageFiles(pkg, files)` for a local or encrypted cache.

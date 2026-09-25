@@ -1,5 +1,6 @@
 import { safeUUID } from "../crypto.js";
 import type {
+  EmbeddedHttpContext,
   EmbeddedFetchResult,
   EmbeddedHttpHandler,
   HttpBridgeHost,
@@ -29,6 +30,16 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(parts.join(""));
 }
 
+function withoutAuthHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (key === "authorization" || key === "owner-did") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 function resolveUrl(url: string): string {
   try {
     return new URL(url, typeof window !== "undefined" ? window.location.href : undefined).href;
@@ -54,6 +65,7 @@ function isCredentialedUrl(host: HttpBridgeHost, url: string): boolean {
 export async function handleEmbeddedHttpFetch(
   host: HttpBridgeHost,
   params: Record<string, unknown>,
+  context?: EmbeddedHttpContext,
 ): Promise<EmbeddedFetchResult> {
   const url = String(params.url ?? "");
   if (!url) throw new Error("http.fetch requires url");
@@ -65,9 +77,23 @@ export async function handleEmbeddedHttpFetch(
     body?: string;
   };
 
-  const credentialed = isCredentialedUrl(host, url);
+  const trusted = isCredentialedUrl(host, url);
   const appHeaders = { ...(init.headers ?? {}) };
-  const headers = credentialed ? host.mergeFetchHeaders(url, appHeaders) : appHeaders;
+  // On trusted origins, prefer a credential scoped to this app over the viewer's
+  // own session; fall back to the session only if the host allows it.
+  let headers = appHeaders;
+  // `credentialed`: the viewer's own session (headers + cookies) is attached.
+  let credentialed = false;
+  if (trusted) {
+    const scoped = context?.appCredentials ? await context.appCredentials().catch(() => null) : null;
+    if (scoped?.apiAuthorization) {
+      headers = withoutAuthHeaders(appHeaders);
+      headers.Authorization = scoped.apiAuthorization;
+    } else if (host.forwardViewerSession !== false) {
+      headers = host.mergeFetchHeaders(url, appHeaders);
+      credentialed = true;
+    }
+  }
   const bodyEncoding = headers["X-Body-Encoding"] ?? headers["x-body-encoding"];
   delete headers["X-Body-Encoding"];
   delete headers["x-body-encoding"];
@@ -164,11 +190,12 @@ export function createEmbeddedHttpHandler(host: HttpBridgeHost): EmbeddedHttpHan
     method: string,
     params: Record<string, unknown>,
     push: SsePushHandler,
+    context?: EmbeddedHttpContext,
   ): Promise<unknown> | null {
     if (module !== "http") return null;
 
     if (method === "fetch") {
-      return handleEmbeddedHttpFetch(host, params);
+      return handleEmbeddedHttpFetch(host, params, context);
     }
 
     if (method === "sseSubscribe") {

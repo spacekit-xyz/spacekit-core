@@ -1,5 +1,6 @@
 import { decodeContentRef } from "./decompress.js";
 import { injectSdkBridgeIntoHtml } from "./injectShim.js";
+import type { PackageSignature } from "./spkgSignature.js";
 import type { AppPackageJSON, ContentRef, EmbedEndpoints, LoadedWebPackage } from "./types.js";
 
 function parseCreatorDid(value: unknown): string {
@@ -344,6 +345,8 @@ export interface VerifiedWebPackageFiles {
   /** Package-relative path → verified bytes + MIME. */
   files: Map<string, VerifiedPackageFile>;
   integrityErrors: string[];
+  /** Publisher signatures (only `.spkg` archives carry them; empty otherwise). */
+  signatures: PackageSignature[];
 }
 
 function resolveMime(ref: ContentRef): string {
@@ -374,9 +377,18 @@ export async function loadVerifiedPackageFiles(
     fetchOpts,
   );
   if (packageRes.status === 200) {
-    const { openSpkg } = await import("./spkg.js");
+    const { openSpkg, packageAppIdHex } = await import("./spkg.js");
     const opened = await openSpkg(await packageRes.arrayBuffer());
-    return assembleVerifiedFiles(opened.package, async (ref) => opened.files[ref.path] ?? null);
+    const archived = packageAppIdHex(opened.package);
+    const requested = appId.trim().toLowerCase().replace(/^0x/, "");
+    if (/^[0-9a-f]{64}$/.test(requested) && archived !== requested) {
+      throw new Error(`SPKG app_id mismatch: requested ${requested}, archive contains ${archived}`);
+    }
+    return assembleVerifiedFiles(
+      opened.package,
+      async (ref) => opened.files[ref.path] ?? null,
+      opened.signatures,
+    );
   }
   if (![404, 405, 501].includes(packageRes.status)) {
     throw new Error(
@@ -435,6 +447,7 @@ export async function verifyLocalPackageFiles(
 async function assembleVerifiedFiles(
   pkg: AppPackageJSON,
   resolveBytes: (ref: ContentRef) => Promise<Uint8Array | null>,
+  signatures: PackageSignature[] = [],
 ): Promise<VerifiedWebPackageFiles> {
   const files = new Map<string, VerifiedPackageFile>();
   const integrityErrors: string[] = [];
@@ -474,5 +487,6 @@ async function assembleVerifiedFiles(
     creatorDid: parseCreatorDid(pkg.creator_did),
     files,
     integrityErrors,
+    signatures,
   };
 }

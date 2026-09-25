@@ -25,11 +25,13 @@ import {
   createCapabilityGuard,
   defaultTrustedOrigins,
   parseManifestPermissions,
+  permissionPolicyFeatures,
   type CapabilityPolicy,
 } from "./capabilities.js";
 import { buildOpaqueBootstrapHtml } from "./frameBootstrap.js";
 import { buildFramePayload } from "./framePayload.js";
 import { loadVerifiedPackageFiles, type VerifiedWebPackageFiles } from "./packageLoader.js";
+import type { PackageSignature } from "./spkgSignature.js";
 import {
   FRAME_LOAD,
   LOCAL_STORAGE_SHIM_PREFIX,
@@ -46,9 +48,14 @@ export type IsolationMode = "opaque" | "origin" | "unsafe-same-origin";
 
 export interface AppTrustInfo {
   appId: string;
+  /** `creator_did` from the manifest: a claim, not proof of who published it. */
   creatorDid: string;
   manifest: AppManifest;
   storageOrigin: string;
+  /** Publisher signatures carried by the package (`.spkg` only). */
+  signatures: PackageSignature[];
+  /** DIDs whose signatures over this exact package verified. */
+  signedBy: string[];
 }
 
 /**
@@ -229,11 +236,14 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
       return;
     }
     const manifest = verified.pkg.manifest;
+    const signatures = verified.signatures ?? [];
     const info: AppTrustInfo = {
       appId: verified.appId,
       creatorDid: verified.creatorDid,
       manifest,
       storageOrigin: options.storageOrigin,
+      signatures,
+      signedBy: signatures.filter((s) => s.status === "valid" && s.did).map((s) => s.did as string),
     };
 
     if (options.trustPolicy) {
@@ -334,7 +344,12 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
 
     const frame = document.createElement("iframe");
     frame.setAttribute("sandbox", sandbox);
-    frame.setAttribute("allow", options.frame?.allow ?? DEFAULT_ALLOW);
+    // Device features (camera, microphone, …) only when declared and granted.
+    const deviceFeatures = permissionPolicyFeatures(declared);
+    frame.setAttribute(
+      "allow",
+      options.frame?.allow ?? [DEFAULT_ALLOW, ...deviceFeatures].join("; "),
+    );
     frame.setAttribute("referrerpolicy", "no-referrer");
     frame.title = options.frame?.title ?? manifest.name ?? "SpaceKit app";
     if (options.frame?.className) frame.className = options.frame.className;

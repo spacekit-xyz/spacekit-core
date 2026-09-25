@@ -66,6 +66,14 @@ const CAPABILITY_ALIASES: Record<string, string> = {
 };
 
 const CAPABILITY_LABELS: Record<string, string> = {
+  "identity:read": "Know which account you are signed in with",
+  camera: "Use your camera",
+  microphone: "Use your microphone",
+  geolocation: "Know your location",
+  "clipboard:write": "Write to your clipboard",
+  notifications: "Show notifications",
+  payments: "Ask you to approve payments",
+  storage: "Store data on this device",
   network: "Connect to other websites",
   "identity:write": "Change your profile details on this site",
   messaging: "Send and read messages as you",
@@ -98,6 +106,7 @@ function hostsFrom(value: unknown): string[] {
       ...asStringList(o.domain),
       ...asStringList(o.origins),
       ...asStringList(o.urls),
+      ...asStringList(o.allowed_hosts),
     ];
   }
   return [];
@@ -114,8 +123,18 @@ export function parseManifestPermissions(permissions: unknown): DeclaredPermissi
   const labels: string[] = [];
 
   const add = (capRaw: string, detail: unknown, original: unknown) => {
-    const cap = normalizeCapability(capRaw);
+    let cap = normalizeCapability(capRaw);
     if (!cap) return;
+    // Shapes of the Rust `Permission` enum (serde externally tagged).
+    const d = detail && typeof detail === "object" ? (detail as Record<string, unknown>) : null;
+    if (cap === "identity") cap = d && d.read_only === false ? "identity:write" : "identity:read";
+    if (cap === "clipboard") cap = d && d.write ? "clipboard:write" : "clipboard:read";
+    if (cap === "wallet") cap = "payments";
+    if (cap === "custom" && d && typeof d.name === "string") {
+      capabilities.add(`custom:${d.name.toLowerCase()}`);
+      labels.push(typeof d.description === "string" && d.description ? d.description : d.name);
+      return;
+    }
     capabilities.add(cap);
     if (cap === "network") {
       const hosts = hostsFrom(detail);
@@ -151,6 +170,19 @@ export function parseManifestPermissions(permissions: unknown): DeclaredPermissi
   }
 
   return { capabilities, networkHosts, labels };
+}
+
+/**
+ * Permissions-Policy features to enable on the app frame for declared
+ * device permissions (camera, microphone, geolocation, clipboard).
+ */
+export function permissionPolicyFeatures(declared: DeclaredPermissions): string[] {
+  const out: string[] = [];
+  if (declared.capabilities.has("camera")) out.push("camera");
+  if (declared.capabilities.has("microphone")) out.push("microphone");
+  if (declared.capabilities.has("geolocation")) out.push("geolocation");
+  if (declared.capabilities.has("clipboard:write")) out.push("clipboard-write");
+  return out;
 }
 
 /** The capability a call needs, or null for baseline calls. */
@@ -284,10 +316,35 @@ export function createCapabilityGuard(options: CapabilityGuardOptions): Capabili
   };
 }
 
-/** Trust-policy helper: only run apps whose `creator_did` is in `dids`. */
-export function allowPublishers(dids: string[]) {
+export interface AllowPublishersOptions {
+  /**
+   * Require a valid package signature by one of the listed DIDs (default true).
+   * With false, a matching `creator_did` claim is enough, which anyone who can
+   * upload a package can write, so use it only for trusted storage nodes.
+   */
+  requireSignature?: boolean;
+}
+
+/**
+ * Trust-policy helper: only run apps published by `dids`. By default the
+ * package must be signed (`signatures/publisher.json`) by one of them.
+ */
+export function allowPublishers(dids: string[], options: AllowPublishersOptions = {}) {
   const allowed = new Set(dids.map((d) => d.trim().toLowerCase()));
-  return (info: { creatorDid: string }): boolean | string =>
-    allowed.has(info.creatorDid.trim().toLowerCase()) ||
-    `Publisher ${info.creatorDid || "(unknown)"} is not on this host's allowlist`;
+  const requireSignature = options.requireSignature ?? true;
+  return (info: { creatorDid: string; signedBy?: string[] }): boolean | string => {
+    const signer = (info.signedBy ?? []).find((d) => allowed.has(d.trim().toLowerCase()));
+    if (signer) return true;
+    if (!requireSignature && allowed.has(info.creatorDid.trim().toLowerCase())) return true;
+    if (requireSignature && allowed.has(info.creatorDid.trim().toLowerCase())) {
+      return `This package claims publisher ${info.creatorDid} but is not signed by an allowed key`;
+    }
+    return `Publisher ${info.creatorDid || "(unknown)"} is not on this host's allowlist`;
+  };
+}
+
+/** Trust-policy helper: require any valid publisher signature. */
+export function requireSignedPackages() {
+  return (info: { signedBy?: string[] }): boolean | string =>
+    (info.signedBy?.length ?? 0) > 0 || "This host only runs signed packages";
 }

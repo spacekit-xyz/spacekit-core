@@ -485,8 +485,19 @@ impl AppStorageEngine {
             .await?
             .ok_or_else(|| anyhow!("App not found"))?;
 
-        // Verify signature (placeholder - in production would verify SPHINCS+ sig)
-        let signature_valid = !app.signature.signature_bytes.is_empty();
+        // The embedded SPHINCS+ signature is not verified here (it has no key
+        // binding to the creator DID yet), so a non-empty signature is NOT
+        // treated as valid. Packages are authenticated by their SPKG publisher
+        // signature instead (`signatures/publisher.json`, checked on upload by
+        // `api::spkg_routes::validate_spkg` and by clients).
+        let signature_valid = false;
+        let mut warnings = Vec::new();
+        if !app.signature.signature_bytes.is_empty() {
+            warnings.push(
+                "embedded SPHINCS+ signature is not verified; rely on the SPKG publisher signature"
+                    .to_string(),
+            );
+        }
 
         // Verify content integrity (would need to fetch all content)
         let content_integrity = true; // Placeholder
@@ -509,7 +520,7 @@ impl AppStorageEngine {
             all_dependencies_available,
             permissions_acceptable,
             overall_valid,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 

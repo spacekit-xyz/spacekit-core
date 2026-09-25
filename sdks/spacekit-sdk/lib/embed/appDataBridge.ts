@@ -1,5 +1,6 @@
 import type { EmbeddedSdkBridge } from "./bridge.js";
 import type {
+  AppCredentials,
   EmbeddedHttpHandler,
   EmbedHostServices,
   MarketplacePurchaseRecord,
@@ -47,6 +48,7 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
   private readonly services: EmbedHostServices;
   private readonly httpHandler: EmbeddedHttpHandler;
   private pushToIframe: ((topic: string, msg: unknown) => void) | null = null;
+  private legacyWarned = false;
 
   constructor(
     appId: string,
@@ -95,14 +97,40 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
     }
   }
 
+  /** App-scoped credentials from the host, if it issues them. */
+  private appCredentials(): Promise<AppCredentials | null> {
+    const get = this.services.getAppCredentials;
+    if (!get) return Promise.resolve(null);
+    return get
+      .call(this.services, {
+        appId: this.appId,
+        publisherDid: this.ownerDid,
+        storageOrigin: this.storageOrigin,
+      })
+      .catch(() => null);
+  }
+
   private async ownerFetch(path: string, init?: RequestInit): Promise<Response> {
     const ownerDid = this.ensureOwnerDid();
+    const creds = await this.appCredentials();
+    let authorization = creds?.storageAuthorization;
+    if (!authorization) {
+      // Legacy: a bare claim of the publisher DID. Storage nodes in strict
+      // mode reject it; hosts should implement getAppCredentials.
+      if (!this.legacyWarned) {
+        this.legacyWarned = true;
+        console.warn(
+          "[spacekit] no app-scoped storage credentials from the host; falling back to a bare DID header",
+        );
+      }
+      authorization = `DID ${ownerDid}`;
+    }
     return fetch(`${trimSlash(this.storageOrigin)}${path}`, {
       ...init,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `DID ${ownerDid}`,
         ...(init?.headers ?? {}),
+        Authorization: authorization,
       },
     });
   }
@@ -222,6 +250,7 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
       method,
       params,
       (topic, msg) => this.pushToIframe?.(topic, msg),
+      { appId: this.appId, appCredentials: () => this.appCredentials() },
     );
     if (httpResult) return httpResult;
 

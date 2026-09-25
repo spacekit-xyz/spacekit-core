@@ -1,4 +1,6 @@
 export type {
+  AppCredentialRequest,
+  AppCredentials,
   AppManifest,
   AppPackageJSON,
   ContentRef,
@@ -6,6 +8,7 @@ export type {
   EmbedHostServices,
   EmbedShimConfig,
   EmbeddedFetchResult,
+  EmbeddedHttpContext,
   EmbeddedHttpHandler,
   HttpBridgeHost,
   LoadedWebPackage,
@@ -113,9 +116,12 @@ export {
 export {
   CapabilityError,
   allowPublishers,
+  requireSignedPackages,
+  type AllowPublishersOptions,
   createCapabilityGuard,
   defaultTrustedOrigins,
   parseManifestPermissions,
+  permissionPolicyFeatures,
   requiredCapability,
   type CapabilityGuard,
   type CapabilityGuardOptions,
@@ -146,3 +152,17 @@ export {
   type PortCallMessage,
   type PortHostMessage,
 } from "./protocol.js";
+
+export {
+  createStorageAuthClient,
+  type StorageAuthClient,
+  type StorageAuthClientOptions,
+  type StorageSigner,
+} from "./storageAuth.js";
+
+export {
+  ed25519KeyMatchesDid,
+  verifyPackageSignature,
+  type PackageSignature,
+  type PackageSignatureStatus,
+} from "./spkgSignature.js";

@@ -69,6 +69,33 @@ export interface SubscriptionStatus {
   reason?: string;
 }
 
+/** What an app's bridge asks the host for when it needs to act for the viewer. */
+export interface AppCredentialRequest {
+  /** Lower-case hex app id. */
+  appId: string;
+  /** The app's publisher (`creator_did`), whose namespace holds the app's shared documents. */
+  publisherDid: string | null;
+  /** Storage origin the bridge talks to. */
+  storageOrigin: string;
+}
+
+/**
+ * Credentials scoped to one app, used instead of the viewer's own session.
+ * Values are complete `Authorization` header values.
+ */
+export interface AppCredentials {
+  /**
+   * For the app's document calls to the storage node, e.g. an app-scoped node
+   * token from `POST /api/auth/delegate` (`"Bearer sktok1.…"`).
+   */
+  storageAuthorization?: string;
+  /**
+   * For `http.fetch` to trusted origins (the host API), e.g. a website-api app
+   * token from `POST /api/auth/app-token` (`"Bearer skapp1.…"`).
+   */
+  apiAuthorization?: string;
+}
+
 /** Host-provided identity, payments, and auth services for embedded app bridges. */
 export interface EmbedHostServices {
   /** Signed-in viewer DID, or null when anonymous. */
@@ -80,6 +107,18 @@ export interface EmbedHostServices {
     req: SubscriptionPaymentRequest,
   ): Promise<SubscriptionPaymentResult>;
   recordMarketplacePurchase?(req: MarketplacePurchaseRecord): Promise<void>;
+  /**
+   * App-scoped credentials for the viewer, or null when the viewer is anonymous
+   * or the host cannot mint them. Called often; cache inside.
+   */
+  getAppCredentials?(req: AppCredentialRequest): Promise<AppCredentials | null>;
+}
+
+/** Per-call context the bridge passes to the HTTP handler. */
+export interface EmbeddedHttpContext {
+  appId: string;
+  /** App-scoped credentials, when the host provides them. */
+  appCredentials?: () => Promise<AppCredentials | null>;
 }
 
 export interface HttpBridgeHost {
@@ -91,6 +130,13 @@ export interface HttpBridgeHost {
    */
   isCredentialedUrl?(url: string): boolean;
   mergeFetchHeaders(url: string, headers: Record<string, string>): Record<string, string>;
+  /**
+   * Whether to fall back to the viewer's own session (`mergeFetchHeaders`) on
+   * trusted origins when no app-scoped `apiAuthorization` is available.
+   * Defaults to true for compatibility; set false once the host API issues app
+   * tokens, so apps never carry the viewer's full session.
+   */
+  forwardViewerSession?: boolean;
   getSessionToken(): string | null;
   /** When true, retry the request once with refreshed auth headers after a 401. */
   shouldRetryUnauthorized?(url: string, headers: Record<string, string>): boolean;
@@ -116,6 +162,7 @@ export type EmbeddedHttpHandler = (
   method: string,
   params: Record<string, unknown>,
   push: SsePushHandler,
+  context?: EmbeddedHttpContext,
 ) => Promise<unknown> | null;
 
 export interface EmbedShimConfig {

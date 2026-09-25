@@ -26,7 +26,7 @@ export type {
   VerifiedFilesLoader,
 } from "../../embed/index.js";
 
-export { allowPublishers } from "../../embed/index.js";
+export { allowPublishers, requireSignedPackages, createStorageAuthClient } from "../../embed/index.js";
 
 /** @deprecated See `serviceWorkerRuntime.ts`; isolated frames no longer use it. */
 export {
