@@ -57,8 +57,9 @@ mod inner {
     ) {
         let commitment = FingerprintCommitment::from_fingerprint(&fp);
         let serialized = commitment.to_bytes();
-        state.contract_kv.insert(
-            (spacetime_fingerprint_account(), kv_key(validator_id)),
+        state.kv_insert(
+            spacetime_fingerprint_account(),
+            kv_key(validator_id).to_vec(),
             serialized.to_vec(),
         );
         let digest = commitment.digest(|b| *keccak256(b));

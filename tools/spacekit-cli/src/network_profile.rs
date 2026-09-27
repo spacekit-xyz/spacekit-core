@@ -780,6 +780,17 @@ pub struct BlockchainSection {
     pub chain_id: u64,
     #[serde(default = "default_block_time_ms")]
     pub block_time_ms: u64,
+    /// `on_demand` (default: blocks for transactions, due rewards and
+    /// heartbeats) or `interval` (a block every `block_time_ms`). Applies to a
+    /// node producing alone; a PoA network takes it from its genesis file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production: Option<String>,
+    /// On-demand: wait this long after the first pending transaction (default 500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_window_ms: Option<u64>,
+    /// On-demand: an empty block after this much idle time (default 300, 0 = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_secs: Option<u64>,
     #[serde(default = "default_epoch_length")]
     pub epoch_length: u64,
     /// Write `ledger.json` every N blocks when `persist_state` is true (default 100).
@@ -796,6 +807,55 @@ pub struct BlockchainSection {
     pub validators: ValidatorSection,
     #[serde(default)]
     pub rewards: RewardSection,
+    /// Proof-of-authority bootstrap (see `infra/spacekit-compute-node/GOVERNANCE.md`).
+    #[serde(default, skip_serializing_if = "PoaSection::is_empty")]
+    pub poa: PoaSection,
+}
+
+/// `[blockchain.poa]`: passed to the compute sidecar as environment variables.
+///
+/// Every node of a network uses the same `genesis_file` (and `genesis_alloc_file`);
+/// `authority_wallet` is this node's own authority key, when it is one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PoaSection {
+    /// `SPACEKIT_POA_GENESIS_FILE`: genesis authorities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_file: Option<PathBuf>,
+    /// `SPACEKIT_AUTHORITY_WALLET`: DID wallet used to seal blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_wallet: Option<PathBuf>,
+    /// `SPACEKIT_GENESIS_ALLOC_FILE`: balances in the genesis state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_alloc_file: Option<PathBuf>,
+    /// Unused: governance is replicated through the chain. Kept so older
+    /// profiles still parse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub governance_sync_urls: Vec<String>,
+    /// Enable the Service Reward Accumulator (rewards as system transactions).
+    #[serde(default)]
+    pub rewards: bool,
+    /// `SPACEKIT_SRA_EPOCH_SECS` (default: one day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward_epoch_secs: Option<u64>,
+    /// `SPACEKIT_SRA_GENESIS_TS`: shared epoch origin (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewards_genesis_ts: Option<u64>,
+    /// `SPACEKIT_AFFILIATED_OPERATOR_DIDS`: credits to these DIDs are locked during PoA.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affiliated_operator_dids: Vec<String>,
+    /// `SPACEKIT_ASTRA_REWARDS_WASM`: AstraRewards contract to install at genesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub astra_rewards_wasm: Option<PathBuf>,
+}
+
+impl PoaSection {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.genesis_file.is_some()
+    }
 }
 
 fn default_chain_id() -> u64 {
@@ -836,6 +896,9 @@ impl Default for BlockchainSection {
             enabled: false,
             chain_id: DEFAULT_CHAIN_ID,
             block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            production: None,
+            batch_window_ms: None,
+            heartbeat_secs: None,
             epoch_length: DEFAULT_EPOCH_LENGTH,
             persist_interval_blocks: DEFAULT_PERSIST_INTERVAL_BLOCKS,
             persist_state: false,
@@ -843,6 +906,7 @@ impl Default for BlockchainSection {
             genesis: GenesisSection::default(),
             validators: ValidatorSection::default(),
             rewards: RewardSection::default(),
+            poa: PoaSection::default(),
         }
     }
 }

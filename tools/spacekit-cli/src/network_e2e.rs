@@ -18,8 +18,13 @@ pub enum NetworkTestSuite {
     Local,
     Private,
     Public,
+    /// Proof-of-authority devnet: sealed production, governance, rewards, lift
+    Poa,
     All,
 }
+
+#[path = "network_e2e_poa.rs"]
+mod poa;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -181,10 +186,12 @@ pub async fn run(
         }
         NetworkTestSuite::Private => suites.push(run_private(&context).await),
         NetworkTestSuite::Public => suites.push(run_public(&context).await),
+        NetworkTestSuite::Poa => suites.push(poa::run_poa(&context).await),
         NetworkTestSuite::All => {
             suites.push(run_local(&context, website_url.as_deref(), api_url.as_deref()).await);
             suites.push(run_private(&context).await);
             suites.push(run_public(&context).await);
+            suites.push(poa::run_poa(&context).await);
         }
     }
 
@@ -434,7 +441,7 @@ async fn run_local(
             .map(|value| format!("genesis block number={}", value["number"])),
     ));
     let started = Instant::now();
-    let wasm_result = deploy_call_wasm(&context.client, &compute, address, None).await;
+    let wasm_result = deploy_call_wasm(&context.client, &compute, address, None, 31337).await;
     let persisted_contract = wasm_result
         .as_ref()
         .ok()
@@ -1159,7 +1166,7 @@ async fn run_private_chain_convergence(
         fund_private_node(&context.client, url, &address, index).await?;
     }
     let (_, contract) =
-        deploy_call_wasm(&context.client, &urls[0], &address, Some(&signing_key)).await?;
+        deploy_call_wasm(&context.client, &urls[0], &address, Some(&signing_key), 4242).await?;
     wait_for_chain_head(
         &context.client,
         &urls,
@@ -2280,6 +2287,7 @@ async fn deploy_call_wasm(
     base: &str,
     address: &str,
     signing_key: Option<&k256::ecdsa::SigningKey>,
+    chain_id: u64,
 ) -> Result<(String, String), String> {
     let wasm = wat::parse_str(
         r#"(module
@@ -2297,7 +2305,7 @@ async fn deploy_call_wasm(
     };
     let deploy_data = hex::encode(&wasm);
     let deploy_signature = signing_key
-        .map(|key| sign_swtchvm_http_tx(key, address, None, 0, 0, &deploy_data))
+        .map(|key| sign_swtchvm_http_tx(key, chain_id, address, None, 0, 0, 1_000_000, 1, &deploy_data))
         .transpose()?;
     let deploy = submit(
         "/contract/deploy",
@@ -2345,7 +2353,7 @@ async fn deploy_call_wasm(
         .ok_or_else(|| format!("deploy receipt missing created_address: {deploy_receipt}"))?;
 
     let call_signature = signing_key
-        .map(|key| sign_swtchvm_http_tx(key, address, Some(&contract), 0, 1, ""))
+        .map(|key| sign_swtchvm_http_tx(key, chain_id, address, Some(&contract), 0, 1, 1_000_000, 1, ""))
         .transpose()?;
     let call = submit(
         "/contract/call",
@@ -2399,28 +2407,40 @@ async fn deploy_call_wasm(
     ))
 }
 
+/// Sign a SwtchVM HTTP transaction (`SPACEKIT-TX-v2`: covers gas and the chain id).
+#[allow(clippy::too_many_arguments)]
 fn sign_swtchvm_http_tx(
     key: &k256::ecdsa::SigningKey,
+    chain_id: u64,
     from: &str,
     to: Option<&str>,
     value: u128,
     nonce: u64,
+    gas_limit: u128,
+    gas_price: u128,
     data_hex: &str,
 ) -> Result<Value, String> {
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use sha2::{Digest as _, Sha256};
+    use spacekit_compute_node::spacekitvm::{
+        transaction_signing_payload, SwtchvmAddress, SwtchvmTransaction, TransactionSignature,
+    };
 
-    let canonical = format!(
-        "{}|{}|{}|{}|{}",
-        from.trim_start_matches("0x").to_ascii_lowercase(),
-        to.unwrap_or_default()
-            .trim_start_matches("0x")
-            .to_ascii_lowercase(),
+    let tx = SwtchvmTransaction {
+        from: SwtchvmAddress::from_hex(from).map_err(|e| e.to_string())?,
+        to: to
+            .map(SwtchvmAddress::from_hex)
+            .transpose()
+            .map_err(|e| e.to_string())?,
+        data: hex::decode(data_hex.trim_start_matches("0x")).map_err(|e| e.to_string())?,
+        gas_limit,
+        gas_price,
         value,
         nonce,
-        data_hex.trim_start_matches("0x").to_ascii_lowercase()
-    );
-    let prehash: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
+        signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+    };
+    let prehash: [u8; 32] =
+        Sha256::digest(transaction_signing_payload(chain_id, &tx).as_bytes()).into();
     let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) = key
         .sign_prehash(&prehash)
         .map_err(|error| error.to_string())?;

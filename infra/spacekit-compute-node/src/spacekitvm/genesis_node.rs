@@ -156,10 +156,24 @@ fn load_did_registry_wasm() -> Option<Vec<u8>> {
 }
 
 fn load_astra_rewards_wasm() -> Option<Vec<u8>> {
+    // Explicit path wins (devnets and CI point this at a fresh build).
+    if let Ok(path) = std::env::var("SPACEKIT_ASTRA_REWARDS_WASM") {
+        if !path.trim().is_empty() {
+            match std::fs::read(path.trim()) {
+                Ok(bytes) => {
+                    tracing::info!("Loaded AstraRewards WASM from {} ({} bytes)", path.trim(), bytes.len());
+                    return Some(bytes);
+                }
+                Err(e) => tracing::warn!("SPACEKIT_ASTRA_REWARDS_WASM={}: {e}", path.trim()),
+            }
+        }
+    }
     load_system_wasm(
         &[
             "spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
             "../spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
+            "sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
+            "../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
         ],
         "AstraRewards",
     )
@@ -475,6 +489,7 @@ impl GenesisNode {
             compute_root: [0u8; 32],
             receipts: vec![],
             verkle_witness: None,
+            proposer_did: None,
         };
 
         // Calculate genesis block hash

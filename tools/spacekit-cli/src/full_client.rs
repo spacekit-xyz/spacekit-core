@@ -1580,6 +1580,18 @@ enum NetworkCommands {
         no_compute: bool,
         #[arg(long)]
         enable_gateway: bool,
+        /// Proof-of-authority genesis file shared by every node (enables the blockchain)
+        #[arg(long)]
+        poa_genesis: Option<PathBuf>,
+        /// This node's authority DID wallet, used to seal the blocks it produces
+        #[arg(long)]
+        authority_wallet: Option<PathBuf>,
+    },
+
+    /// Local proof-of-authority devnet: N authority nodes on this machine
+    Devnet {
+        #[command(subcommand)]
+        action: crate::network_devnet::DevnetAction,
     },
 
     /// Start enabled embedded services from the network profile (like `docker compose up`).
@@ -1593,10 +1605,11 @@ enum NetworkCommands {
         /// Enable all services + blockchain (genesis, validators, operator rewards).
         ///
         /// Equivalent to `--only storage,messaging,compute,gateway` plus `blockchain.enabled = true`.
-        /// For agent/storage/compute work use plain `network up` (no blockchain). `--full` runs an
-        /// in-process block producer that persists `ledger.json` and can increase RSS over long runs.
-        /// Tune `[blockchain] block_time_ms` in `~/.spacekit/network/config.toml` (default 10s) or
-        /// `SPACEKIT_BLOCK_TIME_MS` for local dev.
+        /// For agent/storage/compute work use plain `network up` (no blockchain). With `--full` the
+        /// compute node produces blocks on its own, by default only when there is work (transactions,
+        /// due rewards) plus a heartbeat every 5 minutes. Set `[blockchain] production = "interval"`
+        /// in `~/.spacekit/network/config.toml` for a block every `block_time_ms` (default 10 s),
+        /// or tune `heartbeat_secs` / `batch_window_ms`.
         #[arg(long)]
         full: bool,
     },
@@ -7873,6 +7886,8 @@ async fn handle_network_init(
     no_messaging: bool,
     no_compute: bool,
     enable_gateway: bool,
+    poa_genesis: Option<PathBuf>,
+    authority_wallet: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if port_offset > u16::MAX - crate::network_profile::DEFAULT_KEYMASTER_GUARDIAN_BASE_PORT {
         return Err(format!("port offset {port_offset} overflows default service ports").into());
@@ -7906,6 +7921,17 @@ async fn handle_network_init(
     let mut file = file;
     file.admission.allowlist = allowlist;
     file.admission.shared_genesis_hash = shared_genesis_hash;
+    if let Some(genesis) = poa_genesis {
+        let genesis = std::fs::canonicalize(&genesis)
+            .map_err(|e| format!("--poa-genesis {}: {e}", genesis.display()))?;
+        file.blockchain.enabled = true;
+        file.blockchain.poa.genesis_file = Some(genesis);
+    }
+    if let Some(wallet) = authority_wallet {
+        let wallet = std::fs::canonicalize(&wallet)
+            .map_err(|e| format!("--authority-wallet {}: {e}", wallet.display()))?;
+        file.blockchain.poa.authority_wallet = Some(wallet);
+    }
     let path = crate::network_profile::write_network_profile(&file, force)?;
     println!(
         "{} {}",
@@ -7979,6 +8005,8 @@ async fn handle_network_command(
             no_messaging,
             no_compute,
             enable_gateway,
+            poa_genesis,
+            authority_wallet,
         } => {
             handle_network_init(
                 *force,
@@ -8006,9 +8034,12 @@ async fn handle_network_command(
                 *no_messaging,
                 *no_compute,
                 *enable_gateway,
+                poa_genesis.clone(),
+                authority_wallet.clone(),
             )
             .await
         }
+        NetworkCommands::Devnet { action } => crate::network_devnet::handle(action).await,
         NetworkCommands::Up { detach, only, full } => {
             let only_list = only
                 .as_ref()

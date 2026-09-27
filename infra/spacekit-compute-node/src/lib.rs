@@ -284,6 +284,12 @@ pub use consensus_coordinator::{ConsensusCoordinator, FinalityStatus, ValidatorA
 
 // Proof-of-authority bootstrap: authority set, signed proposals and votes
 pub mod validator_governance;
+
+// Authority seals and producer schedule for proof-of-authority blocks
+pub mod block_production;
+pub mod chain_consensus;
+pub mod staking;
+pub mod block_seal;
 pub use validator_governance::{ConsensusMode, ValidatorGovernance};
 
 /// Subscriber sync bundle + L1 manifest merge for operator HTTP / proposals.

@@ -743,6 +743,7 @@ mod tests {
             compute_root: [0u8; 32],
             receipts: vec![],
             verkle_witness: None,
+            proposer_did: None,
         };
 
         indexer.index_block(&test_block).await.unwrap();

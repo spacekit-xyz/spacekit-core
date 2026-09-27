@@ -8,7 +8,11 @@ use alloc::vec::Vec;
 use core::ptr;
 use serde::{Deserialize, Serialize};
 
-// Set up global allocator
+// wee_alloc is for contracts compiled to WASM only. As a library dependency
+// this attribute used to replace the allocator of every native binary that
+// links spacekit-primitives (the compute node, the CLI): wee_alloc does not
+// reuse freed large blocks well, so a node grew by hundreds of KB per block.
+#[cfg(target_arch = "wasm32")]
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 

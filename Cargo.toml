@@ -67,6 +67,15 @@ exclude = [
 [profile.release]
 overflow-checks = true
 
+# SPHINCS+ (block seals, governance signatures) is C code built by the cc crate
+# at the package's opt-level. Unoptimized it signs so slowly that a debug-build
+# devnet misses its block time and forks.
+[profile.dev.package.pqcrypto-sphincsplus]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-internals]
+opt-level = 3
+
 # Required at workspace level: patches in member manifests are ignored once the
 # repo root is a workspace.
 [patch.crates-io]

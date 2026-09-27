@@ -6,6 +6,9 @@
 pub const OP_INIT: u8 = 0x01;
 /// Opcode: SRA credit (admin-only).
 pub const OP_CREDIT: u8 = 0x10;
+/// Opcode: SRA credit into the recipient's locked balance while in proof of
+/// authority (admin-only); credits normally after END_POA.
+pub const OP_CREDIT_LOCKED: u8 = 0x11;
 /// Opcode: read total emitted.
 pub const OP_GET_TOTAL_EMITTED: u8 = 0x32;
 /// Opcode: read `[locked 16][released 16][releasable 16]` for a DID.
@@ -41,6 +44,17 @@ pub fn encode_credit(
     out.extend_from_slice(&recipient_did_hash);
     out.extend_from_slice(&amount_wei.to_le_bytes());
     out.extend_from_slice(&log_event_hash);
+    out
+}
+
+/// Encode CREDIT_LOCKED: same payload as CREDIT.
+pub fn encode_credit_locked(
+    recipient_did_hash: [u8; 32],
+    amount_wei: u128,
+    log_event_hash: [u8; 32],
+) -> Vec<u8> {
+    let mut out = encode_credit(recipient_did_hash, amount_wei, log_event_hash);
+    out[0] = OP_CREDIT_LOCKED;
     out
 }
 

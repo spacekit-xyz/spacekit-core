@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use warp;
 
@@ -333,6 +333,8 @@ pub struct SwtchComputeNode {
     consensus_host: Arc<spacekit_compute_node::UnifiedConsensusHost>,
     /// Proof-of-authority bootstrap and validator-set governance.
     governance: Arc<spacekit_compute_node::ValidatorGovernance>,
+    /// Block seals: this node's authority key (if any), seal store, governance.
+    sealing: Arc<spacekit_compute_node::block_seal::BlockSealing>,
 }
 
 fn kem_sizes_for_config_algorithm(alg: &str) -> Option<(usize, usize)> {
@@ -423,17 +425,198 @@ fn build_runtime_identity(
     Ok((wallet, kem))
 }
 
-/// Point the Service Reward Accumulator at the current authority set: while
-/// the network is in proof of authority, authorities' (and affiliated
-/// operators') credits go to locked AstraRewards balances (Tokenomics §1.11).
-async fn sync_reward_lock_policy(
+/// Only members of the chain's producer set (authorities in PoA, staked
+/// validators in PoS) may produce blocks; anything else would be rejected by
+/// every peer and fork this node.
+async fn sync_mining_gate(
     governance: &spacekit_compute_node::ValidatorGovernance,
+    sealing: &spacekit_compute_node::block_seal::BlockSealing,
     vm: &SwtchvmNode,
 ) {
-    if let Some(sra) = vm.sra_host() {
-        let state = governance.snapshot().await;
-        sra.set_lock_policy(state.is_poa(), state.authorities.keys().map(String::as_str));
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let producers = vm.producer_set(now).await;
+    let reason = if producers.is_empty() {
+        None
+    } else {
+        match &sealing.signer {
+            None => Some(
+                "this network has block producers and this node has no producer key \
+                 (set SPACEKIT_AUTHORITY_WALLET)"
+                    .to_string(),
+            ),
+            Some(signer) if !producers.contains(&signer.did) => Some(format!(
+                "{} is not a current authority or active validator",
+                signer.did
+            )),
+            Some(_) => None,
+        }
+    };
+    vm.set_mining_blocked(reason);
+    let consensus_network = governance.has_genesis();
+    vm.set_faucet_blocked(consensus_network.then(|| {
+        "the faucet is disabled on proof-of-authority networks: it writes balances \
+         outside blocks. Fund accounts with SPACEKIT_GENESIS_ALLOC_FILE or a transfer."
+            .to_string()
+    }));
+    // Contracts may not read outside the chain where nodes must agree.
+    vm.set_external_reads(!consensus_network);
+}
+
+/// Block production for a node on a network without authorities, from the
+/// environment. Such a node produces on its own only with
+/// `SPACEKIT_BLOCK_PRODUCER=solo` (single-node development); otherwise blocks
+/// come from `POST /mine`, as before.
+///
+/// - `SPACEKIT_BLOCK_PRODUCTION`: `on_demand` (default) or `interval`
+/// - `SPACEKIT_BLOCK_TIME_MS`: minimum gap / block time (default 2000)
+/// - `SPACEKIT_BLOCK_BATCH_WINDOW_MS` (default 500)
+/// - `SPACEKIT_BLOCK_HEARTBEAT_SECS` (default 300, 0 = never)
+///
+/// On a PoA network these are ignored: the setting comes from the genesis
+/// file and governance, so every authority uses the same one.
+fn solo_block_production() -> Option<spacekit_compute_node::block_production::BlockProduction> {
+    use spacekit_compute_node::block_production::{BlockProduction, ProductionMode};
+    let solo = std::env::var("SPACEKIT_BLOCK_PRODUCER")
+        .map(|v| v.trim().eq_ignore_ascii_case("solo"))
+        .unwrap_or(false);
+    if !solo {
+        return None;
     }
+    let num = |key: &str| std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let mut config = BlockProduction::default();
+    if let Ok(mode) = std::env::var("SPACEKIT_BLOCK_PRODUCTION") {
+        config.mode = match mode.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "interval" => ProductionMode::Interval,
+            _ => ProductionMode::OnDemand,
+        };
+    }
+    if let Some(ms) = num("SPACEKIT_BLOCK_TIME_MS") {
+        config.block_time_ms = ms.max(spacekit_compute_node::block_production::MIN_BLOCK_TIME_MS);
+    }
+    if let Some(ms) = num("SPACEKIT_BLOCK_BATCH_WINDOW_MS") {
+        config.batch_window_ms = ms;
+    }
+    if let Some(secs) = num("SPACEKIT_BLOCK_HEARTBEAT_SECS") {
+        config.heartbeat_secs = secs;
+    }
+    match config.validate() {
+        Ok(()) => Some(config),
+        Err(e) => {
+            warn!("ignoring solo block production settings: {e}");
+            Some(BlockProduction::default())
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Produce blocks when they are due (see `block_production`).
+///
+/// With authorities, producers take turns: the authority at `height mod n`
+/// produces once the block is due; if it has not done so a grace period
+/// later, the next authority may, and so on. A fallback producer stands down
+/// while a peer reports a longer chain.
+fn start_block_producer(
+    vm: Arc<SwtchvmNode>,
+    sealing: Arc<spacekit_compute_node::block_seal::BlockSealing>,
+) {
+    use spacekit_compute_node::block_production::{BlockProduction, PendingWork};
+    let solo = solo_block_production();
+    let started_ms = unix_ms();
+    info!(
+        solo = solo.as_ref().map(|c| c.canonical()).unwrap_or_else(|| "off".into()),
+        authority = sealing.signer.as_ref().map(|s| s.did.as_str()).unwrap_or("none"),
+        "Block producer started"
+    );
+    tokio::spawn(async move {
+        let tick = std::time::Duration::from_millis(100);
+        // Governance and reward planning are re-read once a second.
+        let mut last_refresh: Option<std::time::Instant> = None;
+        let mut producers = spacekit_compute_node::chain_consensus::ProducerSet::default();
+        let mut config: Option<BlockProduction> = None;
+        let mut system_since_ms: Option<u64> = None;
+        let mut system_fingerprint: Option<[u8; 32]> = None;
+        let mut attempted_fingerprint: Option<[u8; 32]> = None;
+        loop {
+            tokio::time::sleep(tick).await;
+            let head = vm.get_latest_block();
+            if last_refresh.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                last_refresh = Some(std::time::Instant::now());
+                // Authorities (PoA) or staked validators (PoS), from the chain.
+                producers = vm.producer_set(unix_ms() / 1_000).await;
+                config = if producers.is_empty() {
+                    solo.clone()
+                } else {
+                    Some(producers.block_production.clone())
+                };
+                // Reward settlement (and END_POA) that is due counts as work.
+                let fingerprint = match vm.sra_host() {
+                    Some(sra) => {
+                        let world = vm.runtime_state();
+                        let world = world.read().await;
+                        let plan = sra.plan_block(&world, head.number + 1, unix_ms() / 1_000);
+                        (!plan.system_txs.is_empty()).then(|| {
+                            use sha2::Digest as _;
+                            let mut h = sha2::Sha256::new();
+                            for tx in &plan.system_txs {
+                                h.update(&tx.data);
+                            }
+                            <[u8; 32]>::from(h.finalize())
+                        })
+                    }
+                    None => None,
+                };
+                if fingerprint != system_fingerprint {
+                    system_fingerprint = fingerprint;
+                    system_since_ms = fingerprint.map(|_| unix_ms());
+                }
+            }
+            let Some(config) = &config else { continue };
+            // The same system work only triggers one block: if it keeps
+            // failing, it waits for the next transaction or heartbeat instead
+            // of producing a block every block time.
+            let system_work = system_fingerprint.is_some() && system_fingerprint != attempted_fingerprint;
+            let work = PendingWork {
+                parent_ms: if head.number == 0 { started_ms } else { head.timestamp * 1_000 },
+                transactions_since_ms: vm.pending_since_ms(),
+                system_since_ms: if system_work { system_since_ms } else { None },
+            };
+            let now = unix_ms();
+            let Some(due) = config.due_at_ms(&work) else { continue };
+            if now < due {
+                continue;
+            }
+            let height = head.number + 1;
+            let my_turn = if producers.is_empty() {
+                true
+            } else {
+                let Some(signer) = &sealing.signer else { continue };
+                let me = Some(signer.did.as_str());
+                let primary = producers.scheduled(height, 0) == me;
+                let scheduled = producers.scheduled(height, now - due) == me;
+                scheduled && (primary || vm.peer_head_hint() <= head.number)
+            };
+            if !my_turn {
+                continue;
+            }
+            match vm.mine_block().await {
+                Ok(block) => {
+                    if system_work {
+                        attempted_fingerprint = system_fingerprint;
+                    }
+                    // Re-plan against the new head right away.
+                    last_refresh = None;
+                    debug!(number = block.number, txs = block.transactions.len(), "produced block");
+                }
+                Err(e) => debug!("block production skipped: {e}"),
+            }
+        }
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,6 +959,16 @@ impl SwtchComputeNode {
             )
             .map_err(|e| anyhow::anyhow!("validator governance init failed: {e}"))?,
         );
+        let authority_signer = spacekit_compute_node::block_seal::AuthoritySigner::from_env()
+            .map_err(|e| anyhow::anyhow!("authority wallet: {e}"))?
+            .map(Arc::new);
+        if let Some(signer) = &authority_signer {
+            info!("Authority key loaded for {}", signer.did);
+        }
+        let sealing = Arc::new(spacekit_compute_node::block_seal::BlockSealing {
+            signer: authority_signer,
+            store: spacekit_compute_node::block_seal::SealStore::from_env(),
+        });
 
         #[cfg(feature = "spacetime-consensus")]
         let consensus_host = Arc::new(spacekit_compute_node::UnifiedConsensusHost::new(
@@ -826,6 +1019,11 @@ impl SwtchComputeNode {
             ));
             tracing::info!("Service Reward Accumulator (SRA) enabled on SwtchVM");
         }
+        match swtchvm_node.apply_genesis_alloc_from_env().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(accounts = n, "Applied genesis allocation"),
+            Err(e) => return Err(e.context("SPACEKIT_GENESIS_ALLOC_FILE")),
+        }
         if config.compute.potw_config.enabled {
             match spacekit_compute_node::PoTWHost::new(config.compute.potw_config.clone()) {
                 Ok(host) => {
@@ -853,9 +1051,18 @@ impl SwtchComputeNode {
                 Err(e) => tracing::warn!(error = %e, "Treasury bridge init failed; disabled"),
             }
         }
+        swtchvm_node.set_producer_did(sealing.signer.as_ref().map(|s| s.did.clone()));
         let swtchvm_node = Arc::new(swtchvm_node);
-        // Lock authorities' PoA-phase rewards before the first block is mined.
-        sync_reward_lock_policy(&governance, &swtchvm_node).await;
+        // Governance and staking live in the chain; install the genesis state
+        // at height 0.
+        governance.attach_vm(swtchvm_node.clone()).await?;
+        // Rewards are settled from chain history; rebuild the SRA's epoch
+        // accumulator from stored blocks so a restarted node agrees with peers.
+        if let Some(sra) = swtchvm_node.sra_host() {
+            let blocks = swtchvm_node.blocks();
+            sra.rebuild_from_blocks(blocks.iter());
+        }
+        sync_mining_gate(&governance, &sealing, &swtchvm_node).await;
 
         #[cfg(feature = "spacetime-consensus")]
         let pq_keys = Arc::new(
@@ -881,6 +1088,7 @@ impl SwtchComputeNode {
             #[cfg(feature = "spacetime-consensus")]
             consensus_host,
             governance,
+            sealing,
         })
     }
 
@@ -890,9 +1098,10 @@ impl SwtchComputeNode {
         self.compute_node.start().await?;
         self.register_with_network().await?;
         self.network_service.start().await?;
-        spacekit_compute_node::network::start_swtchvm_bridge(
+        spacekit_compute_node::network::start_swtchvm_bridge_sealed(
             self.swtchvm_node.clone(),
             self.network_service.clone(),
+            Some(self.sealing.clone()),
         );
 
         // Register ourselves as a validator and start the consensus listener
@@ -909,25 +1118,24 @@ impl SwtchComputeNode {
                 self.pq_keys.dilithium_secret_key.clone(),
             )
             .await;
-        // Proof-of-authority validators (genesis or admitted by governance)
-        // join the set without stake; governance gossip keeps nodes in step.
+        // The coordinator mirrors the chain's producer set.
         self.governance.sync_coordinator().await;
-        self.governance
-            .start_p2p_listener(self.network_service.clone());
-        self.governance.start_ticker();
         {
-            // Governance can admit or remove authorities, or lift PoA, at any
-            // time; keep the SRA's reward lock in step.
+            // Blocks change who may produce (admissions, the lift, stake);
+            // keep the mining gate and the coordinator in step.
             let governance = self.governance.clone();
             let vm = self.swtchvm_node.clone();
+            let sealing = self.sealing.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
                 loop {
                     interval.tick().await;
-                    sync_reward_lock_policy(&governance, &vm).await;
+                    sync_mining_gate(&governance, &sealing, &vm).await;
+                    governance.sync_coordinator().await;
                 }
             });
         }
+        start_block_producer(self.swtchvm_node.clone(), self.sealing.clone());
         info!(
             "Consensus mode: {}",
             if self.governance.is_poa().await {
@@ -1671,6 +1879,17 @@ impl SwtchComputeNode {
                                           governance proposal (see /v1/governance)",
                             })),
                             warp::http::StatusCode::FORBIDDEN,
+                        ));
+                    }
+                    // On a governed network, stake is kept in the chain.
+                    if governance.has_genesis() {
+                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "validators register by staking on chain: sign a \
+                                          SPACEKIT-STAKE-v1 message and POST it to /v1/staking \
+                                          (spacekit stake bond)",
+                            })),
+                            warp::http::StatusCode::GONE,
                         ));
                     }
                     let (pk, proof) = match (
@@ -2526,11 +2745,37 @@ impl SwtchComputeNode {
                 }
             });
 
+        // GET /v1/chain/seals/{number} — the block at that height on this node
+        // and the authority seal it was accepted with.
+        let seals_vm = self.swtchvm_node.clone();
+        let seals_store = self.sealing.clone();
+        let chain_seal_route = warp::path!("v1" / "chain" / "seals" / u64)
+            .and(warp::get())
+            .map(move |number: u64| {
+                let Some(block) = seals_vm.get_block_by_number(number) else {
+                    return warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({ "error": "no such block" })),
+                        warp::http::StatusCode::NOT_FOUND,
+                    );
+                };
+                let seal = seals_store.store.get(number, &block.hash);
+                warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "number": number,
+                        "hash": format!("0x{}", hex::encode(block.hash)),
+                        "proposer_did": seal.as_ref().map(|s| s.proposer_did.clone()),
+                        "seal": seal,
+                    })),
+                    warp::http::StatusCode::OK,
+                )
+            });
+
         // GET /v1/chain/status — public chain summary for explorers and the
         // spacekit.xyz network page.
         let status_vm = self.swtchvm_node.clone();
         let status_cc = self.consensus_coordinator.clone();
         let status_gov = self.governance.clone();
+        let status_sealing = self.sealing.clone();
         let status_net = self.network_service.clone();
         let status_chain_id = self.config.compute.chain_id.clone();
         let status_node_did = quantum_did_utils::get_did(&self.identity);
@@ -2540,11 +2785,21 @@ impl SwtchComputeNode {
                 let vm = status_vm.clone();
                 let cc = status_cc.clone();
                 let gov = status_gov.clone();
+                let sealing = status_sealing.clone();
                 let net = status_net.clone();
                 let chain_id = status_chain_id.clone();
                 let node_did = status_node_did.clone();
                 async move {
                     let head = vm.get_latest_block();
+                    let head_seal = sealing.store.get(head.number, &head.hash);
+                    let rewards = match vm.sra_host() {
+                        Some(sra) => {
+                            let world = vm.runtime_state();
+                            let world = world.read().await;
+                            sra.status_json(&world).await
+                        }
+                        None => serde_json::json!({ "enabled": false }),
+                    };
                     let governance = gov.snapshot().await;
                     let validators = cc.validator_entries().await;
                     let network = net.get_status().await.ok();
@@ -2557,6 +2812,9 @@ impl SwtchComputeNode {
                         })
                         .count();
                     let authorities = governance.authorities.len();
+                    let producers = vm
+                        .producer_set(chrono::Utc::now().timestamp().max(0) as u64)
+                        .await;
                     Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                         "network": governance.network,
                         "chain_id": chain_id,
@@ -2572,7 +2830,27 @@ impl SwtchComputeNode {
                             "tx_count": head.transactions.len(),
                             "gas_used": head.gas_used.to_string(),
                             "gas_limit": head.gas_limit.to_string(),
+                            "proposer_did": head.proposer_did.clone(),
+                            "sealed": head_seal.is_some(),
                         },
+                        "sealing": {
+                            "authority_did": sealing.signer.as_ref().map(|s| s.did.clone()),
+                            "seals_stored": sealing.store.len(),
+                            "producer_schedule": producers.dids(),
+                            "producers": producers.members,
+                            "stake_weighted": producers.weighted,
+                            "authority_fallback": producers.fallback,
+                            "reorg_window": vm.undo_depth(),
+                        },
+                        "block_production": {
+                            "setting": if producers.is_empty() {
+                                serde_json::to_value(solo_block_production()).unwrap_or_default()
+                            } else {
+                                serde_json::to_value(&producers.block_production).unwrap_or_default()
+                            },
+                            "pending_transactions": vm.pending_count(),
+                        },
+                        "rewards": rewards,
                         "consensus": {
                             "mode": if governance.is_poa() { "proof_of_authority" } else { "proof_of_stake" },
                             "state_hash": governance.state_hash(),
@@ -2619,6 +2897,7 @@ impl SwtchComputeNode {
             .or(register_validator_route)
             .or(propose_consensus_route)
             .or(chain_status_route)
+            .or(chain_seal_route)
             .or(governance_routes);
         #[cfg(feature = "spacetime-consensus")]
         let routes = routes.or(finalize_consensus_route);

@@ -5,6 +5,7 @@
 #[cfg(feature = "growformer-inference")]
 pub mod growformer_host;
 pub mod l1_checkpoint;
+pub mod state_commitment;
 pub mod swtchvm_node;
 pub mod swtchvm_sdk;
 pub mod tool_policy;
@@ -39,7 +40,7 @@ pub use swtchvm_node::{
     FaucetRequestBody, FaucetResponse, SwtchvmAccount, SwtchvmAddress, SwtchvmBlock,
     SwtchvmContext, SwtchvmExecutionResult, SwtchvmGasSchedule, SwtchvmLog, SwtchvmNetworking,
     SwtchvmNode, SwtchvmReceipt, SwtchvmRuntime, SwtchvmState, SwtchvmTransaction,
-    TransactionSignature,
+    TransactionSignature, transaction_signing_payload,
 };
 
 pub use swtchvm_sdk::{

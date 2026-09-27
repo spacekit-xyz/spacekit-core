@@ -23,6 +23,7 @@
 //! |----|--------|---------------------------------------------------|-------------------|
 //! | INIT                | 0x01 | [treasury_did_hash 32]                    | empty             |
 //! | CREDIT              | 0x10 | [recipient_hash 32][amount 16][log_hash 32] | [new_balance 16] |
+//! | CREDIT_LOCKED       | 0x11 | [recipient_hash 32][amount 16][log_hash 32] | [locked_total 16] |
 //! | WITHDRAW            | 0x20 | [recipient_hash 32][amount 16]              | [new_balance 16] |
 //! | GET_BALANCE         | 0x30 | [did_hash 32]                              | [balance 16]      |
 //! | GET_WITHDRAWN       | 0x31 | [did_hash 32]                              | [total 16]        |
@@ -103,6 +104,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // Opcodes
 const OP_INIT: u8 = 0x01;
 const OP_CREDIT: u8 = 0x10;
+const OP_CREDIT_LOCKED: u8 = 0x11;
 const OP_WITHDRAW: u8 = 0x20;
 const OP_GET_BALANCE: u8 = 0x30;
 const OP_GET_WITHDRAWN: u8 = 0x31;
@@ -172,7 +174,8 @@ impl SpacekitContract for AstraRewards {
 
         match opcode {
             OP_INIT => op_init(input, &mut cursor),
-            OP_CREDIT => op_credit(input, &mut cursor),
+            OP_CREDIT => op_credit(input, &mut cursor, false),
+            OP_CREDIT_LOCKED => op_credit(input, &mut cursor, true),
             OP_WITHDRAW => op_withdraw(input, &mut cursor),
             OP_GET_BALANCE => op_get_balance(input, &mut cursor),
             OP_GET_WITHDRAWN => op_get_withdrawn(input, &mut cursor),
@@ -242,7 +245,9 @@ fn op_init(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
 // Credit (admin only): credits a DID's balance from SRA
 // ============================================================================
 
-fn op_credit(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
+/// `force_lock`: CREDIT_LOCKED, used by the SRA for authority and affiliated
+/// recipients during proof of authority. After END_POA it credits normally.
+fn op_credit(input: &[u8], cursor: &mut usize, force_lock: bool) -> Result<Vec<u8>, ContractError> {
     require_initialized()?;
     require_admin()?;
 
@@ -275,7 +280,7 @@ fn op_credit(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError>
     }
 
     // Proof-of-authority credits to marked recipients are locked.
-    if read_phase()? == PHASE_POA && is_lock_recipient(&recipient_hash)? {
+    if read_phase()? == PHASE_POA && (force_lock || is_lock_recipient(&recipient_hash)?) {
         let locked = read_u128_or_zero(&locked_key(&recipient_hash))?;
         let new_locked = locked.checked_add(amount).ok_or(ContractError::InvalidInput)?;
         write_u128(&locked_key(&recipient_hash), new_locked)?;
@@ -290,8 +295,9 @@ fn op_credit(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError>
         payload.extend_from_slice(&proposed_total.to_le_bytes());
         emit_event_bytes("astra_rewards.credit_locked", &payload);
 
-        // The spendable balance is unchanged.
-        return Ok(read_balance(&recipient_hash)?.to_le_bytes().to_vec());
+        // CREDIT returns the spendable balance (unchanged); CREDIT_LOCKED the locked total.
+        let out = if force_lock { new_locked } else { read_balance(&recipient_hash)? };
+        return Ok(out.to_le_bytes().to_vec());
     }
 
     // Read recipient's current balance
@@ -927,6 +933,30 @@ mod tests {
         // Still locked until the cliff.
         at(GENESIS + YEAR - 1);
         assert_eq!(locked(authority).2, 0);
+    }
+
+    #[test]
+    fn credit_locked_locks_during_poa_only() {
+        init();
+        let d = "did:spacekit:testnet:eeee";
+        as_caller(ADMIN);
+        let mut i = vec![OP_CREDIT_LOCKED];
+        i.extend_from_slice(&h(d));
+        i.extend_from_slice(&(7 * ASTRA).to_le_bytes());
+        i.extend_from_slice(&[1u8; 32]);
+        assert_eq!(u128_at(&call(i.clone()).unwrap(), 0), 7 * ASTRA);
+        assert_eq!(balance(d), 0);
+        assert_eq!(locked(d).0, 7 * ASTRA);
+        call(vec![OP_END_POA]).unwrap();
+        call(i).unwrap();
+        assert_eq!(balance(d), 7 * ASTRA);
+        assert_eq!(locked(d).0, 7 * ASTRA);
+        as_caller("did:spacekit:testnet:mallory");
+        let mut j = vec![OP_CREDIT_LOCKED];
+        j.extend_from_slice(&h(d));
+        j.extend_from_slice(&ASTRA.to_le_bytes());
+        j.extend_from_slice(&[1u8; 32]);
+        assert!(matches!(call(j).unwrap_err(), ContractError::Unauthorized));
     }
 
     #[test]

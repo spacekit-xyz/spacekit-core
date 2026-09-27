@@ -284,6 +284,10 @@ pub struct SwtchvmBlock {
     /// Verkle witness for stateless block validation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verkle_witness: Option<VerkleBlockWitness>,
+    /// The authority or validator that produced the block. Its seal must be
+    /// by this DID, and it earns the block's consensus reward.
+    #[serde(default)]
+    pub proposer_did: Option<String>,
 }
 
 /// Verkle witness included in blocks for stateless validation.
@@ -435,6 +439,13 @@ pub struct SwtchvmState {
     pub fact_packages: HashMap<String, String>,
     #[serde(skip)]
     verkle_tree: Option<QuantumTree<NistSisScheme>>,
+    /// Entries changed since the last checkpoint, with their earlier values.
+    #[serde(skip)]
+    journal: super::state_commitment::StateJournal,
+    /// LtHash over all entries as of the last checkpoint; `None` until first
+    /// computed (after loading a snapshot, for example).
+    #[serde(skip)]
+    commitment: Option<super::state_commitment::LtHash>,
 }
 
 impl std::fmt::Debug for SwtchvmState {
@@ -460,6 +471,8 @@ impl Clone for SwtchvmState {
             contract_kv: self.contract_kv.clone(),
             fact_packages: self.fact_packages.clone(),
             verkle_tree: None,
+            journal: self.journal.clone(),
+            commitment: self.commitment.clone(),
         };
         cloned.rebuild_verkle_tree();
         cloned
@@ -475,6 +488,8 @@ impl SwtchvmState {
             contract_kv: HashMap::new(),
             fact_packages: HashMap::new(),
             verkle_tree: Some(new_quantum_tree()),
+            journal: Default::default(),
+            commitment: None,
         }
     }
 
@@ -488,6 +503,10 @@ impl SwtchvmState {
     }
 
     pub fn get_account_mut(&mut self, address: &SwtchvmAddress) -> &mut SwtchvmAccount {
+        if !self.journal.accounts.contains_key(address) {
+            let before = self.accounts.get(address).cloned();
+            self.journal.accounts.insert(*address, before);
+        }
         self.accounts
             .entry(*address)
             .or_insert_with(|| SwtchvmAccount {
@@ -508,6 +527,10 @@ impl SwtchvmState {
     }
 
     pub fn set_storage(&mut self, address: &SwtchvmAddress, key: [u8; 32], value: [u8; 32]) {
+        if !self.journal.storage.contains_key(&(*address, key)) {
+            let before = self.storage.get(&(*address, key)).copied();
+            self.journal.storage.insert((*address, key), before);
+        }
         if value == [0u8; 32] {
             self.storage.remove(&(*address, key));
             if let Some(tree) = &mut self.verkle_tree {
@@ -553,22 +576,140 @@ impl SwtchvmState {
         format!("0x{}", hex::encode(hasher.finalize()))
     }
 
+    /// Write a contract KV entry (journaled).
+    pub fn kv_insert(&mut self, address: SwtchvmAddress, key: Vec<u8>, value: Vec<u8>) {
+        let k = (address, key);
+        if !self.journal.kv.contains_key(&k) {
+            let before = self.contract_kv.get(&k).cloned();
+            self.journal.kv.insert(k.clone(), before);
+        }
+        self.contract_kv.insert(k, value);
+    }
+
+    /// Delete a contract KV entry (journaled).
+    pub fn kv_remove(&mut self, address: SwtchvmAddress, key: &[u8]) {
+        let k = (address, key.to_vec());
+        if !self.contract_kv.contains_key(&k) {
+            return;
+        }
+        if !self.journal.kv.contains_key(&k) {
+            let before = self.contract_kv.get(&k).cloned();
+            self.journal.kv.insert(k.clone(), before);
+        }
+        self.contract_kv.remove(&k);
+    }
+
+    pub fn kv_get(&self, address: &SwtchvmAddress, key: &[u8]) -> Option<&Vec<u8>> {
+        self.contract_kv.get(&(*address, key.to_vec()))
+    }
+
+    fn full_commitment(&self) -> super::state_commitment::LtHash {
+        use super::state_commitment::{account_entry, kv_entry, storage_entry, LtHash};
+        let mut h = LtHash::default();
+        for (addr, account) in &self.accounts {
+            h.add(&account_entry(addr, account));
+        }
+        for ((addr, key), value) in &self.contract_kv {
+            h.add(&kv_entry(addr, key, value));
+        }
+        for ((addr, key), value) in &self.storage {
+            h.add(&storage_entry(addr, key, value));
+        }
+        h
+    }
+
+    /// Apply the journal's changes to `h` (old entries out, current ones in).
+    fn fold_journal_into(&self, h: &mut super::state_commitment::LtHash) {
+        use super::state_commitment::{account_entry, kv_entry, storage_entry};
+        for (addr, before) in &self.journal.accounts {
+            if let Some(old) = before {
+                h.remove(&account_entry(addr, old));
+            }
+            if let Some(cur) = self.accounts.get(addr) {
+                h.add(&account_entry(addr, cur));
+            }
+        }
+        for ((addr, key), before) in &self.journal.kv {
+            if let Some(old) = before {
+                h.remove(&kv_entry(addr, key, old));
+            }
+            if let Some(cur) = self.contract_kv.get(&(*addr, key.clone())) {
+                h.add(&kv_entry(addr, key, cur));
+            }
+        }
+        for ((addr, key), before) in &self.journal.storage {
+            if let Some(old) = before {
+                h.remove(&storage_entry(addr, key, old));
+            }
+            if let Some(cur) = self.storage.get(&(*addr, *key)) {
+                h.add(&storage_entry(addr, key, cur));
+            }
+        }
+    }
+
+    /// Commitment to the whole state (see `state_commitment`): every account,
+    /// contract KV entry and storage slot.
     pub fn state_root(&self) -> [u8; 32] {
-        if let Some(tree) = &self.verkle_tree {
-            return tree.root().0;
+        match &self.commitment {
+            Some(h) if self.journal.is_empty() => h.root(),
+            Some(h) => {
+                let mut h = h.clone();
+                self.fold_journal_into(&mut h);
+                h.root()
+            }
+            None => self.full_commitment().root(),
         }
-        let leaves = state_merkle_leaves(self);
-        let root = merkle_root_from_leaves(&leaves);
-        if root == "merkle:empty" {
-            return [0u8; 32];
+    }
+
+    /// Checkpoint: fold pending changes into the commitment and return the
+    /// root together with the journal (the values from before the changes),
+    /// which undoes them.
+    pub fn checkpoint(&mut self) -> ([u8; 32], super::state_commitment::StateJournal) {
+        let journal = std::mem::take(&mut self.journal);
+        let h = match self.commitment.take() {
+            Some(mut h) => {
+                let saved = std::mem::replace(&mut self.journal, journal);
+                self.fold_journal_into(&mut h);
+                let journal = std::mem::replace(&mut self.journal, saved);
+                let root = h.root();
+                self.commitment = Some(h);
+                return (root, journal);
+            }
+            None => self.full_commitment(),
+        };
+        let root = h.root();
+        self.commitment = Some(h);
+        (root, journal)
+    }
+
+    /// Undo a checkpointed journal (restore the values it recorded). Pending
+    /// changes are checkpointed first; the restore itself is checkpointed too.
+    pub fn revert(&mut self, undo: super::state_commitment::StateJournal) -> [u8; 32] {
+        let _ = self.checkpoint();
+        for (addr, before) in undo.accounts {
+            if !self.journal.accounts.contains_key(&addr) {
+                let cur = self.accounts.get(&addr).cloned();
+                self.journal.accounts.insert(addr, cur);
+            }
+            match before {
+                Some(account) => {
+                    self.accounts.insert(addr, account);
+                }
+                None => {
+                    self.accounts.remove(&addr);
+                }
+            }
         }
-        let bytes = hex::decode(root).unwrap_or_default();
-        if bytes.len() != 32 {
-            return [0u8; 32];
+        for ((addr, key), before) in undo.kv {
+            match before {
+                Some(value) => self.kv_insert(addr, key, value),
+                None => self.kv_remove(addr, &key),
+            }
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        out
+        for ((addr, key), before) in undo.storage {
+            self.set_storage(&addr, key, before.unwrap_or([0u8; 32]));
+        }
+        self.checkpoint().0
     }
 
     /// Legacy merkle state root (for backwards compatibility / comparison).
@@ -638,9 +779,18 @@ pub struct SwtchvmRuntime {
     l1_persistence: L1PersistenceConfig,
     /// Transaction digests (SHA-256 of bincode(`SwtchvmTransaction`)) batched into the next snapshot `tx_root`.
     commit_tx_digests: StdMutex<Vec<[u8; 32]>>,
+    /// Numeric chain id bound into transaction signatures (`SPACEKIT-TX-v2`).
+    tx_chain_id: std::sync::atomic::AtomicU64,
+    /// Whether contracts may read outside the chain (storage-node fallback).
+    /// Off on multi-node networks, where results must be identical everywhere.
+    external_reads: AtomicBool,
 }
 
 impl SwtchvmRuntime {
+    pub fn external_reads_allowed(&self) -> bool {
+        self.external_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn init_runtime_identity() -> Option<Arc<QuantumResistantDID>> {
         let did = env::var("SPACEKIT_NODE_DID").ok()?;
         let identity =
@@ -729,7 +879,7 @@ impl SwtchvmRuntime {
             .trim_start_matches("0x");
         let addr = SwtchvmAddress::from_hex(hex)?;
         let mut state = self.state.write().await;
-        state.contract_kv.insert((addr, key.to_vec()), value);
+        state.kv_insert(addr, key.to_vec(), value);
         Ok(())
     }
 
@@ -895,6 +1045,8 @@ impl SwtchvmRuntime {
             state_persistence_path,
             l1_persistence,
             commit_tx_digests: StdMutex::new(Vec::new()),
+            tx_chain_id: std::sync::atomic::AtomicU64::new(1337),
+            external_reads: AtomicBool::new(true),
         })
     }
 
@@ -1485,7 +1637,29 @@ impl SwtchvmRuntime {
         context: SwtchvmContext,
     ) -> Result<SwtchvmExecutionResult> {
         self.verify_signature(tx)?;
+        self.execute_transaction_unverified(tx, context).await
+    }
 
+    /// Execute a protocol system transaction (e.g. Service Reward Accumulator
+    /// credits) without a user signature.
+    ///
+    /// Only block production and block import call this, and only for the
+    /// leading system transactions that every node derives independently from
+    /// chain state (see `SraHost::plan_block`). Mempool transactions always go
+    /// through [`execute_transaction`](Self::execute_transaction).
+    pub(crate) async fn execute_system_transaction(
+        &self,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
+        self.execute_transaction_unverified(tx, context).await
+    }
+
+    async fn execute_transaction_unverified(
+        &self,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
         let outcome: Result<SwtchvmExecutionResult> = async {
             let mut state = self.state.write().await;
             let sender = state.get_account_mut(&tx.from);
@@ -1990,11 +2164,12 @@ impl SwtchvmRuntime {
         let Some(data) = Self::read_contract_mem_vec(&mut caller, data_ptr, data_len) else {
             return 0;
         };
-        let caller_addr = unsafe { (*caller.data().context).caller };
+        // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
         unsafe {
-            (*caller.data_mut().state)
-                .contract_kv
-                .insert((caller_addr, key), data);
+            (*caller.data_mut().state).kv_insert(caller_addr, key, data);
         }
         data_len
     }
@@ -2019,14 +2194,19 @@ impl SwtchvmRuntime {
         if max_len <= 0 {
             return 0;
         }
-        let caller_addr = unsafe { (*caller.data().context).caller };
+        // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
         let mut blob = unsafe {
             (*caller.data().state)
                 .contract_kv
                 .get(&(caller_addr, key.clone()))
                 .cloned()
         };
-        if blob.is_none() {
+        // The storage-node fallback reads data outside the chain, so nodes
+        // could compute different results; it is off on consensus networks.
+        if blob.is_none() && unsafe { (*caller.data().runtime).external_reads_allowed() } {
             #[cfg(feature = "storage-integration")]
             {
                 let key_s = String::from_utf8_lossy(&key).to_string();
@@ -2087,7 +2267,10 @@ impl SwtchvmRuntime {
                 let Some(key) = Self::read_contract_mem_vec(&mut caller, key_ptr, key_len) else {
                     return -1;
                 };
-                let caller_addr = unsafe { (*caller.data().context).caller };
+                // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
                 let value_opt = unsafe {
                     (*caller.data().state)
                         .contract_kv
@@ -2480,14 +2663,19 @@ impl SwtchvmRuntime {
                 let Some(key) = Self::read_contract_mem_vec(&mut caller, key_ptr, key_len) else {
                     return -2;
                 };
-                let caller_addr = unsafe { (*caller.data().context).caller };
+                // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
                 let mut blob = unsafe {
                     (*caller.data().state)
                         .contract_kv
                         .get(&(caller_addr, key.clone()))
                         .cloned()
                 };
-                if blob.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
+                if blob.as_ref().map(|b| b.is_empty()).unwrap_or(true)
+                    && unsafe { (*caller.data().runtime).external_reads_allowed() }
+                {
                     #[cfg(feature = "storage-integration")]
                     {
                         let key_s = String::from_utf8_lossy(&key).to_string();
@@ -5295,58 +5483,91 @@ impl SwtchvmRuntime {
         }
 
         use sha2::{Digest, Sha256};
-        let to_hex = tx
-            .to
-            .as_ref()
-            .map(|a| hex::encode(a.as_bytes()))
-            .unwrap_or_default();
-        let canonical = format!(
-            "{}|{}|{}|{}|{}",
-            hex::encode(tx.from.as_bytes()),
-            to_hex,
-            tx.value,
-            tx.nonce,
-            hex::encode(&tx.data),
-        );
-        let message_hash: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(canonical.as_bytes());
-            h.finalize().into()
+        let chain_id = self.tx_chain_id.load(std::sync::atomic::Ordering::Relaxed);
+        let recover = |payload: &str| -> Result<[u8; 20]> {
+            let message_hash: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
+            recover_tx_signer(&message_hash, sig)
         };
-
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(&sig.r);
-        sig_bytes[32..].copy_from_slice(&sig.s);
-
-        let recid = k256::ecdsa::RecoveryId::try_from(sig.v.wrapping_sub(27))
-            .map_err(|_| anyhow::anyhow!("Invalid recovery id v={}", sig.v))?;
-        let ecdsa_sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid ECDSA signature bytes"))?;
-        let recovered =
-            k256::ecdsa::VerifyingKey::recover_from_prehash(&message_hash, &ecdsa_sig, recid)
-                .map_err(|_| anyhow::anyhow!("ECDSA recovery failed"))?;
-
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
-        let uncompressed = recovered.to_encoded_point(false);
-        let recovered_addr: [u8; 20] = {
-            use sha3::Keccak256;
-            let mut kh = Keccak256::new();
-            kh.update(&uncompressed.as_bytes()[1..]);
-            let full_hash: [u8; 32] = kh.finalize().into();
-            let mut a = [0u8; 20];
-            a.copy_from_slice(&full_hash[12..]);
-            a
+        let recovered_addr = recover(&transaction_signing_payload(chain_id, tx))?;
+        // `SPACEKIT_LEGACY_TX_SIGNATURES=1` also accepts the v1 payload, which
+        // does not cover gas or the chain id. Test networks only.
+        let recovered_addr = if recovered_addr != tx.from.0 && legacy_tx_signatures_allowed() {
+            recover(&legacy_transaction_signing_payload(tx)).unwrap_or(recovered_addr)
+        } else {
+            recovered_addr
         };
-
         if recovered_addr != tx.from.0 {
             anyhow::bail!(
-                "Signature mismatch: recovered {} but tx.from is {}",
+                "Signature mismatch: recovered {} but tx.from is {} (sign the SPACEKIT-TX-v2 \
+                 payload for chain {chain_id})",
                 hex::encode(recovered_addr),
                 hex::encode(tx.from.0),
             );
         }
         Ok(())
     }
+}
+
+/// What a transaction's ECDSA (secp256k1) signature covers: SHA-256 of
+///
+/// ```text
+/// SPACEKIT-TX-v2\n{chain_id}\n{from}\n{to}\n{value}\n{nonce}\n{gas_limit}\n{gas_price}\n{data}
+/// ```
+///
+/// Addresses and data are lowercase hex without `0x`; `to` is empty for a
+/// deployment; numbers are decimal. Binding gas and the chain id means a relay
+/// cannot change the fee, and a signature for one network is invalid on another.
+pub fn transaction_signing_payload(chain_id: u64, tx: &SwtchvmTransaction) -> String {
+    format!(
+        "SPACEKIT-TX-v2\n{chain_id}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        hex::encode(tx.from.as_bytes()),
+        tx.to.as_ref().map(|a| hex::encode(a.as_bytes())).unwrap_or_default(),
+        tx.value,
+        tx.nonce,
+        tx.gas_limit,
+        tx.gas_price,
+        hex::encode(&tx.data),
+    )
+}
+
+/// The pre-v2 payload: `{from}|{to}|{value}|{nonce}|{data}`.
+fn legacy_transaction_signing_payload(tx: &SwtchvmTransaction) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        hex::encode(tx.from.as_bytes()),
+        tx.to.as_ref().map(|a| hex::encode(a.as_bytes())).unwrap_or_default(),
+        tx.value,
+        tx.nonce,
+        hex::encode(&tx.data),
+    )
+}
+
+fn legacy_tx_signatures_allowed() -> bool {
+    std::env::var("SPACEKIT_LEGACY_TX_SIGNATURES")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn recover_tx_signer(message_hash: &[u8; 32], sig: &TransactionSignature) -> Result<[u8; 20]> {
+    use sha3::Digest as _;
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(&sig.r);
+    sig_bytes[32..].copy_from_slice(&sig.s);
+
+    let recid = k256::ecdsa::RecoveryId::try_from(sig.v.wrapping_sub(27))
+        .map_err(|_| anyhow::anyhow!("Invalid recovery id v={}", sig.v))?;
+    let ecdsa_sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid ECDSA signature bytes"))?;
+    let recovered =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(message_hash, &ecdsa_sig, recid)
+            .map_err(|_| anyhow::anyhow!("ECDSA recovery failed"))?;
+
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let uncompressed = recovered.to_encoded_point(false);
+    let full_hash: [u8; 32] = sha3::Keccak256::digest(&uncompressed.as_bytes()[1..]).into();
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&full_hash[12..]);
+    Ok(a)
 }
 
 pub struct SwtchvmStoreData {
@@ -5457,6 +5678,13 @@ fn tool_request_key(tool_name: &str, data: &[u8]) -> String {
 // async task, and wasmtime's Store ensures they are not accessed concurrently.
 unsafe impl Send for SwtchvmStoreData {}
 
+/// Namespace for `contract_kv`: the contract whose code is executing, or the
+/// transaction caller for anonymous execution (`execute_wasm_direct`).
+fn contract_kv_namespace(data: &SwtchvmStoreData) -> SwtchvmAddress {
+    data.executing_contract
+        .unwrap_or_else(|| unsafe { (*data.context).caller })
+}
+
 // Helper functions for memory operations
 unsafe fn read_bytes_from_memory(
     _caller: &Caller<'_, SwtchvmStoreData>,
@@ -5479,6 +5707,9 @@ unsafe fn write_bytes_to_memory(
 struct SwtchvmChainState {
     blockchain: Vec<SwtchvmBlock>,
     pending_transactions: Vec<SwtchvmTransaction>,
+    /// Hashes of pending transactions (and of those taken into a block being
+    /// assembled), for de-duplicating relayed transactions.
+    pending_hashes: std::collections::HashSet<[u8; 32]>,
     receipts_by_tx: HashMap<[u8; 32], SwtchvmReceipt>,
     transactions_by_tx: HashMap<[u8; 32], SwtchvmTransaction>,
 }
@@ -5494,12 +5725,52 @@ pub struct SwtchvmNode {
     faucet_requests: Arc<RwLock<HashMap<String, FaucetRecord>>>,
     /// Optional SRA host (production ASTRA emission). See `service_reward_accumulator`.
     sra_host: Option<Arc<crate::service_reward_accumulator::SraHost>>,
+    /// When set, `mine_block` refuses with this reason (e.g. a node without an
+    /// authority key on a proof-of-authority network, whose blocks peers
+    /// would reject).
+    mining_blocked: std::sync::RwLock<Option<String>>,
+    /// Set on multi-node (PoA) networks: the faucet writes balances outside
+    /// blocks, so using it on one node would fork that node's state root.
+    faucet_blocked: std::sync::RwLock<Option<String>>,
+    /// Highest block number a peer has announced (see `note_peer_head`).
+    peer_head_hint: std::sync::atomic::AtomicU64,
     /// Optional PoTW award host (reviewer-quorum emission). See `potw_host`.
     potw_host: Option<Arc<crate::potw_host::PoTWHost>>,
     /// Optional Treasury disbursement bridge (native mirror). See `treasury_host`.
     treasury_host: Option<Arc<crate::treasury_host::TreasuryHost>>,
     /// Locally mined blocks. The standalone process bridges this stream to the real TCP P2P layer.
     mined_blocks_tx: broadcast::Sender<SwtchvmBlock>,
+    /// Transactions newly accepted into the pending pool (local or gossiped),
+    /// for the P2P bridge to relay.
+    new_txs_tx: broadcast::Sender<SwtchvmTransaction>,
+    /// When the oldest transaction still pending arrived (unix ms).
+    pending_since_ms: std::sync::Mutex<Option<u64>>,
+    /// DID written into blocks this node produces.
+    producer_did: StdRwLock<Option<String>>,
+    /// Undo records for the most recent blocks (fork choice).
+    undo_log: StdMutex<std::collections::VecDeque<BlockUndo>>,
+    /// Sealed blocks of competing branches, by hash, with their seals.
+    side_blocks: StdMutex<HashMap<[u8; 32], (SwtchvmBlock, SideSeal)>>,
+}
+
+/// Upper bound on the pending pool, so relayed transactions cannot exhaust memory.
+const MAX_PENDING_TRANSACTIONS: usize = 50_000;
+/// Blocks that can be rolled back by fork choice. Deeper blocks are final.
+pub const MAX_REORG_DEPTH: usize = 64;
+
+/// What undoes one block (see `rollback_head_locked`).
+struct BlockUndo {
+    number: u64,
+    hash: [u8; 32],
+    state: super::state_commitment::StateJournal,
+    sra: Option<spacekit_service_rewards::SraState>,
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SwtchvmNode {
@@ -5525,6 +5796,19 @@ impl SwtchvmNode {
         &self,
         bundle: &crate::rollup_bridge::RollupBundle,
     ) -> anyhow::Result<usize> {
+        // Settlement writes balances outside blocks. On a multi-node network
+        // that would fork this node, so it is refused there until bundles are
+        // settled by consensus transactions.
+        if self
+            .faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            anyhow::bail!(
+                "rollup settlement outside blocks is disabled on consensus (PoA/PoS) networks"
+            );
+        }
         let payloads = match &bundle.tx_payloads {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(0),
@@ -5632,6 +5916,20 @@ impl SwtchvmNode {
         address: SwtchvmAddress,
         amount_override: Option<u128>,
     ) -> FaucetResponse {
+        if let Some(reason) = self
+            .faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return FaucetResponse {
+                success: false,
+                amount: 0,
+                new_balance: 0,
+                error: Some(reason),
+                cooldown_remaining: None,
+            };
+        }
         let policy = Self::faucet_policy();
         let amount = amount_override.unwrap_or(policy.amount);
         let now = Instant::now();
@@ -5716,11 +6014,13 @@ impl SwtchvmNode {
         };
 
         let (mined_blocks_tx, _) = broadcast::channel(256);
+        let (new_txs_tx, _) = broadcast::channel(4096);
         Ok(Self {
             runtime,
             chain: StdRwLock::new(SwtchvmChainState {
                 blockchain: vec![Self::genesis_block()],
                 pending_transactions: Vec::new(),
+                pending_hashes: std::collections::HashSet::new(),
                 receipts_by_tx: HashMap::new(),
                 transactions_by_tx: HashMap::new(),
             }),
@@ -5730,15 +6030,26 @@ impl SwtchvmNode {
             chain_id_num: 1337,
             faucet_requests: Arc::new(RwLock::new(HashMap::new())),
             sra_host: None,
+            mining_blocked: std::sync::RwLock::new(None),
+            faucet_blocked: std::sync::RwLock::new(None),
+            peer_head_hint: std::sync::atomic::AtomicU64::new(0),
             potw_host: None,
             treasury_host: None,
             mined_blocks_tx,
+            new_txs_tx,
+            pending_since_ms: std::sync::Mutex::new(None),
+            producer_did: StdRwLock::new(None),
+            undo_log: StdMutex::new(std::collections::VecDeque::new()),
+            side_blocks: StdMutex::new(HashMap::new()),
         })
     }
 
     pub fn set_chain_id(&mut self, label: String, numeric: u64) {
         self.chain_id = label;
         self.chain_id_num = numeric;
+        self.runtime
+            .tx_chain_id
+            .store(numeric, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn chain_id(&self) -> &str {
@@ -6019,35 +6330,290 @@ impl SwtchvmNode {
             state_root: [0u8; 32],
             compute_root: [0u8; 32],
             verkle_witness: None,
+            proposer_did: None,
         }
     }
 
     pub async fn submit_transaction(&self, tx: SwtchvmTransaction) -> Result<[u8; 32]> {
-        // Basic validation
-        if tx.gas_limit == 0 || tx.gas_price == 0 {
-            return Err(anyhow::anyhow!("Invalid gas parameters"));
-        }
-
-        // Generate transaction hash
-        let tx_bytes = bincode::serialize(&tx)?;
-        let hash = Keccak256::digest(&tx_bytes);
-
-        // Add to the pending pool only after all local validation/hash work succeeds.
-        self.chain
-            .write()
-            .expect("SwtchVM chain lock poisoned")
-            .pending_transactions
-            .push(tx.clone());
+        let (hash, _new) = self.add_pending_transaction(tx.clone()).await?;
 
         // Broadcast to network if enabled
         if let Some(networking) = &self.networking {
             networking.broadcast_transaction(tx).await?;
         }
 
-        Ok(hash.into())
+        Ok(hash)
+    }
+
+    /// Queue a governance or staking message for the next block. Returns
+    /// the transaction hash; fails if the message is invalid right now.
+    pub async fn submit_consensus_message(
+        &self,
+        msg: &crate::chain_consensus::ConsensusMessage,
+    ) -> Result<([u8; 32], bool)> {
+        self.add_pending_transaction(msg.to_transaction()).await
+    }
+
+    /// Chain-held governance and staking, as of the head block.
+    pub async fn consensus_state(&self) -> Option<crate::chain_consensus::ConsensusState> {
+        crate::chain_consensus::load(&*self.runtime.state.read().await)
+    }
+
+    /// Who may produce the next block, from chain state.
+    pub async fn producer_set(&self, now: u64) -> crate::chain_consensus::ProducerSet {
+        crate::chain_consensus::producer_set(&*self.runtime.state.read().await, now)
+    }
+
+    /// Install the PoA genesis governance state while the chain is at
+    /// height 0 (every node of a network does this identically).
+    pub async fn init_consensus_genesis(
+        &self,
+        governance: crate::validator_governance::GovernanceState,
+        staking: crate::staking::StakingParams,
+    ) -> Result<()> {
+        let mut state = self.runtime.state.write().await;
+        if crate::chain_consensus::load(&state).is_some() {
+            return Ok(());
+        }
+        if self.get_latest_block().number > 0 {
+            anyhow::bail!(
+                "this chain has blocks but no on-chain governance state; it was created by an \
+                 older node version. Start the network from fresh state."
+            );
+        }
+        crate::chain_consensus::init_genesis(&mut state, governance, staking);
+        drop(state);
+        self.runtime.persist_state_if_configured().await;
+        Ok(())
+    }
+
+    /// Allow or forbid contract reads from outside the chain.
+    pub fn set_external_reads(&self, allowed: bool) {
+        self.runtime
+            .external_reads
+            .store(allowed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A transaction relayed by a peer. Returns whether it was new here.
+    pub async fn accept_gossiped_transaction(&self, tx: SwtchvmTransaction) -> Result<bool> {
+        self.add_pending_transaction(tx).await.map(|(_, new)| new)
+    }
+
+    /// Validate a transaction and add it to the pending pool, once.
+    ///
+    /// New transactions are published to `subscribe_new_transactions`, which
+    /// the P2P bridge relays to peers, so any authority can include a
+    /// transaction whichever node it was sent to.
+    async fn add_pending_transaction(&self, tx: SwtchvmTransaction) -> Result<([u8; 32], bool)> {
+        if tx.gas_limit == 0 || tx.gas_price == 0 {
+            return Err(anyhow::anyhow!("Invalid gas parameters"));
+        }
+        if crate::chain_consensus::is_consensus_tx(&tx) {
+            // Governance and staking messages carry their own SPHINCS+
+            // signatures; check them against the current chain state.
+            let msg = crate::chain_consensus::ConsensusMessage::from_transaction(&tx)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let now = unix_millis() / 1_000;
+            let state = self.runtime.state.read().await;
+            crate::chain_consensus::validate(&state, &msg, now).map_err(|e| anyhow::anyhow!(e))?;
+        } else {
+            // Reject bad signatures here rather than include them as failed
+            // transactions (and relay them to every peer).
+            self.runtime.verify_signature(&tx)?;
+            let account_nonce = self
+                .runtime
+                .state
+                .read()
+                .await
+                .get_account(&tx.from)
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            if tx.nonce < account_nonce {
+                return Err(anyhow::anyhow!(
+                    "Invalid nonce: {} is already used (account nonce {account_nonce})",
+                    tx.nonce
+                ));
+            }
+        }
+
+        let hash: [u8; 32] = Keccak256::digest(bincode::serialize(&tx)?).into();
+        {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            if chain.transactions_by_tx.contains_key(&hash) {
+                return Ok((hash, false));
+            }
+            if chain.pending_hashes.contains(&hash) {
+                return Ok((hash, false));
+            }
+            if chain.pending_transactions.len() >= MAX_PENDING_TRANSACTIONS {
+                return Err(anyhow::anyhow!("transaction pool is full"));
+            }
+            chain.pending_hashes.insert(hash);
+            chain.pending_transactions.push(tx.clone());
+        }
+        {
+            let mut since = self
+                .pending_since_ms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if since.is_none() {
+                *since = Some(unix_millis());
+            }
+        }
+        let _ = self.new_txs_tx.send(tx);
+        Ok((hash, true))
+    }
+
+    pub fn subscribe_new_transactions(&self) -> broadcast::Receiver<SwtchvmTransaction> {
+        self.new_txs_tx.subscribe()
+    }
+
+    /// Transactions waiting for a block.
+    pub fn pending_count(&self) -> usize {
+        self.chain
+            .read()
+            .expect("SwtchVM chain lock poisoned")
+            .pending_transactions
+            .len()
+    }
+
+    /// When the oldest pending transaction arrived (unix ms), if any.
+    pub fn pending_since_ms(&self) -> Option<u64> {
+        *self.pending_since_ms.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drop pending transactions a new block made obsolete (included, or
+    /// with a nonce the sender has already used), and reset the pending clock
+    /// when the pool is empty.
+    async fn prune_pending_after_block(&self, block: &SwtchvmBlock) {
+        let included: std::collections::HashSet<[u8; 32]> = block
+            .transactions
+            .iter()
+            .filter_map(|tx| bincode::serialize(tx).ok())
+            .map(|b| Keccak256::digest(b).into())
+            .collect();
+        let pending = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            std::mem::take(&mut chain.pending_transactions)
+        };
+        let mut keep = Vec::with_capacity(pending.len());
+        {
+            let state = self.runtime.state.read().await;
+            for tx in pending {
+                let hash: [u8; 32] = match bincode::serialize(&tx) {
+                    Ok(b) => Keccak256::digest(b).into(),
+                    Err(_) => continue,
+                };
+                let nonce = state.get_account(&tx.from).map(|a| a.nonce).unwrap_or(0);
+                if !included.contains(&hash) && tx.nonce >= nonce {
+                    keep.push((hash, tx));
+                }
+            }
+        }
+        let empty = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            // Keep anything that arrived while we pruned.
+            let arrived = std::mem::take(&mut chain.pending_transactions);
+            let mut hashes: std::collections::HashSet<[u8; 32]> =
+                keep.iter().map(|(h, _)| *h).collect();
+            let mut txs: Vec<SwtchvmTransaction> = keep.into_iter().map(|(_, tx)| tx).collect();
+            for tx in arrived {
+                if let Ok(b) = bincode::serialize(&tx) {
+                    hashes.insert(Keccak256::digest(b).into());
+                }
+                txs.push(tx);
+            }
+            chain.pending_transactions = txs;
+            chain.pending_hashes = hashes;
+            chain.pending_transactions.is_empty()
+        };
+        if empty {
+            *self.pending_since_ms.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    /// Block (`Some(reason)`) or allow (`None`) local block production.
+    /// Record a peer's announced head height (P2P bridge).
+    pub fn note_peer_head(&self, number: u64) {
+        self.peer_head_hint
+            .fetch_max(number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Highest head height any peer has announced so far.
+    pub fn peer_head_hint(&self) -> u64 {
+        self.peer_head_hint.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_faucet_blocked(&self, reason: Option<String>) {
+        *self
+            .faucet_blocked
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    }
+
+    /// Apply `SPACEKIT_GENESIS_ALLOC_FILE` while the chain is still at genesis.
+    ///
+    /// The file is `{ "accounts": [ { "address": "0x…", "balance": "123" } ] }`
+    /// (balance in base units, as a string or number). Every node of a network
+    /// must use the same file, like the PoA genesis file: the balances become
+    /// part of the genesis state that block 1 builds on. Accounts that already
+    /// hold a balance are left alone, so restarts are harmless.
+    pub async fn apply_genesis_alloc_from_env(&self) -> Result<usize> {
+        let Some(path) = std::env::var_os("SPACEKIT_GENESIS_ALLOC_FILE") else {
+            return Ok(0);
+        };
+        if self.get_latest_block().number > 0 {
+            return Ok(0);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("reading genesis alloc {}: {e}", std::path::Path::new(&path).display())
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&raw)?;
+        let accounts = json["accounts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("genesis alloc has no accounts array"))?;
+        let mut applied = 0;
+        {
+            let mut state = self.runtime.state.write().await;
+            for entry in accounts {
+                let address = entry["address"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("genesis alloc entry without address"))?;
+                let balance: u128 = match &entry["balance"] {
+                    serde_json::Value::String(s) => s.trim().parse()?,
+                    serde_json::Value::Number(n) => n
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("bad balance for {address}"))?
+                        .into(),
+                    _ => anyhow::bail!("genesis alloc entry {address} has no balance"),
+                };
+                let account = state.get_account_mut(&SwtchvmAddress::from_hex(address)?);
+                if account.balance == 0 {
+                    account.balance = balance;
+                    applied += 1;
+                }
+            }
+        }
+        self.runtime.persist_state_if_configured().await;
+        Ok(applied)
+    }
+
+    pub fn set_mining_blocked(&self, reason: Option<String>) {
+        *self
+            .mining_blocked
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
     }
 
     pub async fn mine_block(&self) -> Result<SwtchvmBlock> {
+        if let Some(reason) = self
+            .mining_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Err(anyhow::anyhow!("block production disabled on this node: {reason}"));
+        }
         let _mining_guard = self.mining_lock.lock().await;
         let (current_block, pending_transactions) = {
             let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
@@ -6059,13 +6625,32 @@ impl SwtchvmNode {
             let pending = std::mem::take(&mut chain.pending_transactions);
             (current, pending)
         };
+        let block_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            // Never step back from the parent (clock skew between producers).
+            .max(current_block.timestamp);
+        // Start this block's journal (its undo record) and apply the
+        // time-based consensus transitions every block begins with.
+        {
+            let mut state = self.runtime.state.write().await;
+            let _ = state.checkpoint();
+            crate::chain_consensus::begin_block(&mut state, block_timestamp);
+        }
+        let sra_before = self.sra_host.as_ref().map(|s| s.snapshot());
+        // Protocol system transactions (SRA reward settlement) lead the block.
+        let sra_plan = match &self.sra_host {
+            Some(sra) => {
+                let world = self.runtime.state.read().await;
+                Some(sra.plan_block(&world, current_block.number + 1, block_timestamp))
+            }
+            None => None,
+        };
         let mut new_block = SwtchvmBlock {
             number: current_block.number + 1,
             parent_hash: current_block.hash,
             hash: [0u8; 32],
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
+            timestamp: block_timestamp,
             gas_limit: 10_000_000,
             gas_used: 0,
             transactions: Vec::new(),
@@ -6073,6 +6658,7 @@ impl SwtchvmNode {
             state_root: [0u8; 32],
             compute_root: [0u8; 32],
             verkle_witness: None,
+            proposer_did: self.producer_did(),
         };
 
         // Execute pending transactions
@@ -6082,7 +6668,48 @@ impl SwtchvmNode {
         let mut receipts = Vec::new();
         let mut remaining_txs = Vec::new();
 
+        // System transactions first. They are not counted against the block
+        // gas limit and are always included, even if they revert, so that
+        // every node's block matches its own plan.
+        if let Some(plan) = &sra_plan {
+            for tx in &plan.system_txs {
+                let receipt = self
+                    .execute_block_system_tx(
+                        tx,
+                        new_block.number,
+                        new_block.timestamp,
+                        included_txs.len() as u64,
+                        &mut total_gas_used,
+                        &mut cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                included_txs.push(tx.clone());
+            }
+        }
+
+        let mut consensus_count = 0usize;
         for tx in pending_transactions {
+            // Governance and staking messages: applied in order, no gas.
+            if crate::chain_consensus::is_consensus_tx(&tx) {
+                if consensus_count >= crate::chain_consensus::MAX_CONSENSUS_TXS_PER_BLOCK {
+                    remaining_txs.push(tx);
+                    continue;
+                }
+                consensus_count += 1;
+                let receipt = self
+                    .execute_consensus_tx(
+                        &tx,
+                        new_block.number,
+                        new_block.timestamp,
+                        included_txs.len() as u64,
+                        cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                included_txs.push(tx);
+                continue;
+            }
             if total_gas_used + tx.gas_limit > new_block.gas_limit {
                 // Put back transaction for next block
                 remaining_txs.push(tx);
@@ -6164,9 +6791,11 @@ impl SwtchvmNode {
         new_block.receipts = receipts;
         new_block.gas_used = total_gas_used;
 
-        // Calculate state root (verkle-based if available, else legacy merkle)
-        let state = self.runtime.state.read().await;
-        new_block.state_root = state.state_root();
+        // Commit to the whole state; the journal since the block started is
+        // what undoes it.
+        let mut state = self.runtime.state.write().await;
+        let (state_root, undo) = state.checkpoint();
+        new_block.state_root = state_root;
 
         // Include verkle witness for stateless validation
         if state.verkle_tree.is_some() {
@@ -6180,22 +6809,18 @@ impl SwtchvmNode {
             });
         }
 
-        // Service Reward Accumulator (protocol emission credits for this block)
-        if let Some(sra) = &self.sra_host {
-            let txs = new_block.transactions.clone();
-            let rcpts = new_block.receipts.clone();
-            if let Err(e) = sra
-                .on_block_finalized(
-                    &self.runtime,
-                    new_block.number,
-                    new_block.timestamp,
-                    &txs,
-                    &rcpts,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, block = new_block.number, "SRA block processing failed");
-            }
+        drop(state);
+        // Service Reward Accumulator: adopt the settlement and record this
+        // block's service events for the current epoch.
+        if let (Some(sra), Some(plan)) = (&self.sra_host, sra_plan) {
+            sra.commit_block(
+                plan,
+                new_block.number,
+                new_block.proposer_did.as_deref(),
+                &new_block.transactions,
+                &new_block.receipts,
+            )
+            .await;
         }
 
         // Calculate block hash
@@ -6218,19 +6843,213 @@ impl SwtchvmNode {
             }
             chain.blockchain.push(new_block.clone());
         }
+        self.remember_undo(BlockUndo {
+            number: new_block.number,
+            hash: new_block.hash,
+            state: undo,
+            sra: sra_before,
+        });
 
         // Broadcast block if networking enabled
         if let Some(networking) = &self.networking {
             networking.broadcast_block(new_block.clone()).await?;
         }
+        self.prune_pending_after_block(&new_block).await;
         let _ = self.mined_blocks_tx.send(new_block.clone());
 
         Ok(new_block)
     }
 
+    /// Apply a governance or staking message (see `chain_consensus`). Pays no
+    /// gas; the receipt fails if the message is invalid at this point in the
+    /// chain, and `return_data` says what happened.
+    async fn execute_consensus_tx(
+        &self,
+        tx: &SwtchvmTransaction,
+        block_number: u64,
+        block_timestamp: u64,
+        tx_index: u64,
+        cumulative_gas_used: u128,
+    ) -> Result<SwtchvmReceipt> {
+        let tx_hash = Keccak256::digest(bincode::serialize(tx)?);
+        let outcome = match crate::chain_consensus::ConsensusMessage::from_transaction(tx) {
+            Ok(msg) => {
+                let mut state = self.runtime.state.write().await;
+                crate::chain_consensus::apply(&mut state, &msg, block_timestamp)
+            }
+            Err(e) => Err(e),
+        };
+        let (success, message) = match outcome {
+            Ok(summary) => (true, summary),
+            Err(error) => (false, error),
+        };
+        Ok(SwtchvmReceipt {
+            tx_hash: hex::encode(tx_hash),
+            tx_index,
+            block_number,
+            success,
+            gas_used: 0,
+            cumulative_gas_used,
+            logs: Vec::new(),
+            logs_bloom: logs_bloom_hex(&[]),
+            return_data: message.into_bytes(),
+            created_address: None,
+            tool_effects: Vec::new(),
+        })
+    }
+
+    /// The DID this node puts in blocks it produces (its sealing authority).
+    pub fn set_producer_did(&self, did: Option<String>) {
+        *self
+            .producer_did
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = did;
+    }
+
+    pub fn producer_did(&self) -> Option<String> {
+        self.producer_did
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn remember_undo(&self, undo: BlockUndo) {
+        let mut log = self.undo_log.lock().unwrap_or_else(|p| p.into_inner());
+        log.push_back(undo);
+        while log.len() > MAX_REORG_DEPTH {
+            log.pop_front();
+        }
+    }
+
+    /// How many recent blocks can be rolled back.
+    pub fn undo_depth(&self) -> usize {
+        self.undo_log.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Roll back the head block (fork choice). Its state changes, reward
+    /// accounting, receipts and seals-to-be are undone, and its user and
+    /// consensus transactions go back to the pending pool. Callers hold the
+    /// mining lock.
+    async fn rollback_head_locked(&self) -> Result<SwtchvmBlock> {
+        let head = self.get_latest_block();
+        if head.number == 0 {
+            return Err(anyhow::anyhow!("cannot roll back the genesis block"));
+        }
+        let undo = {
+            let mut log = self.undo_log.lock().unwrap_or_else(|p| p.into_inner());
+            match log.back() {
+                Some(u) if u.number == head.number && u.hash == head.hash => log.pop_back(),
+                _ => None,
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("block {} is beyond the rollback window", head.number)
+        })?;
+        {
+            let mut state = self.runtime.state.write().await;
+            state.revert(undo.state);
+        }
+        if let (Some(sra), Some(before)) = (&self.sra_host, undo.sra) {
+            sra.restore(before, head.number).await;
+        }
+        let requeue: Vec<SwtchvmTransaction> = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            chain.blockchain.pop();
+            let mut requeue = Vec::new();
+            for tx in &head.transactions {
+                if let Ok(bytes) = bincode::serialize(tx) {
+                    let hash: [u8; 32] = Keccak256::digest(bytes).into();
+                    chain.receipts_by_tx.remove(&hash);
+                    chain.transactions_by_tx.remove(&hash);
+                }
+                let system = self.sra_host.as_ref().is_some_and(|s| s.is_system_tx(tx));
+                if !system {
+                    requeue.push(tx.clone());
+                }
+            }
+            requeue
+        };
+        for tx in requeue {
+            // Re-admission re-checks nonces and signatures against the
+            // rolled-back state; anything no longer valid is dropped.
+            let _ = self.add_pending_transaction(tx).await;
+        }
+        self.runtime.persist_state_if_configured().await;
+        Ok(head)
+    }
+
+    /// Execute one protocol system transaction for a block being produced or
+    /// re-executed, returning its receipt. A failed system transaction still
+    /// yields a (failed) receipt so the block stays aligned with the plan.
+    async fn execute_block_system_tx(
+        &self,
+        tx: &SwtchvmTransaction,
+        block_number: u64,
+        block_timestamp: u64,
+        tx_index: u64,
+        total_gas_used: &mut u128,
+        cumulative_gas_used: &mut u128,
+    ) -> Result<SwtchvmReceipt> {
+        let context = SwtchvmContext {
+            caller: tx.from,
+            origin: tx.from,
+            gas_price: tx.gas_price,
+            gas_limit: tx.gas_limit,
+            gas_used: 0,
+            block_number,
+            block_timestamp,
+            value: tx.value,
+        };
+        let tx_hash = Keccak256::digest(bincode::serialize(tx)?);
+        let receipt = match self.runtime.execute_system_transaction(tx, context).await {
+            Ok(result) => {
+                *total_gas_used += result.gas_used;
+                *cumulative_gas_used += result.gas_used;
+                let logs = result.logs;
+                SwtchvmReceipt {
+                    tx_hash: hex::encode(tx_hash),
+                    tx_index,
+                    block_number,
+                    success: result.success,
+                    gas_used: result.gas_used,
+                    cumulative_gas_used: *cumulative_gas_used,
+                    logs_bloom: logs_bloom_hex(&logs),
+                    logs,
+                    return_data: result.return_data,
+                    created_address: result.created_address,
+                    tool_effects: result.tool_effects,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(block_number, %error, "SRA system transaction failed");
+                *total_gas_used += tx.gas_limit;
+                *cumulative_gas_used += tx.gas_limit;
+                SwtchvmReceipt {
+                    tx_hash: hex::encode(tx_hash),
+                    tx_index,
+                    block_number,
+                    success: false,
+                    gas_used: tx.gas_limit,
+                    cumulative_gas_used: *cumulative_gas_used,
+                    logs: Vec::new(),
+                    logs_bloom: logs_bloom_hex(&[]),
+                    return_data: Vec::new(),
+                    created_address: None,
+                    tool_effects: Vec::new(),
+                }
+            }
+        };
+        Ok(receipt)
+    }
+
     /// Validate and append a block received from a peer by deterministically re-executing every
     /// transaction against the local parent state. No peer-provided world state is trusted.
     pub async fn import_block(&self, chain_id: &str, proposed: SwtchvmBlock) -> Result<()> {
+        let _mining_guard = self.mining_lock.lock().await;
+        self.import_block_locked(chain_id, proposed).await
+    }
+
+    async fn import_block_locked(&self, chain_id: &str, proposed: SwtchvmBlock) -> Result<()> {
         if chain_id != self.chain_id {
             return Err(anyhow::anyhow!(
                 "chain id mismatch: local={} remote={}",
@@ -6238,7 +7057,6 @@ impl SwtchvmNode {
                 chain_id
             ));
         }
-        let _mining_guard = self.mining_lock.lock().await;
         let current = self.get_latest_block();
         if proposed.number <= current.number {
             if proposed.number == current.number && proposed.hash == current.hash {
@@ -6279,42 +7097,160 @@ impl SwtchvmNode {
             }
         }
 
-        let pre_state = self.runtime.state.read().await.clone();
+        // Start the block's journal and apply the time-based consensus
+        // transitions, exactly as the producer did. Every failure below undoes
+        // them.
+        {
+            let mut state = self.runtime.state.write().await;
+            let _ = state.checkpoint();
+            crate::chain_consensus::begin_block(&mut state, proposed.timestamp);
+        }
+        let sra_before = self.sra_host.as_ref().map(|s| s.snapshot());
         let digest_len = self
             .runtime
             .commit_tx_digests
             .lock()
             .map(|digests| digests.len())
             .unwrap_or(0);
-        let validation = self.reexecute_imported_block(&proposed).await;
-        if let Err(error) = validation {
-            *self.runtime.state.write().await = pre_state;
-            if let Ok(mut digests) = self.runtime.commit_tx_digests.lock() {
-                digests.truncate(digest_len);
+        match self.import_block_inner(&proposed).await {
+            Ok((sra_plan, undo)) => {
+                {
+                    let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+                    for (tx, receipt) in proposed.transactions.iter().zip(&proposed.receipts) {
+                        let tx_hash: [u8; 32] = Keccak256::digest(bincode::serialize(tx)?).into();
+                        chain.receipts_by_tx.insert(tx_hash, receipt.clone());
+                        chain.transactions_by_tx.insert(tx_hash, tx.clone());
+                    }
+                    chain.blockchain.push(proposed.clone());
+                }
+                if let (Some(sra), Some(plan)) = (&self.sra_host, sra_plan) {
+                    sra.commit_block(
+                        plan,
+                        proposed.number,
+                        proposed.proposer_did.as_deref(),
+                        &proposed.transactions,
+                        &proposed.receipts,
+                    )
+                    .await;
+                }
+                self.remember_undo(BlockUndo {
+                    number: proposed.number,
+                    hash: proposed.hash,
+                    state: undo,
+                    sra: sra_before,
+                });
+                self.prune_pending_after_block(&proposed).await;
+                self.runtime.persist_state_if_configured().await;
+                Ok(())
             }
-            self.runtime.persist_state_if_configured().await;
-            return Err(error);
-        }
-
-        {
-            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
-            for (tx, receipt) in proposed.transactions.iter().zip(&proposed.receipts) {
-                let tx_hash: [u8; 32] = Keccak256::digest(bincode::serialize(tx)?).into();
-                chain.receipts_by_tx.insert(tx_hash, receipt.clone());
-                chain.transactions_by_tx.insert(tx_hash, tx.clone());
+            Err(error) => {
+                {
+                    let mut state = self.runtime.state.write().await;
+                    let (_, journal) = state.checkpoint();
+                    state.revert(journal);
+                }
+                if let Ok(mut digests) = self.runtime.commit_tx_digests.lock() {
+                    digests.truncate(digest_len);
+                }
+                Err(error)
             }
-            chain.blockchain.push(proposed);
         }
-        self.runtime.persist_state_if_configured().await;
-        Ok(())
     }
 
-    async fn reexecute_imported_block(&self, proposed: &SwtchvmBlock) -> Result<()> {
+    /// Validate and re-execute an imported block on top of the current head
+    /// (after `begin_block`). Returns the SRA plan and the block's undo
+    /// journal; on error the caller reverts.
+    async fn import_block_inner(
+        &self,
+        proposed: &SwtchvmBlock,
+    ) -> Result<(
+        Option<crate::service_reward_accumulator::SraBlockPlan>,
+        super::state_commitment::StateJournal,
+    )> {
+        // The block must start with exactly the system transactions this node
+        // derives from its own chain state (SRA reward settlement).
+        let sra_plan = match &self.sra_host {
+            Some(sra) => {
+                let world = self.runtime.state.read().await;
+                Some(sra.plan_block(&world, proposed.number, proposed.timestamp))
+            }
+            None => None,
+        };
+        let system_count = sra_plan.as_ref().map(|p| p.system_txs.len()).unwrap_or(0);
+        if let Some(plan) = &sra_plan {
+            let prefix = proposed.transactions.get(..system_count).unwrap_or(&[]);
+            let same = prefix.len() == system_count
+                && prefix
+                    .iter()
+                    .zip(&plan.system_txs)
+                    .all(|(a, b)| bincode::serialize(a).ok() == bincode::serialize(b).ok());
+            if !same {
+                return Err(anyhow::anyhow!(
+                    "block {} system transactions do not match the local reward settlement \
+                     (expected {}, got a different prefix); governance or SRA state differs",
+                    proposed.number,
+                    system_count
+                ));
+            }
+        }
+        if let Some(sra) = &self.sra_host {
+            if proposed.transactions[system_count..]
+                .iter()
+                .any(|tx| sra.is_system_tx(tx))
+            {
+                return Err(anyhow::anyhow!("unplanned system transaction in block"));
+            }
+        }
+
+        let consensus_txs = proposed.transactions[system_count..]
+            .iter()
+            .filter(|tx| crate::chain_consensus::is_consensus_tx(tx))
+            .count();
+        if consensus_txs > crate::chain_consensus::MAX_CONSENSUS_TXS_PER_BLOCK {
+            return Err(anyhow::anyhow!("too many consensus transactions in block"));
+        }
+        self.reexecute_imported_block(proposed, system_count).await?;
+        let undo = self.runtime.state.write().await.checkpoint().1;
+        Ok((sra_plan, undo))
+    }
+
+    async fn reexecute_imported_block(
+        &self,
+        proposed: &SwtchvmBlock,
+        system_count: usize,
+    ) -> Result<()> {
         let mut receipts = Vec::with_capacity(proposed.transactions.len());
         let mut total_gas_used = 0u128;
         let mut cumulative_gas_used = 0u128;
 
         for (index, tx) in proposed.transactions.iter().enumerate() {
+            if index < system_count {
+                let receipt = self
+                    .execute_block_system_tx(
+                        tx,
+                        proposed.number,
+                        proposed.timestamp,
+                        index as u64,
+                        &mut total_gas_used,
+                        &mut cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                continue;
+            }
+            if crate::chain_consensus::is_consensus_tx(tx) {
+                let receipt = self
+                    .execute_consensus_tx(
+                        tx,
+                        proposed.number,
+                        proposed.timestamp,
+                        index as u64,
+                        cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                continue;
+            }
             if total_gas_used.saturating_add(tx.gas_limit) > proposed.gas_limit {
                 return Err(anyhow::anyhow!("transaction exceeds block gas limit"));
             }
@@ -6469,6 +7405,15 @@ impl SwtchvmNode {
             .expect("SwtchVM genesis block missing")
     }
 
+    /// All blocks from genesis (used to rebuild derived state on restart).
+    pub fn blocks(&self) -> Vec<SwtchvmBlock> {
+        self.chain
+            .read()
+            .expect("SwtchVM chain lock poisoned")
+            .blockchain
+            .clone()
+    }
+
     pub fn get_block_by_number(&self, number: u64) -> Option<SwtchvmBlock> {
         self.chain
             .read()
@@ -6477,6 +7422,188 @@ impl SwtchvmNode {
             .get(number as usize)
             .cloned()
     }
+
+    /// Fork-choice weight of a block: 2 when its proposer produced it on its
+    /// own first turn, 1 otherwise (a fallback producer, or no proposer).
+    fn block_weight(set: &crate::chain_consensus::ProducerSet, block: &SwtchvmBlock) -> u64 {
+        match block.proposer_did.as_deref() {
+            Some(did) if set.in_turn(block.number, did) => 2,
+            _ => 1,
+        }
+    }
+
+    /// Offer a sealed block that does not extend the head (a competing block,
+    /// or part of a competing branch). Its seal must already be verified.
+    ///
+    /// Fork choice: the branch with more weight wins (in-turn blocks weigh 2,
+    /// others 1); on equal weight the longer branch, then the lower tip hash.
+    /// The node switches by rolling back to the fork point (at most
+    /// [`MAX_REORG_DEPTH`] blocks) and importing the other branch; if any of
+    /// its blocks fails to import, the original branch is restored.
+    pub async fn offer_side_block<S: Clone + Send + Sync + 'static>(
+        &self,
+        chain_id: &str,
+        block: SwtchvmBlock,
+        seal: S,
+    ) -> Result<ForkOutcome<S>> {
+        if chain_id != self.chain_id {
+            return Err(anyhow::anyhow!("chain id mismatch"));
+        }
+        let _guard = self.mining_lock.lock().await;
+        let head = self.get_latest_block();
+        if let Some(ours) = self.get_block_by_number(block.number) {
+            if ours.hash == block.hash {
+                return Ok(ForkOutcome::Known);
+            }
+        }
+        let floor = head.number.saturating_sub(MAX_REORG_DEPTH as u64);
+        if block.number <= floor {
+            return Ok(ForkOutcome::TooDeep);
+        }
+        // Keep the block until its branch is complete.
+        {
+            let mut side = self.side_blocks.lock().unwrap_or_else(|p| p.into_inner());
+            side.retain(|_, (b, _)| b.number > floor);
+            if side.len() >= MAX_SIDE_BLOCKS {
+                return Ok(ForkOutcome::Ignored);
+            }
+            side.insert(block.hash, (block.clone(), std::sync::Arc::new(seal) as SideSeal));
+        }
+        // Walk back to our chain.
+        let mut branch = vec![block.clone()];
+        loop {
+            let first = branch.last().expect("non-empty");
+            if first.number == 0 {
+                return Ok(ForkOutcome::Ignored);
+            }
+            let parent_number = first.number - 1;
+            if self
+                .get_block_by_number(parent_number)
+                .is_some_and(|b| b.hash == first.parent_hash)
+            {
+                break;
+            }
+            let parent = self
+                .side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&first.parent_hash)
+                .map(|(b, _)| b.clone());
+            match parent {
+                Some(p) => branch.push(p),
+                None => {
+                    return Ok(ForkOutcome::NeedParent {
+                        from: parent_number.max(floor + 1),
+                        to: block.number,
+                    })
+                }
+            }
+        }
+        branch.reverse();
+        let fork_point = branch[0].number - 1;
+        let depth = (head.number - fork_point) as usize;
+        if depth > self.undo_depth() {
+            return Ok(ForkOutcome::TooDeep);
+        }
+        let set = self.producer_set(head.timestamp).await;
+        let side_weight: u64 = branch.iter().map(|b| Self::block_weight(&set, b)).sum();
+        let ours: Vec<SwtchvmBlock> = ((fork_point + 1)..=head.number)
+            .filter_map(|n| self.get_block_by_number(n))
+            .collect();
+        let our_weight: u64 = ours.iter().map(|b| Self::block_weight(&set, b)).sum();
+        let side_tip = branch.last().expect("non-empty");
+        let switch = (side_weight, side_tip.number, std::cmp::Reverse(side_tip.hash))
+            > (our_weight, head.number, std::cmp::Reverse(head.hash));
+        if !switch {
+            return Ok(ForkOutcome::Kept {
+                our_weight,
+                side_weight,
+            });
+        }
+
+        tracing::warn!(
+            fork_point,
+            depth,
+            our_weight,
+            side_weight,
+            "Switching to a heavier branch"
+        );
+        // Roll back our blocks, keeping them as a side branch to return to.
+        for _ in 0..depth {
+            let rolled = self.rollback_head_locked().await?;
+            self.side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(rolled.hash)
+                .or_insert_with(|| (rolled.clone(), std::sync::Arc::new(()) as SideSeal));
+        }
+        let mut imported = Vec::new();
+        let mut failure = None;
+        for b in &branch {
+            match self.import_block_locked(chain_id, b.clone()).await {
+                Ok(()) => imported.push(b.clone()),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            tracing::warn!(%error, "Heavier branch failed to import; restoring ours");
+            for _ in 0..imported.len() {
+                self.rollback_head_locked().await?;
+            }
+            for b in ours {
+                self.import_block_locked(chain_id, b).await?;
+            }
+            self.side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|h, _| !branch.iter().any(|b| &b.hash == h));
+            return Ok(ForkOutcome::Invalid(error.to_string()));
+        }
+        let seals: Vec<(SwtchvmBlock, S)> = {
+            let side = self.side_blocks.lock().unwrap_or_else(|p| p.into_inner());
+            imported
+                .iter()
+                .filter_map(|b| {
+                    side.get(&b.hash)
+                        .and_then(|(_, s)| s.clone().downcast::<S>().ok())
+                        .map(|s| (b.clone(), (*s).clone()))
+                })
+                .collect()
+        };
+        self.side_blocks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|h, _| !imported.iter().any(|b| &b.hash == h));
+        Ok(ForkOutcome::Reorged {
+            depth,
+            imported: seals,
+        })
+    }
+}
+
+type SideSeal = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+const MAX_SIDE_BLOCKS: usize = 1_024;
+
+/// What fork choice did with an offered block.
+#[derive(Debug)]
+pub enum ForkOutcome<S> {
+    /// Already in our chain.
+    Known,
+    /// Below the rollback window.
+    TooDeep,
+    /// Not kept (buffer full or unrelated).
+    Ignored,
+    /// Its branch is incomplete; ask peers for these heights.
+    NeedParent { from: u64, to: u64 },
+    /// Our branch is at least as heavy.
+    Kept { our_weight: u64, side_weight: u64 },
+    /// Switched to the offered branch.
+    Reorged { depth: usize, imported: Vec<(SwtchvmBlock, S)> },
+    /// The heavier branch had an invalid block; ours was restored.
+    Invalid(String),
 }
 
 // Simplified networking layer
@@ -8552,14 +9679,18 @@ mod tests {
         nonce: u64,
     ) -> serde_json::Value {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
-        let canonical = format!(
-            "{}|{}|{}|{}|{}",
-            hex::encode(from.as_bytes()),
-            to.map(|address| hex::encode(address.as_bytes()))
-                .unwrap_or_default(),
-            0u128,
-            nonce,
-            hex::encode(data),
+        let canonical = transaction_signing_payload(
+            1337,
+            &SwtchvmTransaction {
+                from,
+                to,
+                data: data.to_vec(),
+                gas_limit: 1_000_000,
+                gas_price: 1,
+                value: 0,
+                nonce,
+                signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+            },
         );
         let digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
         let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
@@ -8682,15 +9813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_swtchvm_basic_execution() -> Result<()> {
-        let mut node = SwtchvmNode::new(false, false).await?;
-
-        // Create test account
-        let addr = SwtchvmAddress::new([1u8; 20]);
-        {
-            let mut state = node.runtime.state.write().await;
-            let account = state.get_account_mut(&addr);
-            account.balance = 1_000_000;
-        }
+        let node = SwtchvmNode::new(false, false).await?;
 
         // Simple WASM that returns 42
         let code = wat::parse_str(
@@ -8703,20 +9826,13 @@ mod tests {
         "#,
         )?;
 
-        let tx = SwtchvmTransaction {
-            from: addr,
-            to: None,
-            data: code,
-            gas_limit: 100_000,
-            gas_price: 1,
-            value: 0,
-            nonce: 0,
-            signature: TransactionSignature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            },
-        };
+        // Unsigned transactions are refused at submission; sign this one.
+        let tx = signed_tx(code, 100_000, 0);
+        {
+            let mut state = node.runtime.state.write().await;
+            let account = state.get_account_mut(&tx.from);
+            account.balance = 10_000_000;
+        }
 
         let _hash = node.submit_transaction(tx).await?;
         let block = node.mine_block().await?;
@@ -8725,6 +9841,94 @@ mod tests {
         assert!(block.gas_used > 0);
 
         Ok(())
+    }
+
+    /// Two nodes produce competing blocks; the lighter one switches to the
+    /// heavier branch by rolling back, and ends up with the same state.
+    #[tokio::test]
+    async fn fork_choice_switches_to_the_heavier_branch() -> Result<()> {
+        let a = SwtchvmNode::new(false, false).await?;
+        let b = SwtchvmNode::new(false, false).await?;
+        let tx_a = signed_tx(b"on-a".to_vec(), 50_000, 0);
+        let tx_b = signed_tx(b"on-b".to_vec(), 50_000, 0);
+        for node in [&a, &b] {
+            node.set_account_balance(&tx_a.from, 10_000_000).await?;
+            node.set_account_balance(&tx_b.from, 10_000_000).await?;
+            // Balances set outside blocks: checkpoint them into the genesis state.
+            node.runtime.state.write().await.checkpoint();
+        }
+        a.submit_transaction(tx_a.clone()).await?;
+        let a1 = a.mine_block().await?;
+        b.submit_transaction(tx_b.clone()).await?;
+        let b1 = b.mine_block().await?;
+        let b2 = b.mine_block().await?;
+        assert_ne!(a1.hash, b1.hash);
+
+        // Height 1 alone: equal weight and length, lower hash decides.
+        let first = a.offer_side_block("spacekitvm-rs", b1.clone(), ()).await?;
+        let a_kept = matches!(first, ForkOutcome::Kept { .. });
+        assert!(a_kept || matches!(first, ForkOutcome::Reorged { .. }));
+        // The longer branch wins.
+        let second = a.offer_side_block("spacekitvm-rs", b2.clone(), ()).await?;
+        if a_kept {
+            match second {
+                ForkOutcome::Reorged { depth, imported } => {
+                    assert_eq!(depth, 1);
+                    assert_eq!(imported.len(), 2);
+                }
+                other => panic!("expected a reorg, got {other:?}"),
+            }
+        } else {
+            // Already on b's branch after the first offer; b2 extends it.
+            a.import_block("spacekitvm-rs", b2.clone()).await?;
+        }
+        assert_eq!(a.get_latest_block().hash, b2.hash);
+        assert_eq!(
+            a.runtime.state.read().await.state_root(),
+            b.runtime.state.read().await.state_root()
+        );
+        // a's own transaction went back to the pool.
+        assert_eq!(a.pending_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submitted_transactions_are_deduplicated_relayed_and_pruned() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let mut relayed = node.subscribe_new_transactions();
+        let tx = signed_tx(b"noop".to_vec(), 50_000, 0);
+        node.set_account_balance(&tx.from, 10_000_000_000).await?;
+
+        // An unsigned copy is refused before it reaches the pool.
+        let mut unsigned = tx.clone();
+        unsigned.signature.r = [0u8; 32];
+        unsigned.signature.s = [0u8; 32];
+        assert!(node.submit_transaction(unsigned).await.is_err());
+
+        assert!(node.pending_since_ms().is_none());
+        node.submit_transaction(tx.clone()).await?;
+        assert!(node.pending_since_ms().is_some());
+        assert_eq!(relayed.try_recv()?.nonce, 0);
+        // The same transaction from a peer is not new and not relayed again.
+        assert!(!node.accept_gossiped_transaction(tx.clone()).await?);
+        assert!(relayed.try_recv().is_err());
+        assert_eq!(node.pending_count(), 1);
+
+        node.mine_block().await?;
+        assert_eq!(node.pending_count(), 0);
+        assert!(node.pending_since_ms().is_none());
+        // Once included, it is neither pending nor accepted again.
+        assert!(node.accept_gossiped_transaction(tx).await.is_err_or_false());
+        Ok(())
+    }
+
+    trait IsErrOrFalse {
+        fn is_err_or_false(&self) -> bool;
+    }
+    impl IsErrOrFalse for Result<bool> {
+        fn is_err_or_false(&self) -> bool {
+            !matches!(self, Ok(true))
+        }
     }
 
     #[tokio::test]
@@ -8741,23 +9945,9 @@ mod tests {
             ..SraHostConfig::default()
         }));
 
-        let addr = SwtchvmAddress::from_hex("0x1111111111111111111111111111111111111111")?;
-        node.set_account_balance(&addr, 10_000_000_000).await?;
-
-        let tx = SwtchvmTransaction {
-            from: addr,
-            to: None,
-            data: b"noop".to_vec(),
-            gas_limit: 50_000,
-            gas_price: 1,
-            value: 0,
-            nonce: 0,
-            signature: TransactionSignature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            },
-        };
+        // Unsigned transactions are refused at submission; sign this one.
+        let tx = signed_tx(b"noop".to_vec(), 50_000, 0);
+        node.set_account_balance(&tx.from, 10_000_000_000).await?;
         node.submit_transaction(tx).await?;
         let block = node.mine_block().await?;
         assert_eq!(block.transactions.len(), 1);
@@ -8798,14 +9988,18 @@ mod tests {
             SwtchvmAddress::new(a)
         };
 
-        // `to` is None (contract creation), which canonicalises to an empty string.
-        let canonical = format!(
-            "{}||{}|{}|{}",
-            hex::encode(from.as_bytes()),
-            0u128,
+        let unsigned = SwtchvmTransaction {
+            from,
+            to: None,
+            data: data.clone(),
+            gas_limit,
+            gas_price: 10,
+            value: 0,
             nonce,
-            hex::encode(&data),
-        );
+            signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+        };
+        // SwtchvmNode::new uses chain id 1337 until set_chain_id.
+        let canonical = transaction_signing_payload(1337, &unsigned);
         let message_hash: [u8; 32] = {
             let mut h = Sha256::new();
             h.update(canonical.as_bytes());

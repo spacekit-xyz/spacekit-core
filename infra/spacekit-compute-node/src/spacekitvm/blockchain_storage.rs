@@ -469,6 +469,7 @@ mod tests {
             compute_root: [0u8; 32],
             receipts: vec![],
             verkle_witness: None,
+            proposer_did: None,
         };
 
         // Store block

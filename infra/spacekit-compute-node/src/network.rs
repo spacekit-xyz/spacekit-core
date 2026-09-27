@@ -74,6 +74,9 @@ pub enum P2PMessage {
     GovernanceProposal { signed_json: String },
     /// Signed governance vote ([`crate::validator_governance::SignedVote`] as JSON).
     GovernanceVote { signed_json: String },
+    /// A pending SwtchVM transaction, relayed so every authority can include
+    /// it whichever node it was submitted to.
+    SwtchvmTransaction { chain_id: String, tx_json: String },
 }
 
 // ─── Core types ─────────────────────────────────────────────────────────────
@@ -205,7 +208,7 @@ impl NetworkService {
         let node_id = format!("node_{}", Uuid::new_v4());
         let node_did = crate::quantum_security::quantum_did_utils::get_did(&identity);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (incoming_tx, _) = broadcast::channel(4096);
+        let (incoming_tx, _) = broadcast::channel(1024);
 
         let inner = Arc::new(RwLock::new(NetworkServiceInner {
             config,
@@ -626,6 +629,9 @@ impl NetworkService {
 struct SwtchvmWireBlock {
     chain_id: String,
     block: SwtchvmBlock,
+    /// Authority seal (proof of authority); absent on networks without authorities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seal: Option<crate::block_seal::BlockSeal>,
 }
 
 /// Bridge a SwtchVM node to the real TCP P2P service.
@@ -634,17 +640,157 @@ struct SwtchvmWireBlock {
 /// accepted only through [`SwtchvmNode::import_block`], which re-executes their transactions.
 /// Periodic head advertisements let nodes that connect after mining request missing blocks.
 pub fn start_swtchvm_bridge(vm: Arc<SwtchvmNode>, network: NetworkService) {
+    start_swtchvm_bridge_sealed(vm, network, None)
+}
+
+/// Catch-up bookkeeping for the bridge: blocks that arrived ahead of their
+/// parents, and the last range requested (so a burst of announcements or
+/// responses does not turn into a storm of identical requests).
+#[derive(Default)]
+struct CatchUp {
+    future: std::collections::BTreeMap<u64, SwtchvmWireBlock>,
+    requested: Option<(u64, u64, std::time::Instant)>,
+}
+
+const MAX_FUTURE_BLOCKS: u64 = 512;
+const REQUEST_SPAN: u64 = 32;
+
+impl CatchUp {
+    fn request(&mut self, network: &NetworkService, from: u64, to: u64) {
+        let to = to.min(from.saturating_add(REQUEST_SPAN - 1));
+        if let Some((f, t, at)) = self.requested {
+            if from >= f && to <= t && at.elapsed() < Duration::from_secs(3) {
+                return;
+            }
+        }
+        self.requested = Some((from, to, std::time::Instant::now()));
+        let _ = network.broadcast(P2PMessage::BlockRequest {
+            from_block: from,
+            to_block: to,
+        });
+    }
+}
+
+/// Import a peer's block, or hand it to fork choice when it does not extend
+/// our head. Blocks ahead of the head wait in `catch_up` until their parents
+/// arrive.
+async fn handle_wire_block(
+    vm: &Arc<SwtchvmNode>,
+    network: &NetworkService,
+    sealing: Option<&crate::block_seal::BlockSealing>,
+    catch_up: &mut CatchUp,
+    wire: SwtchvmWireBlock,
+    source: &str,
+) {
+    let mut queue = std::collections::VecDeque::from([wire]);
+    while let Some(wire) = queue.pop_front() {
+        let head = vm.get_latest_block();
+        catch_up.future.retain(|n, _| *n > head.number);
+        let block = wire.block;
+        let number = block.number;
+        if number > head.number + 1 {
+            if number <= head.number + MAX_FUTURE_BLOCKS {
+                catch_up.future.entry(number).or_insert(SwtchvmWireBlock {
+                    chain_id: wire.chain_id,
+                    block,
+                    seal: wire.seal,
+                });
+            }
+            let first_missing = head.number + 1;
+            let until = (first_missing..number)
+                .find(|n| catch_up.future.contains_key(n))
+                .map(|n| n - 1)
+                .unwrap_or(number - 1);
+            catch_up.request(network, first_missing, until);
+            continue;
+        }
+        let extends_head = number == head.number + 1 && block.parent_hash == head.hash;
+        // Seals are checked against the producer set of our head: exact for a
+        // block that extends it, the current set for a competing one.
+        let producers = vm.producer_set(block.timestamp.max(head.timestamp)).await;
+        if let Some(s) = sealing {
+            if let Err(error) = s.verify(&producers, wire.seal.as_ref(), &wire.chain_id, &block) {
+                debug!("Rejected {} SwtchVM block {}: {}", source, number, error);
+                continue;
+            }
+        }
+        if extends_head {
+            let hash = block.hash;
+            match vm.import_block(&wire.chain_id, block).await {
+                Ok(()) => {
+                    if let Some(s) = sealing {
+                        s.remember(number, &hash, wire.seal);
+                    }
+                    if let Some(next) = catch_up.future.remove(&(number + 1)) {
+                        queue.push_back(next);
+                    }
+                }
+                Err(error) => warn!("Rejected {} SwtchVM block {}: {}", source, number, error),
+            }
+            continue;
+        }
+        match vm.offer_side_block(&wire.chain_id, block, wire.seal.clone()).await {
+            Ok(crate::spacekitvm::swtchvm_node::ForkOutcome::NeedParent { from, to }) => {
+                catch_up.request(network, from, to);
+            }
+            Ok(crate::spacekitvm::swtchvm_node::ForkOutcome::Reorged { depth, imported }) => {
+                info!("Fork choice: switched branch, rolled back {} block(s)", depth);
+                if let Some(s) = sealing {
+                    for (b, seal) in imported {
+                        s.remember(b.number, &b.hash, seal);
+                    }
+                }
+                let head = vm.get_latest_block().number;
+                if let Some(next) = catch_up.future.remove(&(head + 1)) {
+                    queue.push_back(next);
+                }
+            }
+            Ok(crate::spacekitvm::swtchvm_node::ForkOutcome::Invalid(e)) => {
+                warn!("Competing branch rejected: {}", e);
+            }
+            Ok(_) => {}
+            Err(error) => debug!("Fork choice error on block {}: {}", number, error),
+        }
+    }
+}
+
+/// [`start_swtchvm_bridge`] with proof-of-authority block seals: locally mined
+/// blocks are sealed with this node's authority key, and peer blocks are
+/// imported only with a valid seal from a current or former authority.
+pub fn start_swtchvm_bridge_sealed(
+    vm: Arc<SwtchvmNode>,
+    network: NetworkService,
+    sealing: Option<Arc<crate::block_seal::BlockSealing>>,
+) {
     let mut mined = vm.subscribe_mined_blocks();
     let mut incoming = network.subscribe();
-    tokio::spawn(async move {
-        let mut head_interval = interval(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                local = mined.recv() => match local {
+    // Local blocks are sealed and announced in their own task, in order, so a
+    // slow SPHINCS+ signature never holds up importing peers' blocks.
+    {
+        let vm = vm.clone();
+        let network = network.clone();
+        let sealing = sealing.clone();
+        tokio::spawn(async move {
+            loop {
+                match mined.recv().await {
                     Ok(block) => {
+                        let started = std::time::Instant::now();
+                        let seal = match &sealing {
+                            Some(s) => s.seal_local(vm.chain_id(), block.number, block.hash).await,
+                            None => None,
+                        };
+                        let elapsed = started.elapsed();
+                        if seal.is_some() && elapsed > Duration::from_secs(1) {
+                            warn!(
+                                "Sealing block {} took {} ms; peers may produce a competing block",
+                                block.number,
+                                elapsed.as_millis()
+                            );
+                        }
                         let wire = SwtchvmWireBlock {
                             chain_id: vm.chain_id().to_string(),
                             block,
+                            seal,
                         };
                         match serde_json::to_string(&wire) {
                             Ok(block_json) => {
@@ -660,8 +806,55 @@ pub fn start_swtchvm_bridge(vm: Arc<SwtchvmNode>, network: NetworkService) {
                         warn!("SwtchVM P2P bridge lagged by {} locally mined blocks", skipped);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                },
+                }
+            }
+        });
+    }
+    // Relay transactions this node accepted (from its API or from a peer).
+    {
+        let vm = vm.clone();
+        let network = network.clone();
+        let mut new_txs = vm.subscribe_new_transactions();
+        tokio::spawn(async move {
+            loop {
+                match new_txs.recv().await {
+                    Ok(tx) => match serde_json::to_string(&tx) {
+                        Ok(tx_json) => {
+                            let _ = network.broadcast(P2PMessage::SwtchvmTransaction {
+                                chain_id: vm.chain_id().to_string(),
+                                tx_json,
+                            });
+                        }
+                        Err(error) => warn!("Failed to serialize SwtchVM transaction: {}", error),
+                    },
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("SwtchVM transaction relay lagged by {} transactions", skipped);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut head_interval = interval(Duration::from_secs(1));
+        let mut catch_up = CatchUp::default();
+        let mut answered: Option<(u64, u64, std::time::Instant)> = None;
+        loop {
+            tokio::select! {
                 message = incoming.recv() => match message {
+                    Ok(P2PMessage::SwtchvmTransaction { chain_id, tx_json }) => {
+                        if chain_id != vm.chain_id() {
+                            continue;
+                        }
+                        match serde_json::from_str::<crate::spacekitvm::SwtchvmTransaction>(&tx_json) {
+                            Ok(tx) => {
+                                if let Err(error) = vm.accept_gossiped_transaction(tx).await {
+                                    debug!("Ignored relayed SwtchVM transaction: {}", error);
+                                }
+                            }
+                            Err(error) => debug!("Ignored malformed relayed transaction: {}", error),
+                        }
+                    }
                     Ok(P2PMessage::SwtchvmChainHead { chain_id, block_number, block_hash }) => {
                         if chain_id != vm.chain_id() {
                             warn!("Ignoring SwtchVM head for foreign chain {}", chain_id);
@@ -669,28 +862,26 @@ pub fn start_swtchvm_bridge(vm: Arc<SwtchvmNode>, network: NetworkService) {
                         }
                         let local = vm.get_latest_block();
                         if block_number > local.number {
-                            let _ = network.broadcast(P2PMessage::BlockRequest {
-                                from_block: local.number + 1,
-                                to_block: block_number,
-                            });
+                            vm.note_peer_head(block_number);
+                            catch_up.request(&network, local.number + 1, block_number);
                         } else if block_number == local.number
                             && block_hash != hex::encode(local.hash)
                         {
-                            warn!("Rejecting forked SwtchVM head at height {}", block_number);
+                            // A competing head: fetch its recent blocks so
+                            // fork choice can compare the branches.
+                            debug!("Peer has a different head at height {}", block_number);
+                            catch_up.request(
+                                &network,
+                                local.number.saturating_sub(8).max(1),
+                                block_number,
+                            );
                         }
                     }
                     Ok(P2PMessage::SwtchvmBlockAnnounce { chain_id, block_json }) => {
                         match serde_json::from_str::<SwtchvmWireBlock>(&block_json) {
                             Ok(wire) if wire.chain_id == chain_id => {
-                                let local_height = vm.get_latest_block().number;
-                                if wire.block.number > local_height + 1 {
-                                    let _ = network.broadcast(P2PMessage::BlockRequest {
-                                        from_block: local_height + 1,
-                                        to_block: wire.block.number,
-                                    });
-                                } else if let Err(error) = vm.import_block(&chain_id, wire.block).await {
-                                    warn!("Rejected announced SwtchVM block: {}", error);
-                                }
+                                vm.note_peer_head(wire.block.number);
+                                handle_wire_block(&vm, &network, sealing.as_deref(), &mut catch_up, wire, "announced").await;
                             }
                             Ok(_) => warn!("Rejected SwtchVM block with inconsistent chain envelope"),
                             Err(error) => warn!("Rejected malformed SwtchVM block: {}", error),
@@ -698,13 +889,28 @@ pub fn start_swtchvm_bridge(vm: Arc<SwtchvmNode>, network: NetworkService) {
                     }
                     Ok(P2PMessage::BlockRequest { from_block, to_block }) => {
                         let head = vm.get_latest_block().number;
-                        let end = to_block.min(head).min(from_block.saturating_add(255));
+                        // Answer each range once per few seconds: every peer
+                        // sees every request, and responses go to everyone.
+                        if answered
+                            .as_ref()
+                            .is_some_and(|(f, t, at): &(u64, u64, std::time::Instant)| {
+                                from_block >= *f && to_block <= *t && at.elapsed() < Duration::from_secs(3)
+                            })
+                        {
+                            continue;
+                        }
+                        answered = Some((from_block, to_block, std::time::Instant::now()));
+                        let end = to_block.min(head).min(from_block.saturating_add(REQUEST_SPAN - 1));
                         if from_block <= end {
                             for number in from_block..=end {
                                 if let Some(block) = vm.get_block_by_number(number) {
+                                    let seal = sealing
+                                        .as_ref()
+                                        .and_then(|s| s.store.get(block.number, &block.hash));
                                     let wire = SwtchvmWireBlock {
                                         chain_id: vm.chain_id().to_string(),
                                         block,
+                                        seal,
                                     };
                                     if let Ok(block_json) = serde_json::to_string(&wire) {
                                         let _ = network.broadcast(P2PMessage::BlockResponse {
@@ -719,9 +925,7 @@ pub fn start_swtchvm_bridge(vm: Arc<SwtchvmNode>, network: NetworkService) {
                     Ok(P2PMessage::BlockResponse { block_number, block_json }) => {
                         match serde_json::from_str::<SwtchvmWireBlock>(&block_json) {
                             Ok(wire) if wire.block.number == block_number => {
-                                if let Err(error) = vm.import_block(&wire.chain_id, wire.block).await {
-                                    debug!("Ignored SwtchVM catch-up block {}: {}", block_number, error);
-                                }
+                                handle_wire_block(&vm, &network, sealing.as_deref(), &mut catch_up, wire, "catch-up").await;
                             }
                             Ok(_) => warn!("Rejected block response with mismatched height"),
                             Err(error) => warn!("Rejected malformed block response: {}", error),
@@ -911,17 +1115,18 @@ mod tests {
             address.copy_from_slice(&full[12..]);
             SwtchvmAddress::new(address)
         };
-        let to_hex = to
-            .as_ref()
-            .map(|address| hex::encode(address.as_bytes()))
-            .unwrap_or_default();
-        let canonical = format!(
-            "{}|{}|{}|{}|{}",
-            hex::encode(from.as_bytes()),
-            to_hex,
-            0u128,
-            nonce,
-            hex::encode(&data)
+        let canonical = crate::spacekitvm::transaction_signing_payload(
+            4242,
+            &SwtchvmTransaction {
+                from,
+                to,
+                data: data.clone(),
+                gas_limit: 1_000_000,
+                gas_price: 1,
+                value: 0,
+                nonce,
+                signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+            },
         );
         let prehash: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
         let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
