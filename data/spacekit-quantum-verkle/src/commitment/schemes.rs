@@ -835,18 +835,76 @@ fn sis_opening<P: WeeWuSisParams>(value: &[u8], aux: Option<&[u8]>) -> (Vec<u16>
 }
 
 fn sis_commit<P: WeeWuSisParams>(s: &[u16], e: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(P::N);
-    for row in 0..P::N {
-        let mut acc: u32 = 0;
-        for col in 0..P::N {
-            let a = sis_matrix_entry::<P>(row, col) as u32;
-            let sv = s[col] as u32;
-            acc = acc.wrapping_add(a.wrapping_mul(sv));
+    let n = P::N;
+    let mut out = Vec::with_capacity(n);
+    with_sis_matrix::<P>(|matrix| {
+        for row in 0..n {
+            let mut acc: u32 = 0;
+            let row_entries = &matrix[row * n..(row + 1) * n];
+            for (a, sv) in row_entries.iter().zip(s.iter()) {
+                acc = acc.wrapping_add((*a as u32).wrapping_mul(*sv as u32));
+            }
+            acc = acc.wrapping_add(e[row] as u32);
+            out.push((acc % (P::Q as u32)) as u16);
         }
-        acc = acc.wrapping_add(e[row] as u32);
-        out.push((acc % (P::Q as u32)) as u16);
-    }
+    });
     out
+}
+
+/// The public matrix `A` (row-major, `N x N`) for a parameter set.
+///
+/// Every entry is a Keccak hash of `(seed, params id, row, col)`, so deriving
+/// it costs `N^2` hashes (65,536 for `N = 256`). It used to be re-derived on
+/// every commitment, which made each tree write cost tens of milliseconds
+/// (seconds in debug builds). The matrix is a pure function of the parameter
+/// set, so it is derived once per process and reused.
+fn derive_sis_matrix<P: WeeWuSisParams>() -> Vec<u16> {
+    let n = P::N;
+    let mut matrix = Vec::with_capacity(n * n);
+    for row in 0..n {
+        for col in 0..n {
+            matrix.push(sis_matrix_entry::<P>(row, col));
+        }
+    }
+    matrix
+}
+
+#[cfg(feature = "std")]
+fn with_sis_matrix<P: WeeWuSisParams>(f: impl FnOnce(&[u16])) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // Generic functions cannot own a per-`P` static, so cache by params id.
+    // Entries are leaked on purpose: there are a handful of parameter sets
+    // and each matrix lives for the whole process.
+    static CACHE: OnceLock<Mutex<HashMap<(&'static str, usize, u16), &'static [u16]>>> =
+        OnceLock::new();
+    let key = (P::PARAMS_ID, P::N, P::Q);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .copied();
+    let matrix = match cached {
+        Some(m) => m,
+        None => {
+            // Derive outside the lock; a racing thread may derive it too, and
+            // both results are identical.
+            let derived: &'static [u16] = Box::leak(derive_sis_matrix::<P>().into_boxed_slice());
+            *cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(key)
+                .or_insert(derived)
+        }
+    };
+    f(matrix)
+}
+
+#[cfg(not(feature = "std"))]
+fn with_sis_matrix<P: WeeWuSisParams>(f: impl FnOnce(&[u16])) {
+    f(&derive_sis_matrix::<P>())
 }
 
 fn sis_commit_vector<P: WeeWuSisParams>(values: &[Vec<u8>], aux: Option<&[u8]>) -> Vec<u16> {
@@ -944,4 +1002,47 @@ fn params_blob_from_id(params_id: &str, n: u32, q: u16, eta: u16, hide: bool) ->
     out.extend_from_slice(&eta.to_be_bytes());
     out.push(hide as u8);
     out
+}
+
+#[cfg(test)]
+mod sis_matrix_cache_tests {
+    use super::*;
+
+    /// Rows checked against the original per-entry computation. The full
+    /// reference costs N^2 hashes per call, which is slow in debug builds.
+    const ROWS: usize = 12;
+
+    /// The original per-entry computation for the first `ROWS` rows.
+    fn sis_commit_uncached<P: WeeWuSisParams>(s: &[u16], e: &[u16]) -> Vec<u16> {
+        let mut out = Vec::with_capacity(ROWS);
+        for row in 0..ROWS {
+            let mut acc: u32 = 0;
+            for col in 0..P::N {
+                let a = sis_matrix_entry::<P>(row, col) as u32;
+                acc = acc.wrapping_add(a.wrapping_mul(s[col] as u32));
+            }
+            acc = acc.wrapping_add(e[row] as u32);
+            out.push((acc % (P::Q as u32)) as u16);
+        }
+        out
+    }
+
+    fn check<P: WeeWuSisParams>(value: &[u8]) {
+        let (s, e) = sis_opening::<P>(value, None);
+        let cached = sis_commit::<P>(&s, &e);
+        assert_eq!(cached.len(), P::N);
+        assert_eq!(&cached[..ROWS], sis_commit_uncached::<P>(&s, &e).as_slice());
+        // Second call hits the cache and must agree with the first.
+        assert_eq!(sis_commit::<P>(&s, &e), cached);
+    }
+
+    #[test]
+    fn cached_matrix_matches_reference_for_every_parameter_set() {
+        for value in [&b""[..], &[0xffu8; 32][..]] {
+            check::<Sis128B>(value);
+            check::<Sis128HB>(value);
+            check::<Sis192B>(value);
+            check::<Sis192HB>(value);
+        }
+    }
 }

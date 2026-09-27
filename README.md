@@ -11,6 +11,10 @@ required to build and operate SpaceKit networks.
 
 ## Repository organization
 
+![SpaceKit Core architecture: dependency-layered crate and module map](docs/spacekit-core-architecture.svg)
+
+> A layer may depend on anything below it, never above. Rendered from [`docs/spacekit-core-architecture.svg`](docs/spacekit-core-architecture.svg); see [Dependency direction](#dependency-direction) below.
+
 ```text
 spacekit-core/
 ├── consensus/

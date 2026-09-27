@@ -124,6 +124,11 @@ Two names matter — do not conflate them:
 
 Detail: [`spacekit-unified-consensus/README.md`](../../consensus/spacekit-unified-consensus/README.md).
 
+**Proof-of-authority bootstrap.** With `SPACEKIT_POA_GENESIS_FILE` set, a new network starts in
+proof of authority: the genesis authorities validate without stake, and the validator set changes
+only through signed governance proposals (`add_authority`, `remove_authority`). Authorities can
+vote to lift PoA (`lift_poa`) once there are at least 10 validators. See [`GOVERNANCE.md`](GOVERNANCE.md).
+
 ### Architecture
 
 Long-form: [`documentation/SPACEKIT_ARCHITECTURE.md`](documentation/SPACEKIT_ARCHITECTURE.md).
@@ -183,6 +188,8 @@ Example:
 | POST | `/v1/did/register` | **Development helper:** validates posted keys and returns a synthesized DID document in-process; **does not** replace an on-chain or production DID registry—wire [`SwtchvmRuntime`](src/spacekitvm/) / your registry before relying on it. |
 | POST | `/v1/payments/*` | Payment rails (see `spacekit-payments`) |
 | POST | `/v1/execute` | Execution intent (payments-aware) |
+| GET | `/v1/chain/status` | Head block, consensus mode, validator set, peers (public) |
+| GET/POST | `/v1/governance/*` | PoA authorities, proposals, and signed votes ([`GOVERNANCE.md`](GOVERNANCE.md)) |
 
 Full route list and handlers: [`documentation/BINARY_STANDALONE.md`](documentation/BINARY_STANDALONE.md).
 

@@ -20,6 +20,8 @@ const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpkgMetadata {
     pub app_id: String,
+    /// DIDs of valid `signatures/*.json` publisher signatures (see `crate::spkg_signature`).
+    pub signers: Vec<String>,
 }
 
 fn package_dir(data_dir: &Path, hash: &str) -> PathBuf {
@@ -107,6 +109,13 @@ fn read_entry(
 }
 
 /// Validate an SPKG in place without extracting any archive entry.
+/// `SPACEKIT_REQUIRE_SIGNED_PACKAGES=true` rejects uploads without a valid publisher signature.
+fn require_signed_packages() -> bool {
+    std::env::var("SPACEKIT_REQUIRE_SIGNED_PACKAGES")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 pub(crate) fn validate_spkg(bytes: &[u8]) -> Result<SpkgMetadata, String> {
     let mut archive =
         ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("invalid ZIP: {error}"))?;
@@ -273,7 +282,25 @@ pub(crate) fn validate_spkg(bytes: &[u8]) -> Result<SpkgMetadata, String> {
     if aggregate.finalize().as_slice() != expected_checksum {
         return Err("manifest checksum mismatch".to_string());
     }
-    Ok(SpkgMetadata { app_id })
+
+    // Publisher signatures: every JSON signature entry must verify.
+    let mut signature_names: Vec<&String> = entries
+        .keys()
+        .filter(|name| name.starts_with("signatures/") && name.ends_with(".json"))
+        .collect();
+    signature_names.sort();
+    let mut signers = Vec::with_capacity(signature_names.len());
+    for name in signature_names {
+        let &(index, size) = &entries[name];
+        if size > 64 * 1024 {
+            return Err(format!("signature entry too large: {name}"));
+        }
+        let data = read_entry(&mut archive, index, size)?;
+        let did = crate::spkg_signature::verify(&manifest_bytes, &data)
+            .map_err(|error| format!("invalid package signature {name}: {error}"))?;
+        signers.push(did);
+    }
+    Ok(SpkgMetadata { app_id, signers })
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {
@@ -387,6 +414,14 @@ async fn put_package(
             ));
         }
     };
+    if spkg.signers.is_empty() && require_signed_packages() {
+        return Ok(json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "error": "this node only accepts signed packages (signatures/publisher.json); package with `spacekit app package --sign-key`"
+            }),
+        ));
+    }
 
     let path = package_path(&data_dir, &hash);
     let existed = tokio::fs::metadata(&path).await.is_ok();
@@ -598,7 +633,7 @@ pub fn routes(
         .and(warp::any().map(move || put_data_dir.clone()))
         .and(warp::any().map(move || put_semaphore.clone()))
         .and(warp::any().map(move || auth_mode))
-        .and(warp::header::optional::<String>("authorization"))
+        .and(super::with_optional_auth_header())
         .and_then(put_package);
 
     // App aliases must be registered before the generic package hash routes.
@@ -700,7 +735,8 @@ mod tests {
         assert_eq!(
             validate_spkg(&package("index.html", payload, hash)),
             Ok(SpkgMetadata {
-                app_id: "0".repeat(64)
+                app_id: "0".repeat(64),
+                signers: Vec::new(),
             })
         );
     }

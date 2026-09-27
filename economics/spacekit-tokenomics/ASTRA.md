@@ -40,7 +40,7 @@ We have requested a separate written legal opinion from Withers Worldwide on AST
 
 SWTCH Labs has raised equity capital ($3M+ at $55M+ valuation floor) from accredited investors. The raise is equity in SWTCH Labs as a company. No portion of any equity raise is denominated in ASTRA. No investor is entitled to ASTRA tokens as part of their equity stake.
 
-**Not yield-bearing.** Holding ASTRA passively does not earn yield. There is no staking pool that pays interest. There is no lending mechanism. There is no liquidity mining. There is no inflation reward for passive holders. The only mechanism to acquire newly-emitted ASTRA is through operator service.
+**Not yield-bearing.** Holding ASTRA passively does not earn yield. There is no staking pool that pays interest. There is no lending mechanism. There is no liquidity mining, and SWTCH Labs does not seed liquidity: markets form only from ASTRA that operators earned. There is no inflation reward for passive holders. The only mechanism to acquire newly-emitted ASTRA is through operator service.
 
 Third-party DeFi protocols built on SpaceKit may exist and may create yield products denominated in ASTRA. These are not SWTCH Labs products and the SpaceKit protocol does not endorse or guarantee them.
 
@@ -60,7 +60,7 @@ The 2 billion cap is enforced at the protocol level. The protocol has no mechani
 
 ASTRA is emitted to operators through the **Service Reward Accumulator (SRA)**, which credits the **AstraRewards** on-chain contract per measured service. Emission follows a **4-year halving curve**: **200M ASTRA** in year 1, decaying toward an asymptotic **~1.15B** cumulative operator total under the 2B cap.
 
-**Genesis treasury: 350M ASTRA (17.5%)** is minted at protocol INIT (not subject to halving). **50M** bootstrap stake for initial validators is drawn from treasury, one-time with vesting.
+**Genesis treasury: 350M ASTRA (17.5%)** is minted at protocol INIT (not subject to halving). There is no bootstrap stake pool: nobody is given or lent ASTRA to stake, and nobody seeds markets. Validators stake only what they earned.
 
 Default annual category split: consensus **40%**, compute **30%**, storage **20%**, messaging **10%**. Governance may adjust shares within bounds; the **2B cap is not adjustable**.
 
@@ -79,6 +79,10 @@ Operators who want to participate in consensus validation must lock ASTRA as a s
 **Withdrawal delay.** When a validator wants to exit and reclaim their stake, there is a withdrawal delay (currently several days). The delay exists so that any misbehavior the validator may have committed in their final rounds has time to be detected and prosecuted before the stake is released.
 
 Specific staking parameters (minimum stake amount, slashing fractions, withdrawal delay) are protocol parameters set by governance. Current values are in the validator operations guide.
+
+**Bootstrap: proof of authority first.** A new network starts with a small set of authorities: known operators, including SWTCH Labs and invited partners, who validate without stake. New validators are admitted by a two-thirds vote of the authorities. Once the network has at least 10 validators, the authorities can vote to switch to proof of stake. Staking and stake-weighted governance start then.
+
+**Launch operators' rewards are locked.** Authorities earn the normal ASTRA for the service they provide, but anything they (or any SWTCH Labs–affiliated operator) earn during proof of authority is locked. It has a 12-month cliff from genesis, then vests linearly to month 36. Locked ASTRA can be staked but not sold or transferred. Details: [Tokenomics §1.11](./SpaceKit_Tokenomics.md).
 
 ## Governance
 
@@ -148,7 +152,7 @@ For operators interested in earning ASTRA, the path is:
 
 3. **Register on-chain.** Your node registers with the SpaceKit protocol announcing the services you provide. Registration is permissionless and DID-keyed.
 
-4. **For validation only: stake ASTRA.** If you're running a validator node, you'll need to lock ASTRA as a security deposit before participating in consensus. (Note: this is a chicken-and-egg problem in the network's earliest days — initial validators are provisioned with ASTRA from the protocol treasury allocation. Once the network has been operating, operators who have earned ASTRA through other service categories can convert their earnings to validator stake.)
+4. **For validation only: get admitted or stake ASTRA.** While the network is in proof of authority (fewer than 10 validators), validators are admitted by a vote of the existing authorities, with no stake; apply through [spacekit.xyz](https://spacekit.xyz/contact). After the switch to proof of stake, you lock ASTRA you earned as a security deposit. Run a compute, storage or messaging node to earn it; there is no stake lending or delegation.
 
 5. **Provide service.** Run your node, serve the requests assigned to it, and earn ASTRA proportional to your measured contribution. Rewards accrue continuously and are credited to your DID's balance on a regular cadence.
 

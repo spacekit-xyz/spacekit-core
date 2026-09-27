@@ -1,4 +1,6 @@
 export type {
+  AppCredentialRequest,
+  AppCredentials,
   AppManifest,
   AppPackageJSON,
   ContentRef,
@@ -6,11 +8,13 @@ export type {
   EmbedHostServices,
   EmbedShimConfig,
   EmbeddedFetchResult,
+  EmbeddedHttpContext,
   EmbeddedHttpHandler,
   HttpBridgeHost,
   LoadedWebPackage,
   MarketplacePurchaseRecord,
   SubscriptionPaymentRequest,
+  SubscriptionRecordRequest,
   SubscriptionPaymentResult,
   SubscriptionStatus,
 } from "./types.js";
@@ -59,11 +63,18 @@ export {
   loadWebPackageFromLocal,
   revokeLoadedWebPackage,
   loadVerifiedPackageFiles,
+  verifyLocalPackageFiles,
   type LoadWebPackageOptions,
   type VerifiedPackageFile,
   type VerifiedWebPackageFiles,
 } from "./packageLoader.js";
 
+/**
+ * @deprecated Serves apps from the host origin, which gives them the host's
+ * storage and session. Isolated hosts (`mountSpacekitApp`, `SpacekitAppFrame`)
+ * no longer use it; kept for hosts that still run `isolation: "unsafe-same-origin"`
+ * apps through their own frame code.
+ */
 export {
   createSpacekitServiceWorkerLoader,
   spacekitServiceWorkerLoader,
@@ -88,3 +99,75 @@ export {
 export { injectSdkBridgeIntoHtml } from "./injectShim.js";
 
 export { decodeContentRef, isDecodableCompression } from "./decompress.js";
+
+// --- Isolated app host (protocol v1) ---
+export {
+  mountSpacekitApp,
+  resolveAppOrigin,
+  type AppMountState,
+  type AppTrustInfo,
+  type IsolationMode,
+  type MountSpacekitAppOptions,
+  type PermissionRequest,
+  type SpacekitAppHandle,
+  type TrustPolicy,
+  type VerifiedFilesLoader,
+} from "./host.js";
+
+export {
+  CapabilityError,
+  allowPublishers,
+  requireSignedPackages,
+  type AllowPublishersOptions,
+  createCapabilityGuard,
+  defaultTrustedOrigins,
+  parseManifestPermissions,
+  permissionPolicyFeatures,
+  requiredCapability,
+  type CapabilityGuard,
+  type CapabilityGuardOptions,
+  type CapabilityPolicy,
+  type DeclaredPermissions,
+  type NetworkPolicy,
+} from "./capabilities.js";
+
+export {
+  buildOpaqueBootstrapHtml,
+  renderFrameHostHtml,
+  type FrameBootstrapConfig,
+  type FrameHostHtmlOptions,
+} from "./frameBootstrap.js";
+
+export { buildFramePayload, findHtmlEntryPath, type FramePayload, type FramePayloadOptions } from "./framePayload.js";
+
+export {
+  FRAME_ERROR,
+  FRAME_LOAD,
+  FRAME_READY,
+  LOCAL_STORAGE_SHIM_PREFIX,
+  SPACEKIT_EMBED_PROTOCOL_VERSION,
+  type FrameErrorMessage,
+  type FrameLoadFile,
+  type FrameLoadMessage,
+  type FrameReadyMessage,
+  type PortCallMessage,
+  type PortHostMessage,
+} from "./protocol.js";
+
+export {
+  createStorageAuthClient,
+  createSubscriptionRecorder,
+  websiteStorageSession,
+  type StorageAuthClient,
+  type StorageAuthClientOptions,
+  type StorageSession,
+  type StorageSignatureAlgorithm,
+  type StorageSigner,
+} from "./storageAuth.js";
+
+export {
+  ed25519KeyMatchesDid,
+  verifyPackageSignature,
+  type PackageSignature,
+  type PackageSignatureStatus,
+} from "./spkgSignature.js";

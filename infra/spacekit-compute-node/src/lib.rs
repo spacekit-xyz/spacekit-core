@@ -280,7 +280,11 @@ pub mod keymaster;
 pub mod consensus_coordinator;
 #[cfg(feature = "spacetime-consensus")]
 pub use consensus_coordinator::CoordinatorRoundSnapshot;
-pub use consensus_coordinator::{ConsensusCoordinator, FinalityStatus};
+pub use consensus_coordinator::{ConsensusCoordinator, FinalityStatus, ValidatorAdmission};
+
+// Proof-of-authority bootstrap: authority set, signed proposals and votes
+pub mod validator_governance;
+pub use validator_governance::{ConsensusMode, ValidatorGovernance};
 
 /// Subscriber sync bundle + L1 manifest merge for operator HTTP / proposals.
 pub mod subscriber_sync;

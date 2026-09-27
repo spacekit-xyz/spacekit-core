@@ -1,0 +1,285 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1364" viewBox="0 0 1680 1364" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+<defs>
+<filter id="cardShadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="1" stdDeviation="1.4" flood-color="#0F172A" flood-opacity="0.10"/></filter>
+<filter id="bandShadow" x="-5%" y="-10%" width="110%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#0F172A" flood-opacity="0.07"/></filter>
+</defs>
+<rect x="0" y="0" width="1680" height="1364" fill="#FBFBFD"/>
+<text x="36" y="52" font-size="30" font-weight="700" fill="#0F172A">SpaceKit&#160;Core &#8212; Architecture</text>
+<text x="36" y="80" font-size="14.5" fill="#475569">Dependency-layered crate &amp; module map of the <tspan font-family="ui-monospace, Menlo, Consolas, monospace" fill="#334155">spacekit-core</tspan> monorepo. A layer may depend on anything below it, never above.</text>
+<text x="36" y="100" font-size="12" fill="#94A3B8">Crate names shown without the <tspan font-family="ui-monospace, Menlo, Consolas, monospace">spacekit-</tspan> prefix (e.g. primitives = spacekit-primitives). Hover any card for its full path. © 2026 SWTCH Labs LLC.</text>
+<rect x="1394" y="24" width="250" height="138" rx="9" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="1408" y="44" font-size="11" font-weight="700" fill="#334155" letter-spacing="0.4">LEGEND</text>
+<rect x="1410" y="53" width="14" height="11" rx="2.5" fill="#DE7A2B"/>
+<text x="1434" y="62" font-size="11.5" fill="#475569">Rust (default — left bar)</text>
+<rect x="1410" y="71" width="14" height="11" rx="2.5" fill="#2563EB"/>
+<text x="1434" y="80" font-size="11.5" fill="#475569">TypeScript</text>
+<rect x="1410" y="89" width="14" height="11" rx="2.5" fill="#7C3AED"/>
+<text x="1434" y="98" font-size="11.5" fill="#475569">wasm32 target</text>
+<path d="M1417 106.5 L1423 112.5 L1417 118.5 L1411 112.5 Z" fill="#0891B2"/>
+<text x="1434" y="116" font-size="11.5" fill="#475569">nested Cargo workspace</text>
+<text x="1410" y="134" font-size="13" font-weight="700" fill="#64748B">→</text>
+<text x="1434" y="134" font-size="11.5" fill="#475569">→ package name differs</text>
+<defs><marker id="depArrow" markerWidth="10" markerHeight="10" refX="5" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#94A3B8"/></marker></defs>
+<line x1="52" y1="188" x2="52" y2="1282" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#depArrow)"/>
+<text x="46" y="735.0" font-size="11.5" font-weight="600" fill="#94A3B8" transform="rotate(-90 46 735.0)" text-anchor="middle">dependencies point downward</text>
+<rect x="206" y="180" width="1438" height="164" rx="14" fill="#FEF2F2" stroke="#FCA5A5" filter="url(#bandShadow)"/>
+<rect x="206" y="180" width="6" height="164" rx="3" fill="#EF4444"/>
+<text x="80" y="210" font-size="22" font-weight="800" fill="#B91C1C">L5</text>
+<text x="80" y="232" font-size="12.5" font-weight="600" fill="#475569">Control plane &amp;</text>
+<text x="80" y="248" font-size="12.5" font-weight="600" fill="#475569">operations</text>
+<rect x="80" y="262" width="96" height="18" rx="9" fill="#FFFFFF" stroke="#FCA5A5"/>
+<text x="128.0" y="275" font-size="10.5" font-weight="600" fill="#B91C1C" text-anchor="middle">uses L1–L4</text>
+<rect x="710.0" y="202" width="200" height="120" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="724.0" y="224" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">tools/</text>
+<text x="724.0" y="238" font-size="10.3" fill="#94A3B8">operator &amp; developer control-plane app</text>
+<g filter="url(#cardShadow)"><title>tools/spacekit-cli — package name: spacekit</title>
+<rect x="724.0" y="256" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="724.0" y="256" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="738.0" y="280" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">cli</text>
+<text x="738.0" y="296" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">→ spacekit</text>
+</g>
+<rect x="940.0" y="202" width="200" height="120" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="954.0" y="224" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">operations/</text>
+<text x="954.0" y="238" font-size="10.3" fill="#94A3B8">runbooks, incident procedures, fixtures</text>
+<g filter="url(#cardShadow)"><title>operations/spacekit-runbook</title>
+<rect x="954.0" y="256" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="954.0" y="256" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="968.0" y="287" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">runbook</text>
+</g>
+<rect x="206" y="370" width="1438" height="226" rx="14" fill="#FFF7ED" stroke="#FDBA74" filter="url(#bandShadow)"/>
+<rect x="206" y="370" width="6" height="226" rx="3" fill="#F97316"/>
+<text x="80" y="400" font-size="22" font-weight="800" fill="#C2410C">L4</text>
+<text x="80" y="422" font-size="12.5" font-weight="600" fill="#475569">Infrastructure</text>
+<text x="80" y="438" font-size="12.5" font-weight="600" fill="#475569">services</text>
+<rect x="80" y="452" width="96" height="18" rx="9" fill="#FFFFFF" stroke="#FDBA74"/>
+<text x="128.0" y="465" font-size="10.5" font-weight="600" fill="#C2410C" text-anchor="middle">uses L1–L3</text>
+<rect x="643.0" y="392" width="564" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="657.0" y="414" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">infra/</text>
+<text x="657.0" y="428" font-size="10.3" fill="#94A3B8">network service nodes (deployables)</text>
+<g filter="url(#cardShadow)"><title>infra/spacekit-compute-node — Layer-1 validator, SwtchVM (Wasmtime)</title>
+<rect x="657.0" y="446" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="657.0" y="446" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="671.0" y="470" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">compute-node</text>
+<text x="671.0" y="486" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">L1 · SwtchVM</text>
+</g>
+<g filter="url(#cardShadow)"><title>infra/spacekit-storage-node — durable artifact &amp; agent data plane</title>
+<rect x="839.0" y="446" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="839.0" y="446" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="853.0" y="470" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">storage-node</text>
+<text x="853.0" y="486" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">CAS · facts</text>
+</g>
+<g filter="url(#cardShadow)"><title>infra/spacekit-messaging-node — quantum-resistant P2P messaging</title>
+<rect x="1021.0" y="446" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1021.0" y="446" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="1035.0" y="470" font-size="12.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">messaging-node</text>
+<text x="1035.0" y="486" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">P2P</text>
+</g>
+<g filter="url(#cardShadow)"><title>infra/spacekit-gateway — proxies stdio MCP backends</title>
+<rect x="657.0" y="508" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="657.0" y="508" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="671.0" y="532" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">gateway</text>
+<text x="671.0" y="548" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">MCP proxy</text>
+</g>
+<g filter="url(#cardShadow)"><title>infra/spacekit-keymaster — nested workspace</title>
+<rect x="839.0" y="508" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="839.0" y="508" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="853.0" y="539" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">keymaster</text>
+<path d="M997.0 540.5 L1002.5 546 L997.0 551.5 L991.5 546 Z" fill="#0891B2"/>
+</g>
+<g filter="url(#cardShadow)"><title>infra/spacekit-pay — TypeScript</title>
+<rect x="1021.0" y="508" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1021.0" y="508" width="5" height="52" rx="2.5" fill="#2563EB"/>
+<text x="1035.0" y="539" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">pay</text>
+<rect x="1151.0" y="516" width="34" height="16" rx="8" fill="#E2ECFE"/>
+<text x="1168.0" y="527.6" font-size="9.3" font-weight="700" fill="#1D4ED8" text-anchor="middle">TS</text>
+</g>
+<rect x="206" y="622" width="1438" height="226" rx="14" fill="#EEF2FF" stroke="#A5B4FC" filter="url(#bandShadow)"/>
+<rect x="206" y="622" width="6" height="226" rx="3" fill="#6366F1"/>
+<text x="80" y="652" font-size="22" font-weight="800" fill="#4338CA">L3</text>
+<text x="80" y="674" font-size="12.5" font-weight="600" fill="#475569">Protocols ·</text>
+<text x="80" y="690" font-size="12.5" font-weight="600" fill="#475569">Economics · SDKs</text>
+<text x="80" y="706" font-size="12.5" font-weight="600" fill="#475569">· Runtimes</text>
+<rect x="80" y="720" width="96" height="18" rx="9" fill="#FFFFFF" stroke="#A5B4FC"/>
+<text x="128.0" y="733" font-size="10.5" font-weight="600" fill="#4338CA" text-anchor="middle">uses L1–L2</text>
+<rect x="298.0" y="644" width="200" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="312.0" y="666" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">consensus/</text>
+<text x="312.0" y="680" font-size="10.3" fill="#94A3B8">consensus algorithms &amp; extensions</text>
+<g filter="url(#cardShadow)"><title>consensus/spacekit-spacetime-consensus — Cl(1,3) rotors, fraud proofs; augments PBFT</title>
+<rect x="312.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="312.0" y="698" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="326.0" y="729" font-size="11.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">spacetime-consensus</text>
+</g>
+<g filter="url(#cardShadow)"><title>consensus/spacekit-unified-consensus — reputation-weighted facade</title>
+<rect x="312.0" y="760" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="312.0" y="760" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="326.0" y="791" font-size="11.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">unified-consensus</text>
+</g>
+<rect x="528.0" y="644" width="382" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="542.0" y="666" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">economics/</text>
+<text x="542.0" y="680" font-size="10.3" fill="#94A3B8">payments, routing, rewards, tokenomics</text>
+<g filter="url(#cardShadow)"><title>economics/spacekit-payments — FeeRouter, x402, vault</title>
+<rect x="542.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="542.0" y="698" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="556.0" y="729" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">payments</text>
+</g>
+<g filter="url(#cardShadow)"><title>economics/spacekit-service-rewards — SRA</title>
+<rect x="724.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="724.0" y="698" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="738.0" y="729" font-size="12.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">service-rewards</text>
+</g>
+<g filter="url(#cardShadow)"><title>economics/routekit — routing</title>
+<rect x="542.0" y="760" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="542.0" y="760" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="556.0" y="791" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">routekit</text>
+</g>
+<g filter="url(#cardShadow)"><title>economics/spacekit-tokenomics — TypeScript</title>
+<rect x="724.0" y="760" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="724.0" y="760" width="5" height="52" rx="2.5" fill="#2563EB"/>
+<text x="738.0" y="791" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">tokenomics</text>
+<rect x="854.0" y="768" width="34" height="16" rx="8" fill="#E2ECFE"/>
+<text x="871.0" y="779.6" font-size="9.3" font-weight="700" fill="#1D4ED8" text-anchor="middle">TS</text>
+</g>
+<rect x="940.0" y="644" width="382" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="954.0" y="666" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">sdks/</text>
+<text x="954.0" y="680" font-size="10.3" fill="#94A3B8">contract SDK, reusable contracts, dev APIs</text>
+<g filter="url(#cardShadow)"><title>sdks/spacekit-contract-sdk — no_std SDK; nested workspace</title>
+<rect x="954.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="954.0" y="698" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="968.0" y="729" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">contract-sdk</text>
+<path d="M1112.0 730.5 L1117.5 736 L1112.0 741.5 L1106.5 736 Z" fill="#0891B2"/>
+</g>
+<g filter="url(#cardShadow)"><title>sdks/spacekit-standard-library — reusable contracts; nested workspace</title>
+<rect x="1136.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1136.0" y="698" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="1150.0" y="729" font-size="12.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">standard-library</text>
+<path d="M1294.0 730.5 L1299.5 736 L1294.0 741.5 L1288.5 736 Z" fill="#0891B2"/>
+</g>
+<g filter="url(#cardShadow)"><title>sdks/spacekit-sdk — @spacekit/sdk; TypeScript</title>
+<rect x="954.0" y="760" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="954.0" y="760" width="5" height="52" rx="2.5" fill="#2563EB"/>
+<text x="968.0" y="791" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">sdk</text>
+<rect x="1084.0" y="768" width="34" height="16" rx="8" fill="#E2ECFE"/>
+<text x="1101.0" y="779.6" font-size="9.3" font-weight="700" fill="#1D4ED8" text-anchor="middle">TS</text>
+</g>
+<g filter="url(#cardShadow)"><title>sdks/spacekit-apps — TypeScript</title>
+<rect x="1136.0" y="760" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1136.0" y="760" width="5" height="52" rx="2.5" fill="#2563EB"/>
+<text x="1150.0" y="791" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">apps</text>
+<rect x="1266.0" y="768" width="34" height="16" rx="8" fill="#E2ECFE"/>
+<text x="1283.0" y="779.6" font-size="9.3" font-weight="700" fill="#1D4ED8" text-anchor="middle">TS</text>
+</g>
+<rect x="1352.0" y="644" width="200" height="120" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="1366.0" y="666" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">runtimes/</text>
+<text x="1366.0" y="680" font-size="10.3" fill="#94A3B8">execute contracts off-node (L2)</text>
+<g filter="url(#cardShadow)"><title>runtimes/spacekit-js — L2 VM &amp; dApp SDK; TypeScript</title>
+<rect x="1366.0" y="698" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1366.0" y="698" width="5" height="52" rx="2.5" fill="#2563EB"/>
+<text x="1380.0" y="722" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">js</text>
+<text x="1380.0" y="738" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">@spacekit/spacekit-js</text>
+<rect x="1496.0" y="706" width="34" height="16" rx="8" fill="#E2ECFE"/>
+<text x="1513.0" y="717.6" font-size="9.3" font-weight="700" fill="#1D4ED8" text-anchor="middle">TS</text>
+</g>
+<rect x="206" y="874" width="1438" height="226" rx="14" fill="#ECFDF5" stroke="#6EE7B7" filter="url(#bandShadow)"/>
+<rect x="206" y="874" width="6" height="226" rx="3" fill="#10B981"/>
+<text x="80" y="904" font-size="22" font-weight="800" fill="#047857">L2</text>
+<text x="80" y="926" font-size="12.5" font-weight="600" fill="#475569">Domain libraries</text>
+<rect x="80" y="940" width="72" height="18" rx="9" fill="#FFFFFF" stroke="#6EE7B7"/>
+<text x="116.0" y="953" font-size="10.5" font-weight="600" fill="#047857" text-anchor="middle">uses L1</text>
+<rect x="231.0" y="896" width="564" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="245.0" y="918" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">data/</text>
+<text x="245.0" y="932" font-size="10.3" fill="#94A3B8">repo semantics, diffing, compression, state integrity</text>
+<g filter="url(#cardShadow)"><title>data/spacekit-repo</title>
+<rect x="245.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="245.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="259.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">repo</text>
+</g>
+<g filter="url(#cardShadow)"><title>data/spacekit-diff</title>
+<rect x="427.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="427.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="441.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">diff</text>
+</g>
+<g filter="url(#cardShadow)"><title>data/spacekit-compressor — shared by storage, messaging, AI</title>
+<rect x="609.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="609.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="623.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">compressor</text>
+</g>
+<g filter="url(#cardShadow)"><title>data/spacekit-quantum-verkle — package: spacekit-quantum-verkle-tree; + wasm child</title>
+<rect x="245.0" y="1012" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="245.0" y="1012" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="259.0" y="1036" font-size="12.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">quantum-verkle</text>
+<text x="259.0" y="1052" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">→ …-verkle-tree</text>
+</g>
+<g filter="url(#cardShadow)"><title>data/spacekit-mempool</title>
+<rect x="427.0" y="1012" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="427.0" y="1012" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="441.0" y="1043" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">mempool</text>
+</g>
+<g filter="url(#cardShadow)"><title>data/spacekit-memsearcher</title>
+<rect x="609.0" y="1012" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="609.0" y="1012" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="623.0" y="1043" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">memsearcher</text>
+</g>
+<rect x="825.0" y="896" width="564" height="182" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="839.0" y="918" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">identity/</text>
+<text x="839.0" y="932" font-size="10.3" fill="#94A3B8">DID create/verify, bridges, browser identity</text>
+<g filter="url(#cardShadow)"><title>identity/spacekit-did — QuantumResistantWallet, VC helpers</title>
+<rect x="839.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="839.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="853.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">did</text>
+</g>
+<g filter="url(#cardShadow)"><title>identity/spacekit-did-onchain — EVM/Solana bridge; nested workspace</title>
+<rect x="1021.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1021.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="1035.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">did-onchain</text>
+<path d="M1179.0 982.5 L1184.5 988 L1179.0 993.5 L1173.5 988 Z" fill="#0891B2"/>
+</g>
+<g filter="url(#cardShadow)"><title>identity/spacekit-recovery</title>
+<rect x="1203.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1203.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="1217.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">recovery</text>
+</g>
+<g filter="url(#cardShadow)"><title>identity/spacekit-behavioral</title>
+<rect x="839.0" y="1012" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="839.0" y="1012" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="853.0" y="1043" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">behavioral</text>
+</g>
+<g filter="url(#cardShadow)"><title>identity/wasm-did — wasm32-unknown-unknown</title>
+<rect x="1021.0" y="1012" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1021.0" y="1012" width="5" height="52" rx="2.5" fill="#7C3AED"/>
+<text x="1035.0" y="1043" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">wasm-did</text>
+<rect x="1145.0" y="1020" width="40" height="16" rx="8" fill="#EDE7FD"/>
+<text x="1165.0" y="1031.6" font-size="9.3" font-weight="700" fill="#6D28D9" text-anchor="middle">wasm</text>
+</g>
+<rect x="1419.0" y="896" width="200" height="120" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="1433.0" y="918" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">observability/</text>
+<text x="1433.0" y="932" font-size="10.3" fill="#94A3B8">structured protocol &amp; operational logging</text>
+<g filter="url(#cardShadow)"><title>observability/spacekit-log — shared workspace dependency</title>
+<rect x="1433.0" y="950" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="1433.0" y="950" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="1447.0" y="981" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">log</text>
+</g>
+<rect x="206" y="1126" width="1438" height="164" rx="14" fill="#F5F3FF" stroke="#C4B5FD" filter="url(#bandShadow)"/>
+<rect x="206" y="1126" width="6" height="164" rx="3" fill="#8B5CF6"/>
+<text x="80" y="1156" font-size="22" font-weight="800" fill="#6D28D9">L1</text>
+<text x="80" y="1178" font-size="12.5" font-weight="600" fill="#475569">Foundation</text>
+<rect x="80" y="1192" width="72" height="18" rx="9" fill="#FFFFFF" stroke="#C4B5FD"/>
+<text x="116.0" y="1205" font-size="10.5" font-weight="600" fill="#6D28D9" text-anchor="middle">no deps</text>
+<rect x="734.0" y="1148" width="382" height="120" rx="10" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="748.0" y="1170" font-size="14.5" font-weight="700" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#0F172A">foundation/</text>
+<text x="748.0" y="1184" font-size="10.3" fill="#94A3B8">cross-network types &amp; PQ primitives</text>
+<g filter="url(#cardShadow)"><title>foundation/spacekit-primitives — core types &amp; PQ; wasm-kyber, wasm-sphincs, vendored pqcrypto-*</title>
+<rect x="748.0" y="1202" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="748.0" y="1202" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="762.0" y="1226" font-size="13" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">primitives</text>
+<text x="762.0" y="1242" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">+ wasm-kyber / -sphincs</text>
+</g>
+<g filter="url(#cardShadow)"><title>foundation/spacekit-contract-language — SKCL compiler; package: spacekit-contract-lang</title>
+<rect x="930.0" y="1202" width="172" height="52" rx="8" fill="#FFFFFF" stroke="#E6EAF0"/>
+<rect x="930.0" y="1202" width="5" height="52" rx="2.5" fill="#DE7A2B"/>
+<text x="944.0" y="1226" font-size="11.5" font-weight="650" font-family="ui-monospace, Menlo, Consolas, monospace" fill="#1E293B">contract-language</text>
+<text x="944.0" y="1242" font-size="9.6" fill="#64748B" font-family="ui-monospace, Menlo, Consolas, monospace">→ spacekit-contract-lang</text>
+</g>
+<line x1="36" y1="1308" x2="1644" y2="1308" stroke="#E2E8F0"/>
+<text x="36" y="1324" font-size="11.5" fill="#64748B"><tspan font-weight="700" fill="#475569">Invariants:</tspan> internal deps declared once in <tspan font-family="ui-monospace, Menlo, Consolas, monospace">[workspace.dependencies]</tspan>; <tspan font-family="ui-monospace, Menlo, Consolas, monospace">overflow-checks = true</tspan> in every workspace (consensus invariant); nested workspaces (◆) build from inside — not reachable by <tspan font-family="ui-monospace, Menlo, Consolas, monospace">cargo -p</tspan> from root.</text>
+<text x="36" y="1342" font-size="11.5" fill="#94A3B8">Stack: Rust (nodes, CLI, contracts) + TypeScript (spacekit-js, @spacekit/sdk). AI: Growformer consumed as a pinned Git dependency from the separate spacekit-ai repo (not vendored here).</text>
+</svg>

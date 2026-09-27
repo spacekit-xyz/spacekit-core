@@ -125,14 +125,23 @@ pub struct StressTestResults {
 impl ProductionTestingSuite {
     /// Create a new production testing suite
     pub async fn new(compute_node: Arc<ComputeNode>) -> Result<Self> {
+        Self::with_storage_config(compute_node, StorageIntegrationConfig::default()).await
+    }
+
+    /// Like [`new`](Self::new), with an explicit storage configuration.
+    ///
+    /// The storage database keeps `.redb` sidecars in its data directory and
+    /// holds an exclusive lock on them while open, so two suites in one process
+    /// (e.g. parallel `cargo test` threads) must not share `storage_data_dir`.
+    pub async fn with_storage_config(
+        compute_node: Arc<ComputeNode>,
+        storage_config: StorageIntegrationConfig,
+    ) -> Result<Self> {
         info!("🧪 Initializing Production Testing Suite v1.5 with Unified Consensus Testing");
 
         let storage_manager = Arc::new(RwLock::new(
-            StorageIntegrationManager::new(
-                StorageIntegrationConfig::default(),
-                compute_node.config.node_did.clone(),
-            )
-            .await?,
+            StorageIntegrationManager::new(storage_config, compute_node.config.node_did.clone())
+                .await?,
         ));
 
         let cross_node_manager = Arc::new(CrossNodeCommunicationManager::new(
@@ -1635,13 +1644,25 @@ impl Default for ConsensusTestMetrics {
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "storage-integration"))]
+    /// A suite with its own storage directory. Tests run in parallel threads
+    /// of one process, and the default `./swx/compute_storage` is locked by
+    /// whichever suite opens it first ("Database already open. Cannot acquire
+    /// lock."), which failed every other suite's setup.
+    async fn test_suite(compute_node: Arc<ComputeNode>) -> Result<ProductionTestingSuite> {
+        let dir = std::env::temp_dir().join(format!("spacekit-testing-suite-{}", Uuid::new_v4()));
+        let storage_config = StorageIntegrationConfig {
+            storage_data_dir: dir.to_string_lossy().into_owned(),
+            ..StorageIntegrationConfig::default()
+        };
+        ProductionTestingSuite::with_storage_config(compute_node, storage_config).await
+    }
+
     #[tokio::test]
     async fn test_production_testing_suite_creation() {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await;
+        let testing_suite = test_suite(compute_node).await;
         assert!(testing_suite.is_ok());
     }
 
@@ -1667,7 +1688,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
 
         // Verify consensus components are initialized
         assert!(testing_suite.unified_consensus.is_some());
@@ -1682,7 +1703,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_validator_committees().await;
 
         assert!(
@@ -1698,7 +1719,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_unified_voting_mechanism().await;
 
         assert!(
@@ -1714,7 +1735,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_block_proposal_processing().await;
 
         assert!(
@@ -1730,7 +1751,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_metrics_proposal_processing().await;
 
         assert!(
@@ -1746,7 +1767,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_hybrid_proposal_processing().await;
 
         assert!(
@@ -1762,7 +1783,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_consensus_migration().await;
 
         assert!(
@@ -1778,7 +1799,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_economic_optimization().await;
 
         assert!(
@@ -1794,7 +1815,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.benchmark_consensus_performance().await;
 
         assert!(
@@ -1822,7 +1843,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let mut testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let mut testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.run_consensus_tests().await;
 
         assert!(
@@ -1857,7 +1878,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let migration_manager = testing_suite.consensus_migration.as_ref().unwrap();
 
         let savings = migration_manager.calculate_savings().await.unwrap();
@@ -1910,7 +1931,7 @@ mod tests {
         let config = ComputeConfig::default();
         let compute_node = Arc::new(ComputeNode::new(config).await.unwrap());
 
-        let testing_suite = ProductionTestingSuite::new(compute_node).await.unwrap();
+        let testing_suite = test_suite(compute_node).await.unwrap();
         let result = testing_suite.test_byzantine_fault_tolerance().await;
 
         assert!(

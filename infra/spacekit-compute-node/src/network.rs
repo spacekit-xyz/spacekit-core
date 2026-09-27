@@ -69,6 +69,11 @@ pub enum P2PMessage {
     },
     /// Service discovery request / response.
     ServiceAnnounce(ServiceInfo),
+    /// Signed validator-set governance proposal
+    /// ([`crate::validator_governance::SignedProposal`] as JSON).
+    GovernanceProposal { signed_json: String },
+    /// Signed governance vote ([`crate::validator_governance::SignedVote`] as JSON).
+    GovernanceVote { signed_json: String },
 }
 
 // ─── Core types ─────────────────────────────────────────────────────────────

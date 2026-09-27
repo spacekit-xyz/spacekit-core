@@ -1,4 +1,9 @@
 /**
+ * @deprecated Serves apps from the host's own origin, so an app can read the
+ * host's storage and session. `mountSpacekitApp` / `SpacekitAppFrame` isolate
+ * apps instead and no longer call this; under a cross-origin-isolated host the
+ * isolated frame still gets SharedArrayBuffer and WASM threads.
+ *
  * Service-worker app runtime (page side).
  *
  * Produces a {@link SpacekitPackageLoader}-compatible loader that serves a

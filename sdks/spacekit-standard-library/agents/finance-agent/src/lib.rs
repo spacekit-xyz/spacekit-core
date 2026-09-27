@@ -19,7 +19,7 @@ use spacekit_contract_sdk::{
     remote_storage::{remote_storage_get, remote_storage_put},
     tools::web_search,
     messaging::messaging_send,
-    ContractError, SpacekitContract, spacekit_contract,
+    ContractError, ContractErrorCode, SpacekitContract, spacekit_contract,
 };
 
 #[global_allocator]

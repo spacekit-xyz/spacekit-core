@@ -1,23 +1,64 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type FC } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FC, type ReactNode } from "react";
 import {
-  configureBridgeOwner,
-  handleSdkCall,
-  loadWebPackage,
-  revokeLoadedWebPackage,
-  type AppManifest,
+  mountSpacekitApp,
+  type AppMountState,
+  type CapabilityPolicy,
   type EmbeddedSdkBridge,
   type EmbedEndpoints,
   type EmbedHostServices,
+  type IsolationMode,
   type LoadWebPackageOptions,
   type LoadedWebPackage,
+  type PermissionRequest,
+  type TrustPolicy,
+  type VerifiedFilesLoader,
 } from "../../embed/index.js";
 import EmbedAppLoading from "./EmbedAppLoading.js";
 
+/** @deprecated Blob-URL loaders cannot be isolated. Use `loadFiles` (verified files) instead. */
 export type SpacekitPackageLoader = (
   storageOrigin: string,
   appId: string,
   options: LoadWebPackageOptions,
 ) => Promise<LoadedWebPackage>;
+
+export interface SpacekitFrameTheme {
+  background: string;
+  text: string;
+  muted: string;
+  accent: string;
+  accentText: string;
+  panelBackground: string;
+  panelBorder: string;
+  error: string;
+  fontFamily: string;
+}
+
+function defaultTheme(embedded: boolean | undefined): SpacekitFrameTheme {
+  return embedded
+    ? {
+        background: "#0c1020",
+        text: "#eef0f7",
+        muted: "#6b7390",
+        accent: "linear-gradient(180deg, #f3c879, #e0a948)",
+        accentText: "#241a05",
+        panelBackground: "rgba(255,255,255,0.03)",
+        panelBorder: "rgba(29,35,60,0.9)",
+        error: "#ef4444",
+        fontFamily: '"Hanken Grotesk", sans-serif',
+      }
+    : {
+        background: "#0c0f18",
+        text: "#f9fafb",
+        muted: "#9ca3af",
+        accent: "linear-gradient(135deg, #67e8f9 0%, #22d3ee 100%)",
+        accentText: "#080b0f",
+        panelBackground: "rgba(255,255,255,0.03)",
+        panelBorder: "rgba(255,255,255,0.08)",
+        error: "#ef4444",
+        fontFamily: "'DM Sans', sans-serif",
+      };
+}
 
 export interface SpacekitAppFrameProps {
   appId: string;
@@ -33,246 +74,178 @@ export interface SpacekitAppFrameProps {
   active?: boolean;
   contentFit?: "fill" | "contain";
   acquireBridge: (appId: string, storageOrigin: string, manifestName: string) => EmbeddedSdkBridge;
-  /** Override network fetch (e.g. Desktop encrypted package cache). */
+  /**
+   * How the app is isolated from this page. Defaults to `"origin"` when
+   * `appOrigin` is set, otherwise `"opaque"`. See `mountSpacekitApp`.
+   */
+  isolation?: IsolationMode;
+  /** Dedicated app origin (or `{app}` template / function) for `isolation: "origin"`. */
+  appOrigin?: string | ((appIdHex: string) => string);
+  frameHostPath?: string;
+  /** What apps may do beyond the baseline, and which origins get host credentials. */
+  capabilities?: CapabilityPolicy;
+  /** Refuse apps before they run (publisher allowlists, org policy). */
+  trustPolicy?: TrustPolicy;
+  /** Override package loading; must return verified files. */
+  loadFiles?: VerifiedFilesLoader;
+  /** @deprecated Ignored. Blob-URL loaders cannot be isolated; use `loadFiles`. */
   loadPackage?: SpacekitPackageLoader;
+  onStateChange?: (state: AppMountState) => void;
+  theme?: Partial<SpacekitFrameTheme>;
+  className?: string;
+  /** Replace the built-in consent prompt. Call `grant(true | false)`. */
+  renderPermissions?: (request: PermissionRequest, grant: (allow: boolean) => void) => ReactNode;
+  loadingLabel?: string;
 }
 
-type LoadState =
-  | { status: "loading" }
-  | { status: "permissions"; manifest: AppManifest; pkg: LoadedWebPackage }
-  | { status: "running"; manifest: AppManifest; blobUrl: string }
-  | { status: "error"; message: string };
-
-function installSdkBridge(
-  bridgeRef: React.MutableRefObject<EmbeddedSdkBridge | null>,
-  acquireBridge: SpacekitAppFrameProps["acquireBridge"],
-  appId: string,
-  storageOrigin: string,
-  manifestName: string,
-  ownerDid: string,
-): void {
-  bridgeRef.current?.flush();
-  const bridge = acquireBridge(appId, storageOrigin, manifestName);
-  configureBridgeOwner(bridge, ownerDid);
-  bridgeRef.current = bridge;
-  void bridge.ensureHydrated();
-}
+let warnedLoadPackage = false;
 
 export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
   appId,
   storageOrigin,
   bridgeStorageOrigin,
   services,
-  endpoints = {},
+  endpoints,
   parentOrigin,
   fullscreen,
   embedded,
   active = true,
   contentFit = "fill",
   acquireBridge,
+  isolation,
+  appOrigin,
+  frameHostPath,
+  capabilities,
+  trustPolicy,
+  loadFiles,
   loadPackage,
+  onStateChange,
+  theme: themeOverrides,
+  className,
+  renderPermissions,
+  loadingLabel,
 }) => {
-  const [state, setState] = useState<LoadState>({ status: "loading" });
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const pkgRef = useRef<LoadedWebPackage | null>(null);
-  const loadedFitRef = useRef<"fill" | "contain" | null>(null);
-  const bridgeRef = useRef<EmbeddedSdkBridge | null>(null);
-  const resolvedParentOrigin = parentOrigin ?? (typeof window !== "undefined" ? window.location.origin : "");
-  const resolvedBridgeOrigin = bridgeStorageOrigin ?? storageOrigin;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [state, setState] = useState<AppMountState>({ status: "loading" });
+  const [consent, setConsent] = useState<{ request: PermissionRequest; resolve: (allow: boolean) => void } | null>(
+    null,
+  );
+  const theme = { ...defaultTheme(embedded), ...themeOverrides };
+
+  if (loadPackage && !warnedLoadPackage) {
+    warnedLoadPackage = true;
+    console.warn("[spacekit] SpacekitAppFrame `loadPackage` is deprecated and ignored; use `loadFiles`.");
+  }
+
+  // Callbacks and plain-data options go through refs/keys so a parent that
+  // re-creates them every render does not remount the app.
+  const callbacks = useRef({ trustPolicy, loadFiles, onStateChange });
+  callbacks.current = { trustPolicy, loadFiles, onStateChange };
+  const endpointsKey = JSON.stringify(endpoints ?? {});
+  const capabilitiesKey = JSON.stringify(capabilities ?? {});
+  const appOriginKey = typeof appOrigin === "function" ? appOrigin : String(appOrigin ?? "");
+  const stableEndpoints = useMemo(() => endpoints, [endpointsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const stableCapabilities = useMemo(() => capabilities, [capabilitiesKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    return () => {
-      bridgeRef.current?.flush();
-      bridgeRef.current = null;
-    };
-  }, [appId, resolvedBridgeOrigin]);
-
-  useEffect(() => {
-    if (embedded && !active) {
-      if (pkgRef.current) {
-        revokeLoadedWebPackage(pkgRef.current);
-        pkgRef.current = null;
-        loadedFitRef.current = null;
-      }
-      return;
-    }
-    if (embedded && pkgRef.current && loadedFitRef.current === contentFit) return;
-
-    if (pkgRef.current) {
-      revokeLoadedWebPackage(pkgRef.current);
-      pkgRef.current = null;
-      loadedFitRef.current = null;
-    }
-
-    let cancelled = false;
+    if (embedded && !active) return;
+    const el = containerRef.current;
+    if (!el) return;
     setState({ status: "loading" });
-
-    const loadOptions: LoadWebPackageOptions = {
-      parentOrigin: resolvedParentOrigin,
-      endpoints: {
-        ...endpoints,
-        wasmUrl: endpoints.wasmUrl ?? `${resolvedParentOrigin}/wasm/kyber_wasm_bg.wasm`,
-      },
-      identityDid: services.getIdentityDid(),
+    const handle = mountSpacekitApp(el, {
+      appId,
+      storageOrigin,
+      bridgeStorageOrigin,
+      services,
+      acquireBridge,
+      endpoints: stableEndpoints,
+      parentOrigin,
       contentFit,
-    };
-    const loader = loadPackage ?? loadWebPackage;
-
-    loader(storageOrigin, appId, loadOptions)
-      .then((pkg) => {
-        if (cancelled) {
-          revokeLoadedWebPackage(pkg);
-          return;
-        }
-        pkgRef.current = pkg;
-        loadedFitRef.current = contentFit;
-        installSdkBridge(
-          bridgeRef,
-          acquireBridge,
-          appId,
-          resolvedBridgeOrigin,
-          pkg.manifest.name,
-          pkg.creatorDid,
-        );
-        if (pkg.integrityErrors.length > 0) {
-          setState({ status: "error", message: `Integrity failed: ${pkg.integrityErrors.join(", ")}` });
-          return;
-        }
-        if (pkg.manifest.permissions.length > 0) {
-          setState({ status: "permissions", manifest: pkg.manifest, pkg });
-        } else {
-          setState({ status: "running", manifest: pkg.manifest, blobUrl: pkg.blobUrl });
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setState({ status: "error", message: err instanceof Error ? err.message : String(err) });
-        }
-      });
-
+      isolation,
+      appOrigin,
+      frameHostPath,
+      capabilities: stableCapabilities,
+      trustPolicy: callbacks.current.trustPolicy ? (info) => callbacks.current.trustPolicy!(info) : undefined,
+      loadFiles: callbacks.current.loadFiles
+        ? (origin, id) => callbacks.current.loadFiles!(origin, id)
+        : undefined,
+      requestPermissions: (request) =>
+        new Promise<boolean>((resolve) => {
+          setConsent({ request, resolve });
+        }),
+      onStateChange: (next) => {
+        setState(next);
+        callbacks.current.onStateChange?.(next);
+      },
+      frame: {
+        hash: typeof window !== "undefined" ? window.location.hash : undefined,
+        style: {
+          borderRadius: embedded || fullscreen ? "0" : "12px",
+          background: theme.background,
+        },
+      },
+    });
     return () => {
-      cancelled = true;
+      handle.unmount();
+      setConsent((prev) => {
+        prev?.resolve(false);
+        return null;
+      });
     };
+    // theme.background only styles the frame; it is read at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     appId,
     storageOrigin,
-    resolvedBridgeOrigin,
-    resolvedParentOrigin,
+    bridgeStorageOrigin,
+    services,
+    acquireBridge,
+    stableEndpoints,
+    parentOrigin,
+    contentFit,
+    isolation,
+    appOriginKey,
+    frameHostPath,
+    stableCapabilities,
     embedded,
     active,
-    contentFit,
-    services,
-    endpoints,
-    acquireBridge,
-    loadPackage,
+    fullscreen,
   ]);
 
-  useEffect(() => {
-    return () => {
-      if (pkgRef.current) {
-        revokeLoadedWebPackage(pkgRef.current);
-        pkgRef.current = null;
-      }
-    };
-  }, [appId, storageOrigin]);
-
-  const handleMessage = useCallback((e: MessageEvent) => {
-    if (e.data?.type !== "spacekit-sdk-call") return;
-    const iframe = iframeRef.current;
-    if (!iframe?.contentWindow || e.source !== iframe.contentWindow) return;
-    const bridge = bridgeRef.current;
-    if (!bridge) return;
-    const { id, module, method, params } = e.data;
-    handleSdkCall(bridge, module, method, params)
-      .then((result) => {
-        iframe.contentWindow?.postMessage({ type: "spacekit-sdk-response", id, result }, "*");
-      })
-      .catch((err) => {
-        iframe.contentWindow?.postMessage(
-          { type: "spacekit-sdk-response", id, error: err instanceof Error ? err.message : String(err) },
-          "*",
-        );
-      });
-  }, []);
-
-  useEffect(() => {
-    const bridge = bridgeRef.current;
-    const iframe = iframeRef.current;
-    if (!bridge || !iframe) return;
-    bridge.setPushHandler((topic, msg) => {
-      iframe.contentWindow?.postMessage({ type: "spacekit-sdk-event", topic, msg }, "*");
-    });
-  }, [state]);
-
-  useEffect(() => {
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [handleMessage]);
-
-  const notifyIframeResize = useCallback(() => {
-    iframeRef.current?.contentWindow?.dispatchEvent(new Event("resize"));
-  }, []);
-
-  useEffect(() => {
-    if (state.status !== "running") return;
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    notifyIframeResize();
-    const t1 = window.setTimeout(notifyIframeResize, 120);
-    const t2 = window.setTimeout(notifyIframeResize, 400);
-    const ro =
-      typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => notifyIframeResize()) : null;
-    ro?.observe(iframe);
-    window.addEventListener("resize", notifyIframeResize);
-    return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-      ro?.disconnect();
-      window.removeEventListener("resize", notifyIframeResize);
-    };
-  }, [state, notifyIframeResize]);
-
-  const grantPermissions = useCallback(() => {
-    if (state.status === "permissions") {
-      setState({ status: "running", manifest: state.manifest, blobUrl: state.pkg.blobUrl });
-    }
-  }, [state]);
+  const grant = (allow: boolean) => {
+    consent?.resolve(allow);
+    setConsent(null);
+  };
 
   const base: CSSProperties = embedded
-    ? {
-        width: "100%",
-        height: "100%",
-        display: "flex",
-        flexDirection: "column",
-        minHeight: 0,
-        background: "#0c1020",
-      }
+    ? { width: "100%", height: "100%", display: "flex", flexDirection: "column", minHeight: 0, background: theme.background }
     : fullscreen
       ? { width: "100%", height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }
       : { maxWidth: 1200, margin: "0 auto", minHeight: "60vh", display: "flex", flexDirection: "column" };
 
-  const muted = embedded ? "#6b7390" : "#9ca3af";
-  const panelBg = "rgba(255,255,255,0.03)";
-  const panelBorder = embedded ? "rgba(29,35,60,0.9)" : "rgba(255,255,255,0.08)";
-  const accentBtn = embedded
-    ? "linear-gradient(180deg, #f3c879, #e0a948)"
-    : "linear-gradient(135deg, #67e8f9 0%, #22d3ee 100%)";
-  const accentBtnText = embedded ? "#241a05" : "#080b0f";
-  const iframeBg = embedded ? "#0c1020" : "#0c0f18";
-  const font = embedded ? '"Hanken Grotesk", sans-serif' : "'DM Sans', sans-serif";
+  const overlay: CSSProperties = {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: embedded ? 24 : 60,
+    background: theme.background,
+    fontFamily: theme.fontFamily,
+  };
 
+  let cover: ReactNode = null;
   if (state.status === "loading") {
-    return (
-      <div style={{ ...base, alignItems: "center", justifyContent: "center", padding: embedded ? 24 : 60 }}>
-        <EmbedAppLoading embedded={embedded} />
+    cover = (
+      <div style={overlay}>
+        <EmbedAppLoading embedded={embedded} label={loadingLabel} fontFamily={theme.fontFamily} color={theme.muted} />
       </div>
     );
-  }
-
-  if (state.status === "error") {
-    return (
-      <div style={{ ...base, alignItems: "center", justifyContent: "center", padding: embedded ? 24 : 60 }}>
+  } else if (state.status === "error") {
+    cover = (
+      <div style={overlay}>
         <div
+          role="alert"
           style={{
             padding: embedded ? "16px 20px" : "20px 28px",
             borderRadius: 12,
@@ -280,100 +253,103 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
             border: "1px solid rgba(239,68,68,0.2)",
             textAlign: "center",
             maxWidth: 480,
-            fontFamily: font,
           }}
         >
-          <div style={{ fontSize: 15, fontWeight: 700, color: "#ef4444", marginBottom: 8 }}>
-            Failed to load app
-          </div>
-          <div style={{ fontSize: 13, color: muted, lineHeight: 1.5 }}>{state.message}</div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: theme.error, marginBottom: 8 }}>Failed to load app</div>
+          <div style={{ fontSize: 13, color: theme.muted, lineHeight: 1.5 }}>{state.message}</div>
         </div>
       </div>
     );
-  }
-
-  if (state.status === "permissions") {
-    return (
-      <div style={{ ...base, alignItems: "center", justifyContent: "center", padding: embedded ? 24 : 60 }}>
-        <div
-          style={{
-            padding: embedded ? "22px 24px" : "28px 32px",
-            borderRadius: 16,
-            background: panelBg,
-            border: `1px solid ${panelBorder}`,
-            maxWidth: 420,
-            textAlign: "center",
-            fontFamily: font,
-          }}
-        >
+  } else if (state.status === "permissions" && consent) {
+    cover = (
+      <div style={overlay}>
+        {renderPermissions ? (
+          renderPermissions(consent.request, grant)
+        ) : (
           <div
             style={{
-              fontSize: 18,
-              fontWeight: 700,
-              color: embedded ? "#eef0f7" : "#f9fafb",
-              marginBottom: 6,
+              padding: embedded ? "22px 24px" : "28px 32px",
+              borderRadius: 16,
+              background: theme.panelBackground,
+              border: `1px solid ${theme.panelBorder}`,
+              maxWidth: 420,
+              textAlign: "center",
             }}
           >
-            {state.manifest.name}
-          </div>
-          <div style={{ fontSize: 12, color: muted, marginBottom: 16 }}>This app requests permissions:</div>
-          <ul style={{ listStyle: "none", padding: 0, margin: "0 0 20px", textAlign: "left" }}>
-            {state.manifest.permissions.map((p, i) => (
-              <li
-                key={i}
+            <div style={{ fontSize: 18, fontWeight: 700, color: theme.text, marginBottom: 6 }}>{state.manifest.name}</div>
+            <div style={{ fontSize: 12, color: theme.muted, marginBottom: 16 }}>This app asks to:</div>
+            <ul style={{ listStyle: "none", padding: 0, margin: "0 0 20px", textAlign: "left" }}>
+              {state.permissions.map((p, i) => (
+                <li
+                  key={i}
+                  style={{
+                    padding: "6px 12px",
+                    marginBottom: 4,
+                    borderRadius: 8,
+                    border: `1px solid ${theme.panelBorder}`,
+                    fontSize: 12,
+                    color: theme.text,
+                  }}
+                >
+                  {p}
+                </li>
+              ))}
+            </ul>
+            <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+              <button
+                type="button"
+                onClick={() => grant(false)}
                 style={{
-                  padding: "6px 12px",
-                  marginBottom: 4,
-                  borderRadius: 8,
-                  background: embedded ? "rgba(116,224,168,0.08)" : "rgba(103,232,249,0.06)",
-                  border: embedded ? "1px solid rgba(116,224,168,0.18)" : "1px solid rgba(103,232,249,0.15)",
-                  fontSize: 12,
-                  color: embedded ? "#eef0f7" : "#e5e7eb",
+                  background: "transparent",
+                  color: theme.muted,
+                  border: `1px solid ${theme.panelBorder}`,
+                  borderRadius: 10,
+                  padding: "10px 20px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  fontFamily: theme.fontFamily,
                 }}
               >
-                {typeof p === "string" ? p : JSON.stringify(p)}
-              </li>
-            ))}
-          </ul>
-          <button
-            type="button"
-            onClick={grantPermissions}
-            style={{
-              background: accentBtn,
-              color: accentBtnText,
-              border: "none",
-              borderRadius: 10,
-              padding: "10px 28px",
-              fontSize: 13,
-              fontWeight: 700,
-              cursor: "pointer",
-              fontFamily: font,
-            }}
-          >
-            Grant & Launch
-          </button>
-        </div>
+                Don't allow
+              </button>
+              <button
+                type="button"
+                onClick={() => grant(true)}
+                style={{
+                  background: theme.accent,
+                  color: theme.accentText,
+                  border: "none",
+                  borderRadius: 10,
+                  padding: "10px 28px",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  fontFamily: theme.fontFamily,
+                }}
+              >
+                Allow & launch
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
 
   return (
-    <div style={base}>
-      <iframe
-        ref={iframeRef}
-        src={`${state.blobUrl}${typeof window !== "undefined" ? window.location.hash : ""}`}
-        sandbox="allow-scripts allow-same-origin allow-modals"
+    <div className={className} style={base}>
+      <div
         style={{
+          position: "relative",
           flex: 1,
-          width: "100%",
           minHeight: embedded || fullscreen ? 0 : "60vh",
-          border: "none",
-          borderRadius: embedded || fullscreen ? 0 : 12,
-          background: iframeBg,
+          display: "flex",
         }}
-        title={state.manifest.name}
-        onLoad={notifyIframeResize}
-      />
+      >
+        <div ref={containerRef} style={{ flex: 1, display: "flex", minHeight: 0 }} />
+        {cover}
+      </div>
     </div>
   );
 };

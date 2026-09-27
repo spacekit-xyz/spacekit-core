@@ -1,0 +1,10 @@
+{
+  "network": "testnet",
+  "min_validators_to_lift": 10,
+  "authorities": [
+    { "did": "did:spacekit:testnet:<address-1>", "sphincs_pk_hex": "<sphincs-public-key-hex-1>", "name": "Operator 1" },
+    { "did": "did:spacekit:testnet:<address-2>", "sphincs_pk_hex": "<sphincs-public-key-hex-2>", "name": "Operator 2" },
+    { "did": "did:spacekit:testnet:<address-3>", "sphincs_pk_hex": "<sphincs-public-key-hex-3>", "name": "Operator 3" },
+    { "did": "did:spacekit:testnet:<address-4>", "sphincs_pk_hex": "<sphincs-public-key-hex-4>", "name": "Operator 4" }
+  ]
+}

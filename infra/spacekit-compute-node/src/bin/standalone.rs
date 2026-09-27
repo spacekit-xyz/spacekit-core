@@ -331,6 +331,8 @@ pub struct SwtchComputeNode {
     /// [`spacekit_unified_consensus`] facade over [`ConsensusCoordinator`] + spacetime extension.
     #[cfg(feature = "spacetime-consensus")]
     consensus_host: Arc<spacekit_compute_node::UnifiedConsensusHost>,
+    /// Proof-of-authority bootstrap and validator-set governance.
+    governance: Arc<spacekit_compute_node::ValidatorGovernance>,
 }
 
 fn kem_sizes_for_config_algorithm(alg: &str) -> Option<(usize, usize)> {
@@ -419,6 +421,19 @@ fn build_runtime_identity(
         "Signing on this node uses the embedded SPHINCS+ wallet keys; CLI Kyber material is available for KEM-aligned features (storage, registry payloads). Kyber-only signing is not implemented here."
     );
     Ok((wallet, kem))
+}
+
+/// Point the Service Reward Accumulator at the current authority set: while
+/// the network is in proof of authority, authorities' (and affiliated
+/// operators') credits go to locked AstraRewards balances (Tokenomics §1.11).
+async fn sync_reward_lock_policy(
+    governance: &spacekit_compute_node::ValidatorGovernance,
+    vm: &SwtchvmNode,
+) {
+    if let Some(sra) = vm.sra_host() {
+        let state = governance.snapshot().await;
+        sra.set_lock_policy(state.is_poa(), state.authorities.keys().map(String::as_str));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +769,13 @@ impl SwtchComputeNode {
             network_service.clone(),
             node_did.clone(),
         ));
+        let governance = Arc::new(
+            spacekit_compute_node::ValidatorGovernance::from_env(
+                &config.network.name,
+                consensus_coordinator.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("validator governance init failed: {e}"))?,
+        );
 
         #[cfg(feature = "spacetime-consensus")]
         let consensus_host = Arc::new(spacekit_compute_node::UnifiedConsensusHost::new(
@@ -832,6 +854,8 @@ impl SwtchComputeNode {
             }
         }
         let swtchvm_node = Arc::new(swtchvm_node);
+        // Lock authorities' PoA-phase rewards before the first block is mined.
+        sync_reward_lock_policy(&governance, &swtchvm_node).await;
 
         #[cfg(feature = "spacetime-consensus")]
         let pq_keys = Arc::new(
@@ -856,6 +880,7 @@ impl SwtchComputeNode {
             pq_keys,
             #[cfg(feature = "spacetime-consensus")]
             consensus_host,
+            governance,
         })
     }
 
@@ -884,6 +909,33 @@ impl SwtchComputeNode {
                 self.pq_keys.dilithium_secret_key.clone(),
             )
             .await;
+        // Proof-of-authority validators (genesis or admitted by governance)
+        // join the set without stake; governance gossip keeps nodes in step.
+        self.governance.sync_coordinator().await;
+        self.governance
+            .start_p2p_listener(self.network_service.clone());
+        self.governance.start_ticker();
+        {
+            // Governance can admit or remove authorities, or lift PoA, at any
+            // time; keep the SRA's reward lock in step.
+            let governance = self.governance.clone();
+            let vm = self.swtchvm_node.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    sync_reward_lock_policy(&governance, &vm).await;
+                }
+            });
+        }
+        info!(
+            "Consensus mode: {}",
+            if self.governance.is_poa().await {
+                "proof of authority (validators admitted by governance)"
+            } else {
+                "proof of stake"
+            }
+        );
         #[cfg(feature = "spacetime-consensus")]
         self.consensus_host.start_p2p_listener();
         #[cfg(not(feature = "spacetime-consensus"))]
@@ -1048,6 +1100,11 @@ impl SwtchComputeNode {
                             "/v1/onboarding/balance?did=",
                             "GET /v1/sync/subscriber",
                             "POST /v1/consensus/propose",
+                            "GET /v1/chain/status",
+                            "GET /v1/governance",
+                            "GET /v1/governance/proposals",
+                            "POST /v1/governance/proposals",
+                            "POST /v1/governance/votes",
                         ]
                     }
                 });
@@ -1590,6 +1647,7 @@ impl SwtchComputeNode {
         }
         let cc_reg = self.consensus_coordinator.clone();
         let vr_entitlements = entitlement_reader.clone();
+        let vr_governance = self.governance.clone();
         let register_validator_route = warp::path!("v1" / "consensus" / "register-validator")
             .and(warp::post())
             .and(spacekit_compute_node::api_auth::signed_json::<RegisterValidatorBody>(
@@ -1601,7 +1659,20 @@ impl SwtchComputeNode {
             )| {
                 let cc = cc_reg.clone();
                 let entitlements = vr_entitlements.clone();
+                let governance = vr_governance.clone();
                 async move {
+                    // During the proof-of-authority bootstrap the validator set
+                    // changes only through governance proposals.
+                    if governance.is_poa().await {
+                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "the network is in its proof-of-authority bootstrap; \
+                                          validators are admitted by an add_authority \
+                                          governance proposal (see /v1/governance)",
+                            })),
+                            warp::http::StatusCode::FORBIDDEN,
+                        ));
+                    }
                     let (pk, proof) = match (
                         hex::decode(&body.sphincs_pk_hex),
                         hex::decode(&body.proof_hex),
@@ -2455,6 +2526,81 @@ impl SwtchComputeNode {
                 }
             });
 
+        // GET /v1/chain/status — public chain summary for explorers and the
+        // spacekit.xyz network page.
+        let status_vm = self.swtchvm_node.clone();
+        let status_cc = self.consensus_coordinator.clone();
+        let status_gov = self.governance.clone();
+        let status_net = self.network_service.clone();
+        let status_chain_id = self.config.compute.chain_id.clone();
+        let status_node_did = quantum_did_utils::get_did(&self.identity);
+        let chain_status_route = warp::path!("v1" / "chain" / "status")
+            .and(warp::get())
+            .and_then(move || {
+                let vm = status_vm.clone();
+                let cc = status_cc.clone();
+                let gov = status_gov.clone();
+                let net = status_net.clone();
+                let chain_id = status_chain_id.clone();
+                let node_did = status_node_did.clone();
+                async move {
+                    let head = vm.get_latest_block();
+                    let governance = gov.snapshot().await;
+                    let validators = cc.validator_entries().await;
+                    let network = net.get_status().await.ok();
+                    let finalized = cc
+                        .finalized_proposals()
+                        .await
+                        .values()
+                        .filter(|s| {
+                            matches!(s, spacekit_compute_node::FinalityStatus::Finalized { .. })
+                        })
+                        .count();
+                    let authorities = governance.authorities.len();
+                    Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "network": governance.network,
+                        "chain_id": chain_id,
+                        "node_did": node_did,
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "time": chrono::Utc::now().timestamp(),
+                        "head": {
+                            "number": head.number,
+                            "hash": format!("0x{}", hex::encode(head.hash)),
+                            "parent_hash": format!("0x{}", hex::encode(head.parent_hash)),
+                            "state_root": format!("0x{}", hex::encode(head.state_root)),
+                            "timestamp": head.timestamp,
+                            "tx_count": head.transactions.len(),
+                            "gas_used": head.gas_used.to_string(),
+                            "gas_limit": head.gas_limit.to_string(),
+                        },
+                        "consensus": {
+                            "mode": if governance.is_poa() { "proof_of_authority" } else { "proof_of_stake" },
+                            "state_hash": governance.state_hash(),
+                            "authorities": authorities,
+                            "approvals_needed": spacekit_compute_node::validator_governance::approvals_needed(authorities),
+                            "fault_tolerance": spacekit_compute_node::validator_governance::fault_tolerance(authorities),
+                            "min_validators_to_lift": governance.min_validators_to_lift,
+                            "pos_activated_at": governance.pos_activated_at,
+                            "finalized_proposals": finalized,
+                        },
+                        "validators": validators.iter().map(|v| serde_json::json!({
+                            "did": v.did,
+                            "admission": v.admission,
+                            "stake_units": v.stake_units.to_string(),
+                            "joined_at": v.joined_at.timestamp(),
+                            "has_key": v.sphincs_public_key.is_some(),
+                        })).collect::<Vec<_>>(),
+                        "peers": {
+                            "connected": network.as_ref().map(|n| n.peer_count).unwrap_or(0),
+                            "is_connected": network.as_ref().map(|n| n.is_connected).unwrap_or(false),
+                        },
+                    })))
+                }
+            });
+
+        let governance_routes =
+            spacekit_compute_node::validator_governance::http::routes(self.governance.clone());
+
         // Full SwtchVM developer HTTP API (same in-process node as operator — see RUNBOOK §9).
         let swtchvm_http = SwtchvmNode::http_dev_api_routes(self.swtchvm_node.clone());
 
@@ -2471,7 +2617,9 @@ impl SwtchComputeNode {
             .or(state_snapshot_route)
             .or(network_peers_route)
             .or(register_validator_route)
-            .or(propose_consensus_route);
+            .or(propose_consensus_route)
+            .or(chain_status_route)
+            .or(governance_routes);
         #[cfg(feature = "spacetime-consensus")]
         let routes = routes.or(finalize_consensus_route);
 

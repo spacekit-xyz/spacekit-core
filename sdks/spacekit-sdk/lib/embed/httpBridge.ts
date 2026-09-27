@@ -1,5 +1,6 @@
 import { safeUUID } from "../crypto.js";
 import type {
+  EmbeddedHttpContext,
   EmbeddedFetchResult,
   EmbeddedHttpHandler,
   HttpBridgeHost,
@@ -29,12 +30,46 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(parts.join(""));
 }
 
+function withoutAuthHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (key === "authorization" || key === "owner-did") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function resolveUrl(url: string): string {
+  try {
+    return new URL(url, typeof window !== "undefined" ? window.location.href : undefined).href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Host credentials go only to origins the host vouches for. Without an explicit
+ * `isCredentialedUrl`, that is the host page's own origin.
+ */
+function isCredentialedUrl(host: HttpBridgeHost, url: string): boolean {
+  if (host.isCredentialedUrl) return host.isCredentialedUrl(resolveUrl(url));
+  if (typeof window === "undefined") return false;
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
 export async function handleEmbeddedHttpFetch(
   host: HttpBridgeHost,
   params: Record<string, unknown>,
+  context?: EmbeddedHttpContext,
 ): Promise<EmbeddedFetchResult> {
   const url = String(params.url ?? "");
   if (!url) throw new Error("http.fetch requires url");
+  const resolvedUrl = resolveUrl(url);
 
   const init = (params.init ?? {}) as {
     method?: string;
@@ -42,7 +77,23 @@ export async function handleEmbeddedHttpFetch(
     body?: string;
   };
 
-  const headers = host.mergeFetchHeaders(url, { ...(init.headers ?? {}) });
+  const trusted = isCredentialedUrl(host, url);
+  const appHeaders = { ...(init.headers ?? {}) };
+  // On trusted origins, prefer a credential scoped to this app over the viewer's
+  // own session; fall back to the session only if the host allows it.
+  let headers = appHeaders;
+  // `credentialed`: the viewer's own session (headers + cookies) is attached.
+  let credentialed = false;
+  if (trusted) {
+    const scoped = context?.appCredentials ? await context.appCredentials().catch(() => null) : null;
+    if (scoped?.apiAuthorization) {
+      headers = withoutAuthHeaders(appHeaders);
+      headers.Authorization = scoped.apiAuthorization;
+    } else if (host.forwardViewerSession !== false) {
+      headers = host.mergeFetchHeaders(url, appHeaders);
+      credentialed = true;
+    }
+  }
   const bodyEncoding = headers["X-Body-Encoding"] ?? headers["x-body-encoding"];
   delete headers["X-Body-Encoding"];
   delete headers["x-body-encoding"];
@@ -62,10 +113,11 @@ export async function handleEmbeddedHttpFetch(
   const method = init.method ?? "GET";
 
   async function doFetch(requestHeaders: Record<string, string>): Promise<Response> {
-    return fetch(url, {
+    return fetch(resolvedUrl, {
       method,
       headers: requestHeaders,
       body: fetchBody,
+      credentials: credentialed ? "same-origin" : "omit",
     });
   }
 
@@ -78,6 +130,7 @@ export async function handleEmbeddedHttpFetch(
   }
 
   if (
+    credentialed &&
     res.status === 401 &&
     host.shouldRetryUnauthorized?.(url, headers) &&
     host.refreshFetchHeaders
@@ -92,7 +145,7 @@ export async function handleEmbeddedHttpFetch(
     }
   }
 
-  if (res.status === 401 && host.getSessionToken() && host.isSessionExpiredError) {
+  if (credentialed && res.status === 401 && host.getSessionToken() && host.isSessionExpiredError) {
     const errBody = await res.clone().json().catch(() => null);
     if (host.isSessionExpiredError(errBody)) {
       host.onSessionExpired?.("Your session expired. Sign in again to continue.");
@@ -137,18 +190,21 @@ export function createEmbeddedHttpHandler(host: HttpBridgeHost): EmbeddedHttpHan
     method: string,
     params: Record<string, unknown>,
     push: SsePushHandler,
+    context?: EmbeddedHttpContext,
   ): Promise<unknown> | null {
     if (module !== "http") return null;
 
     if (method === "fetch") {
-      return handleEmbeddedHttpFetch(host, params);
+      return handleEmbeddedHttpFetch(host, params, context);
     }
 
     if (method === "sseSubscribe") {
       const url = String(params.url ?? "");
       if (!url) throw new Error("http.sseSubscribe requires url");
       const id = safeUUID();
-      const es = new EventSource(url);
+      const es = new EventSource(resolveUrl(url), {
+        withCredentials: false,
+      });
       sseStreams.set(id, es);
       es.onmessage = (event) => {
         push(`__sse:${id}`, { type: "message", data: event.data });

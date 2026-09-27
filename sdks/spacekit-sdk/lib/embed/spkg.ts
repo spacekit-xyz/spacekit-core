@@ -1,5 +1,6 @@
 import { unzipSync } from "fflate";
 import { loadWebPackageFromLocal, type LoadWebPackageOptions } from "./packageLoader.js";
+import { verifyPackageSignature, type PackageSignature } from "./spkgSignature.js";
 import type { AppPackageJSON, ContentRef, LoadedWebPackage } from "./types.js";
 
 export const SPKG_MIMETYPE = "application/vnd.spacekit.spkg+zip";
@@ -11,6 +12,11 @@ export type SpkgSource = Uint8Array | ArrayBuffer;
 export interface OpenedSpkg {
   package: AppPackageJSON;
   files: Record<string, Uint8Array>;
+  /**
+   * Publisher signatures found in `signatures/*.json`. Invalid signatures make
+   * `openSpkg` throw, so entries here are "valid" or "unsupported".
+   */
+  signatures: PackageSignature[];
 }
 
 function asBytes(source: SpkgSource): Uint8Array {
@@ -250,7 +256,22 @@ export async function openSpkg(source: SpkgSource): Promise<OpenedSpkg> {
     );
   }
 
-  return { package: pkg, files };
+  const signatures: PackageSignature[] = [];
+  for (const name of Object.keys(entries).sort()) {
+    if (!name.startsWith("signatures/") || !name.endsWith(".json")) continue;
+    const result = await verifyPackageSignature(name, manifestBytes, entries[name]);
+    if (result.status === "invalid") {
+      throw new Error(`SPKG signature ${name} is invalid: ${result.reason ?? "does not verify"}`);
+    }
+    signatures.push(result);
+  }
+
+  return { package: pkg, files, signatures };
+}
+
+/** Lower-case hex app id of a package, for comparing with a requested id. */
+export function packageAppIdHex(pkg: AppPackageJSON): string {
+  return normalizeAppId(pkg.app_id, "SPKG AppPackage app_id");
 }
 
 export const parseSpkg = openSpkg;

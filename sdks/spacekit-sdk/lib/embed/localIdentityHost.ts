@@ -10,6 +10,8 @@
 
 import { createEmbeddedHttpHandler } from "./httpBridge.js";
 import type {
+  AppCredentialRequest,
+  AppCredentials,
   EmbedHostServices,
   EmbeddedHttpHandler,
   HttpBridgeHost,
@@ -43,6 +45,17 @@ export interface LocalIdentityHostOptions {
    * apps still load; they just see a null viewer DID.
    */
   isEphemeralDid?: (did: string) => boolean;
+  /**
+   * Let embedded apps replace the signed-in DID through `identity.setState`.
+   * Off by default: an app may update profile fields, never who is signed in.
+   */
+  allowAppDidWrites?: boolean;
+  /**
+   * Legacy: answer `identity.authHeaders`, handing the session token to the
+   * app. Off by default; apps should call `spacekit.http.fetch`, which attaches
+   * credentials only for trusted origins.
+   */
+  exposeAuthHeaders?: boolean;
 }
 
 export interface LocalIdentityHost {
@@ -134,15 +147,20 @@ export function createLocalIdentityHost(
     if (method === "did") return readSnapshot().myDid;
     if (method === "getState") return readSnapshot();
     if (method === "setState") {
-      const next = writeSnapshot(params as Partial<LocalIdentitySnapshot>);
+      const partial = { ...(params as Partial<LocalIdentitySnapshot>) };
+      if (!options.allowAppDidWrites) delete partial.myDid;
+      const next = writeSnapshot(partial);
       try {
-        window.postMessage({ type: "spacekit-identity-changed", state: next }, "*");
+        window.postMessage({ type: "spacekit-identity-changed", state: next }, window.location.origin);
       } catch {
         /* ignore */
       }
       return next;
     }
-    if (method === "authHeaders") return authHeaders();
+    if (method === "authHeaders") {
+      if (options.exposeAuthHeaders) return authHeaders();
+      throw new Error("identity.authHeaders is not available to embedded apps; use spacekit.http.fetch");
+    }
     throw new Error(`identity.${method} not supported`);
   }
 
@@ -167,6 +185,21 @@ export interface LocalEmbedHostOptions extends LocalIdentityHostOptions {
   services?: Partial<EmbedHostServices>;
   /** Overrides for the HTTP bridge, e.g. site-specific auth header merging. */
   httpBridge?: Partial<HttpBridgeHost>;
+  /**
+   * Origins that receive the viewer's session token and owner DID on app
+   * requests (the host's own API). The host page origin is always included.
+   * Every other origin gets the app's request without host credentials.
+   */
+  credentialedOrigins?: string[];
+  /**
+   * Issue app-scoped credentials (storage-node app tokens, host API app
+   * tokens) so embedded apps never receive the viewer's own session.
+   */
+  appCredentials?: (req: AppCredentialRequest) => Promise<AppCredentials | null>;
+  /** Verify and record app subscriptions (see `createSubscriptionRecorder`). */
+  recordSubscription?: EmbedHostServices["recordSubscription"];
+  /** See `HttpBridgeHost.forwardViewerSession`. Defaults to true. */
+  forwardViewerSession?: boolean;
 }
 
 /**
@@ -179,7 +212,25 @@ export function createLocalStorageEmbedHost(
   const identity = createLocalIdentityHost(options);
   const isEphemeralDid = options.isEphemeralDid ?? defaultIsEphemeralDid;
 
+  const credentialed = new Set<string>();
+  if (typeof window !== "undefined") credentialed.add(window.location.origin);
+  for (const origin of options.credentialedOrigins ?? []) {
+    try {
+      credentialed.add(new URL(origin).origin);
+    } catch {
+      /* ignore malformed origin */
+    }
+  }
+
   const httpBridgeHost: HttpBridgeHost = {
+    forwardViewerSession: options.forwardViewerSession ?? true,
+    isCredentialedUrl(url) {
+      try {
+        return credentialed.has(new URL(url).origin);
+      } catch {
+        return false;
+      }
+    },
     mergeFetchHeaders(_url, headers) {
       return { ...identity.authHeaders(), ...headers };
     },
@@ -198,6 +249,8 @@ export function createLocalStorageEmbedHost(
       return identity.loadDid();
     },
     handleIdentity: identity.handleIdentity,
+    ...(options.appCredentials ? { getAppCredentials: options.appCredentials } : {}),
+    ...(options.recordSubscription ? { recordSubscription: options.recordSubscription } : {}),
     ...options.services,
   };
 

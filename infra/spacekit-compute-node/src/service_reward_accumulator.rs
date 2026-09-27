@@ -3,12 +3,14 @@
 //! Wired from `SwtchvmNode::mine_block` when `SraHostConfig::enabled` is true.
 //! Spec: `spacekit-tokenomics/Service_Reward_Accumulator_Spec.md`
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use spacekit_service_rewards::{
-    address_to_did_hash, classify_log_topic, encode_credit, encode_get_total_emitted, encode_init,
+    address_to_did_hash, classify_log_topic, encode_credit, encode_end_poa,
+    encode_get_total_emitted, encode_init, encode_set_locked_recipient, lock_recipient_hashes,
     treasury_did_hash, CreditInstruction, ServiceCategory, ServiceRewardEvent, SraState,
 };
 use tokio::sync::RwLock;
@@ -34,6 +36,43 @@ pub struct SraHostConfig {
     /// Caller address for CREDIT (must match AstraRewards admin / INIT deployer).
     #[serde(default = "default_sra_admin")]
     pub sra_admin_address: String,
+    /// Operator DIDs affiliated with SWTCH Labs or the SpaceKit Foundation.
+    /// Their proof-of-authority credits are locked like the authorities'
+    /// (Tokenomics §1.11). Also read from `SPACEKIT_AFFILIATED_OPERATOR_DIDS`
+    /// (comma-separated).
+    #[serde(default)]
+    pub affiliated_operator_dids: Vec<String>,
+}
+
+/// Which recipients' credits AstraRewards must lock, derived from governance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RewardLockPolicy {
+    /// The network is still in proof of authority.
+    pub proof_of_authority: bool,
+    /// Recipient keys (see `lock_recipient_hashes`) whose PoA credits are locked.
+    pub recipients: BTreeSet<[u8; 32]>,
+}
+
+impl RewardLockPolicy {
+    /// Authorities plus affiliated operators, each under every key SRA may credit.
+    pub fn from_dids<'a>(proof_of_authority: bool, dids: impl IntoIterator<Item = &'a str>) -> Self {
+        let recipients = dids
+            .into_iter()
+            .filter(|d| !d.trim().is_empty())
+            .flat_map(lock_recipient_hashes)
+            .collect();
+        Self {
+            proof_of_authority,
+            recipients,
+        }
+    }
+}
+
+/// What has been applied to AstraRewards so far.
+#[derive(Debug, Default)]
+struct AppliedLockPolicy {
+    marked: BTreeSet<[u8; 32]>,
+    poa_ended: bool,
 }
 
 fn default_genesis_ts() -> u64 {
@@ -60,7 +99,21 @@ impl Default for SraHostConfig {
             apply_credits_onchain: default_apply_onchain(),
             astra_rewards_contract: default_astra_rewards_contract(),
             sra_admin_address: default_sra_admin(),
+            affiliated_operator_dids: Vec::new(),
         }
+    }
+}
+
+impl SraHostConfig {
+    /// Configured affiliated DIDs plus `SPACEKIT_AFFILIATED_OPERATOR_DIDS`.
+    pub fn affiliated_dids(&self) -> Vec<String> {
+        let mut dids = self.affiliated_operator_dids.clone();
+        if let Ok(raw) = std::env::var("SPACEKIT_AFFILIATED_OPERATOR_DIDS") {
+            dids.extend(raw.split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()));
+        }
+        dids.sort();
+        dids.dedup();
+        dids
     }
 }
 
@@ -85,6 +138,9 @@ pub struct SraHost {
     state: RwLock<SraState>,
     astra_rewards_initialized: RwLock<bool>,
     pub credits_by_block: RwLock<Vec<SraBlockCredits>>,
+    /// Desired lock policy, set from governance (sync so node setup can set it).
+    lock_policy: std::sync::RwLock<RewardLockPolicy>,
+    applied_lock_policy: RwLock<AppliedLockPolicy>,
 }
 
 impl SraHost {
@@ -94,7 +150,106 @@ impl SraHost {
             state: RwLock::new(SraState::new(config.genesis_timestamp_secs)),
             astra_rewards_initialized: RwLock::new(false),
             credits_by_block: RwLock::new(Vec::new()),
+            // Until governance says otherwise, lock the affiliated operators
+            // and treat the network as proof of authority. Crediting an
+            // authority unlocked by mistake cannot be undone; locking an
+            // unaffiliated operator by mistake is fixed by the next sync.
+            lock_policy: std::sync::RwLock::new(RewardLockPolicy::from_dids(
+                true,
+                config.affiliated_dids().iter().map(String::as_str),
+            )),
+            applied_lock_policy: RwLock::new(AppliedLockPolicy::default()),
         })
+    }
+
+    /// Update which recipients are locked: the current authorities and the
+    /// affiliated operators while `proof_of_authority` is true. Applied to
+    /// AstraRewards before the next block's credits.
+    pub fn set_lock_policy<'a>(
+        &self,
+        proof_of_authority: bool,
+        authority_dids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut dids: Vec<String> = authority_dids.into_iter().map(str::to_string).collect();
+        dids.extend(self.config.affiliated_dids());
+        let policy =
+            RewardLockPolicy::from_dids(proof_of_authority, dids.iter().map(String::as_str));
+        let mut guard = self
+            .lock_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *guard != policy {
+            tracing::info!(
+                proof_of_authority,
+                recipients = policy.recipients.len(),
+                "SRA reward lock policy updated"
+            );
+            *guard = policy;
+        }
+    }
+
+    pub fn lock_policy(&self) -> RewardLockPolicy {
+        self.lock_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Bring AstraRewards in line with the lock policy: mark new recipients,
+    /// unmark removed ones, and end PoA once governance has lifted it.
+    async fn sync_lock_policy_onchain(
+        &self,
+        runtime: &SwtchvmRuntime,
+        block_number: u64,
+        block_timestamp: u64,
+    ) -> Result<()> {
+        let policy = self.lock_policy();
+        let mut applied = self.applied_lock_policy.write().await;
+        if applied.poa_ended {
+            return Ok(());
+        }
+        let contract = parse_address(&self.config.astra_rewards_contract)?;
+        let admin = parse_address(&self.config.sra_admin_address)?;
+        let call = |payload: Vec<u8>, what: &'static str| {
+            let contract = contract;
+            let admin = admin;
+            async move {
+                let result = runtime
+                    .call_contract_public(
+                        &admin,
+                        &contract,
+                        &payload,
+                        protocol_context(&admin, block_number, block_timestamp, 200_000),
+                    )
+                    .await
+                    .context(what)?;
+                if !result.success {
+                    return Err(anyhow!(
+                        "{what} reverted: {}",
+                        String::from_utf8_lossy(&result.return_data)
+                    ));
+                }
+                Ok(())
+            }
+        };
+
+        if policy.proof_of_authority {
+            let to_mark: Vec<_> = policy.recipients.difference(&applied.marked).copied().collect();
+            for hash in to_mark {
+                call(encode_set_locked_recipient(hash, true), "AstraRewards SET_LOCKED_RECIPIENT").await?;
+                applied.marked.insert(hash);
+            }
+            let to_unmark: Vec<_> = applied.marked.difference(&policy.recipients).copied().collect();
+            for hash in to_unmark {
+                call(encode_set_locked_recipient(hash, false), "AstraRewards SET_LOCKED_RECIPIENT").await?;
+                applied.marked.remove(&hash);
+            }
+        } else {
+            call(encode_end_poa(), "AstraRewards END_POA").await?;
+            applied.poa_ended = true;
+            tracing::info!("AstraRewards: proof of authority ended; new credits are unlocked");
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -116,15 +271,21 @@ impl SraHost {
         let mut events = extract_events_from_logs(block_number, receipts);
         events.extend(events_from_tx_gas(block_number, transactions, receipts));
 
+        // Rewards settle when an epoch closes (ASTRA_EMISSION §5): close any
+        // finished epochs first, then record this block's events in its own.
         let mut state = self.state.write().await;
-        state.maybe_advance_epoch(block_timestamp);
-        let credits = state.process_events(&events);
+        let credits = state.maybe_advance_epoch(block_timestamp);
+        state.record_events(&events);
         drop(state);
 
         let mut onchain_applied = 0usize;
         let mut onchain_failed = 0usize;
         let mut records = Vec::with_capacity(credits.len());
 
+        // Lock marks must be on chain before any credit, or an authority's
+        // PoA reward would land unlocked. If they cannot be applied, hold this
+        // block's credits back rather than pay them unlocked.
+        let mut lock_ready = true;
         if self.config.apply_credits_onchain && !credits.is_empty() {
             if let Err(e) = self
                 .ensure_astra_rewards_initialized(runtime, block_number, block_timestamp)
@@ -132,11 +293,25 @@ impl SraHost {
             {
                 tracing::warn!(error = %e, "AstraRewards INIT skipped or failed");
             }
+            if let Err(e) = self
+                .sync_lock_policy_onchain(runtime, block_number, block_timestamp)
+                .await
+            {
+                lock_ready = false;
+                tracing::warn!(
+                    error = %e,
+                    block_number,
+                    "AstraRewards lock policy not applied; withholding this block's credits"
+                );
+            }
         }
 
         for credit in &credits {
             let mut onchain_ok = None;
-            if self.config.apply_credits_onchain && credit.amount_wei > 0 {
+            if self.config.apply_credits_onchain && credit.amount_wei > 0 && !lock_ready {
+                onchain_failed += 1;
+                onchain_ok = Some(false);
+            } else if self.config.apply_credits_onchain && credit.amount_wei > 0 {
                 match self
                     .apply_credit_onchain(runtime, block_number, block_timestamp, credit)
                     .await
@@ -316,7 +491,8 @@ fn events_from_tx_gas(
         let mut log_hash = [0u8; 32];
         log_hash[0..8].copy_from_slice(&block_number.to_le_bytes());
         log_hash[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-        log_hash[16..24].copy_from_slice(&receipt.gas_used.to_le_bytes());
+        // gas_used is u128 (16 bytes); a [16..24] slice panicked on every block.
+        log_hash[16..32].copy_from_slice(&receipt.gas_used.to_le_bytes());
         out.push(ServiceRewardEvent {
             operator_did_hash: address_to_did_hash(tx.from.as_bytes()),
             category: ServiceCategory::Compute,
@@ -381,5 +557,37 @@ fn read_resource_units(data: &[u8]) -> u128 {
         u128::from_le_bytes(a)
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod lock_policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_covers_authorities_and_affiliated_under_both_keys() {
+        let host = SraHost::new(SraHostConfig {
+            affiliated_operator_dids: vec![
+                "did:spacekit:testnet:1111111111111111111111111111111111111111".into(),
+            ],
+            ..SraHostConfig::default()
+        });
+        // Before governance syncs: PoA, affiliated operators locked.
+        let initial = host.lock_policy();
+        assert!(initial.proof_of_authority);
+        assert_eq!(initial.recipients.len(), 2);
+
+        host.set_lock_policy(
+            true,
+            ["did:spacekit:testnet:2222222222222222222222222222222222222222"],
+        );
+        let p = host.lock_policy();
+        assert_eq!(p.recipients.len(), 4);
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(&[0x22; 20]);
+        assert!(p.recipients.contains(&padded));
+
+        host.set_lock_policy(false, std::iter::empty());
+        assert!(!host.lock_policy().proof_of_authority);
     }
 }

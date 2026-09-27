@@ -115,7 +115,7 @@ pub fn mint_upload_token(
     if !issuer_did.starts_with("did:") {
         return Err(anyhow!("invalid issuer DID"));
     }
-    let ttl = req.ttl_seconds.min(MAX_TTL_SECONDS).max(1);
+    let ttl = req.ttl_seconds.clamp(1, MAX_TTL_SECONDS);
     let claims = UploadTokenClaims {
         sub: issuer_did.to_string(),
         op: req.operation,
@@ -167,19 +167,11 @@ pub fn verify_upload_token(secret: &[u8], token: &str, now: u64) -> Result<Uploa
     Ok(claims)
 }
 
-fn parse_did_header(value: &str) -> Option<String> {
-    let raw = if let Some(rest) = value.strip_prefix("DID ") {
-        rest.trim()
-    } else if let Some(rest) = value.strip_prefix("Bearer ") {
-        rest.trim()
-    } else {
-        return None;
-    };
-    if raw.starts_with("did:") && raw.len() > 10 {
-        Some(raw.to_string())
-    } else {
-        None
-    }
+/// Identity from an `Authorization` value that is not an upload token: an unscoped
+/// session token, or a bare DID where `request_auth` still accepts one (legacy
+/// mode, non-protected DIDs). See `crate::request_auth`.
+fn parse_did_header(value: &str, now: u64) -> Option<String> {
+    crate::request_auth::did_from_authorization(crate::request_auth::config(), value, now)
 }
 
 fn parse_upload_token_header(value: &str) -> Option<&str> {
@@ -197,7 +189,7 @@ pub fn optional_requester_did(
     now: u64,
 ) -> Option<String> {
     let header = auth?;
-    if let Some(did) = parse_did_header(header) {
+    if let Some(did) = parse_did_header(header, now) {
         return Some(did);
     }
     if header.starts_with(TOKEN_PREFIX) {
@@ -219,7 +211,7 @@ pub fn authorize_blob_write(
     now: u64,
 ) -> Option<String> {
     let header = auth?;
-    if let Some(did) = parse_did_header(header) {
+    if let Some(did) = parse_did_header(header, now) {
         return Some(did);
     }
     let token = header
@@ -245,7 +237,7 @@ pub fn authorize_blob_read(
     now: u64,
 ) -> Option<String> {
     let header = auth?;
-    if let Some(did) = parse_did_header(header) {
+    if let Some(did) = parse_did_header(header, now) {
         return Some(did);
     }
     let token = header
@@ -266,7 +258,7 @@ pub fn authorize_blob_read(
 /// Authorize fact POST via upload token (`PutFact`, resource `*` or fact id placeholder).
 pub fn authorize_fact_post(auth: Option<&str>, secret: Option<&[u8]>, now: u64) -> Option<String> {
     let header = auth?;
-    if let Some(did) = parse_did_header(header) {
+    if let Some(did) = parse_did_header(header, now) {
         return Some(did);
     }
     let token = header

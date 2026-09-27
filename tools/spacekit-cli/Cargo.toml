@@ -32,6 +32,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 blake3 = "1.5"
+# SPKG publisher signatures (src/spkg_signature.rs)
+ed25519-dalek = "2"
 dirs = "5.0"
 percent-encoding = "2"
 
