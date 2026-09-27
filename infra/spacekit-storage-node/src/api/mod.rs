@@ -1899,7 +1899,10 @@ Rebuild (e.g. `./build-docker-aws.sh`) so the storage node can load the server K
         };
 
         // Auth failures answer 401 with the reason instead of warp's default 500.
-        let routes = routes.recover(recover_auth_rejection).unify();
+        // `.boxed()` erases the Recover type: without it the server future is not
+        // general enough for the `tokio::spawn` in lib.rs (E0308, "one type is
+        // more general than the other").
+        let routes = routes.recover(recover_auth_rejection).unify().boxed();
         let routes = routes.with(cors).with(warp::log("spacekit-storage-api"));
 
         // Check HOST environment variable, default to 0.0.0.0 for container/VPC deployments

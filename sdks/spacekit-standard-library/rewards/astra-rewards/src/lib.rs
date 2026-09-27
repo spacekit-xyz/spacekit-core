@@ -30,6 +30,27 @@
 //! | GET_REMAINING_CAP   | 0x33 | (empty)                                    | [remaining 16]    |
 //! | GET_WITHDRAWAL_COUNT| 0x34 | [did_hash 32]                              | [count 8]         |
 //! | ROTATE_ADMIN        | 0xF0 | [new_admin_hash 32]                        | empty             |
+//! | GET_LOCKED          | 0x35 | [did_hash 32]                              | [locked 16][released 16][releasable 16] |
+//! | GET_PHASE           | 0x36 | (empty)                                    | [phase 1][genesis 8][cliff 8][end 8][pos_at 8] |
+//! | SET_LOCKED_RECIPIENT| 0x40 | [did_hash 32][flag 1]                      | empty             |
+//! | END_POA             | 0x41 | (empty)                                    | empty             |
+//! | RELEASE             | 0x42 | [did_hash 32]                              | [released 16]     |
+//!
+//! # Proof-of-authority reward lock (Tokenomics §1.11, ASTRA_EMISSION §8a)
+//!
+//! While the network is in proof of authority (`phase = 0`, set at INIT),
+//! CREDITs to a DID marked with SET_LOCKED_RECIPIENT (authorities and
+//! operators affiliated with SWTCH Labs or the Foundation) go to a locked
+//! balance instead of the spendable one. Locked ASTRA counts toward
+//! `total_emitted` like any credit.
+//!
+//! Locked ASTRA vests on a schedule fixed at INIT from the genesis block time:
+//! nothing before the cliff (365 days), then linearly until 1,095 days
+//! (36 months). RELEASE (callable by anyone for any DID) moves the vested,
+//! not-yet-released amount into the spendable balance; WITHDRAW releases the
+//! caller's vested amount first. END_POA (admin, irreversible) stops new
+//! credits from being locked; ASTRA locked before it keeps vesting on the same
+//! schedule.
 //!
 //! # Events
 //!
@@ -38,6 +59,10 @@
 //! - `astra_rewards.withdraw`        - balance transferred between DIDs
 //! - `astra_rewards.cap_reached`     - credit attempt rejected due to cap
 //! - `astra_rewards.admin_rotated`   - admin DID changed
+//! - `astra_rewards.credit_locked`   - PoA-phase credit added to a locked balance
+//! - `astra_rewards.released`        - vested locked ASTRA moved to the spendable balance
+//! - `astra_rewards.lock_recipient`  - a DID was marked or unmarked for locking
+//! - `astra_rewards.poa_ended`       - proof of authority ended; new credits unlocked
 //!
 //! # References
 //!
@@ -46,24 +71,26 @@
 //! - Service Reward Accumulator Integration Spec (Document G)
 //! - SpaceKit Tokenomics v2.0
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use spacekit_contract_sdk::{
-    emit_event_bytes, get_caller_did_hash, spacekit_contract,
+    block_timestamp, emit_event_bytes, get_caller_did_hash, spacekit_contract,
     spacekit_storage::{storage_load, storage_save},
     wire::read_u8,
     ContractError, ContractErrorCode, SpacekitContract,
 };
 
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
@@ -83,6 +110,18 @@ const OP_GET_TOTAL_EMITTED: u8 = 0x32;
 const OP_GET_REMAINING_CAP: u8 = 0x33;
 const OP_GET_WITHDRAWAL_COUNT: u8 = 0x34;
 const OP_ROTATE_ADMIN: u8 = 0xF0;
+const OP_GET_LOCKED: u8 = 0x35;
+const OP_GET_PHASE: u8 = 0x36;
+const OP_SET_LOCKED_RECIPIENT: u8 = 0x40;
+const OP_END_POA: u8 = 0x41;
+const OP_RELEASE: u8 = 0x42;
+
+// Proof-of-authority reward lock schedule (seconds after genesis).
+const LOCK_CLIFF_SECS: u64 = 365 * 86_400;
+const LOCK_END_SECS: u64 = 3 * 365 * 86_400;
+
+const PHASE_POA: u8 = 0;
+const PHASE_POS: u8 = 1;
 
 // Hard cap: 2,000,000,000 ASTRA with 18 decimals = 2 * 10^27 wei-ASTRA
 // 2_000_000_000 * 10^18 = 2_000_000_000_000_000_000_000_000_000
@@ -98,11 +137,17 @@ const ZERO_HASH: [u8; 32] = [0u8; 32];
 const KEY_TOTAL_EMITTED: &str = "astra_rewards.total_emitted";
 const KEY_IS_INITIALIZED: &str = "astra_rewards.is_initialized";
 const KEY_ADMIN: &str = "astra_rewards.admin";
+const KEY_PHASE: &str = "astra_rewards.phase";
+const KEY_GENESIS_TS: &str = "astra_rewards.genesis_ts";
+const KEY_POS_ACTIVATED_TS: &str = "astra_rewards.pos_activated_ts";
 
 // Storage key prefixes (concatenated with hex-encoded DID hash for per-DID data)
 const KEY_PREFIX_BALANCE: &str = "astra_rewards.balance.";
 const KEY_PREFIX_WITHDRAWN: &str = "astra_rewards.withdrawn.";
 const KEY_PREFIX_WITHDRAWAL_COUNT: &str = "astra_rewards.wcount.";
+const KEY_PREFIX_LOCKED: &str = "astra_rewards.locked.";
+const KEY_PREFIX_RELEASED: &str = "astra_rewards.released.";
+const KEY_PREFIX_LOCK_FLAG: &str = "astra_rewards.lockflag.";
 
 // ============================================================================
 // Contract
@@ -135,6 +180,11 @@ impl SpacekitContract for AstraRewards {
             OP_GET_REMAINING_CAP => op_get_remaining_cap(),
             OP_GET_WITHDRAWAL_COUNT => op_get_withdrawal_count(input, &mut cursor),
             OP_ROTATE_ADMIN => op_rotate_admin(input, &mut cursor),
+            OP_GET_LOCKED => op_get_locked(input, &mut cursor),
+            OP_GET_PHASE => op_get_phase(),
+            OP_SET_LOCKED_RECIPIENT => op_set_locked_recipient(input, &mut cursor),
+            OP_END_POA => op_end_poa(),
+            OP_RELEASE => op_release(input, &mut cursor),
             _ => Err(ContractError::InvalidInput),
         }
     }
@@ -170,6 +220,11 @@ fn op_init(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
 
     // Set admin to deployer
     storage_save(KEY_ADMIN, &deployer_hash)?;
+
+    // The network starts in proof of authority; the lock schedule is anchored
+    // to the genesis block time.
+    storage_save(KEY_PHASE, &[PHASE_POA])?;
+    write_u64(KEY_GENESIS_TS, block_timestamp())?;
 
     // Mark initialized
     storage_save(KEY_IS_INITIALIZED, &[1u8])?;
@@ -219,6 +274,26 @@ fn op_credit(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError>
         return Err(ContractError::CapExceeded);
     }
 
+    // Proof-of-authority credits to marked recipients are locked.
+    if read_phase()? == PHASE_POA && is_lock_recipient(&recipient_hash)? {
+        let locked = read_u128_or_zero(&locked_key(&recipient_hash))?;
+        let new_locked = locked.checked_add(amount).ok_or(ContractError::InvalidInput)?;
+        write_u128(&locked_key(&recipient_hash), new_locked)?;
+        write_u128(KEY_TOTAL_EMITTED, proposed_total)?;
+
+        // recipient (32) + amount (16) + log_event_hash (32) + locked_total (16) + total_emitted (16)
+        let mut payload = Vec::with_capacity(112);
+        payload.extend_from_slice(&recipient_hash);
+        payload.extend_from_slice(&amount.to_le_bytes());
+        payload.extend_from_slice(&log_event_hash);
+        payload.extend_from_slice(&new_locked.to_le_bytes());
+        payload.extend_from_slice(&proposed_total.to_le_bytes());
+        emit_event_bytes("astra_rewards.credit_locked", &payload);
+
+        // The spendable balance is unchanged.
+        return Ok(read_balance(&recipient_hash)?.to_le_bytes().to_vec());
+    }
+
     // Read recipient's current balance
     let current_balance = read_balance(&recipient_hash)?;
     let new_balance = current_balance.checked_add(amount).ok_or(ContractError::InvalidInput)?;
@@ -258,6 +333,9 @@ fn op_withdraw(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractErro
     if recipient_hash == ZERO_HASH {
         return Err(ContractError::InvalidInput);
     }
+
+    // Vested locked ASTRA becomes spendable before the balance check.
+    release_vested(&caller_hash)?;
 
     // Read caller's balance
     let caller_balance = read_balance(&caller_hash)?;
@@ -370,6 +448,138 @@ fn op_rotate_admin(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, Contract
 }
 
 // ============================================================================
+// Proof-of-authority reward lock
+// ============================================================================
+
+/// Vested part of `locked` at `now` for a schedule anchored at `genesis`:
+/// 0 before the cliff, linear from the cliff to the end, everything after.
+pub fn vested_amount(locked: u128, genesis: u64, now: u64) -> u128 {
+    let elapsed = now.saturating_sub(genesis);
+    if elapsed < LOCK_CLIFF_SECS {
+        return 0;
+    }
+    if elapsed >= LOCK_END_SECS {
+        return locked;
+    }
+    let since_cliff = (elapsed - LOCK_CLIFF_SECS) as u128;
+    let span = (LOCK_END_SECS - LOCK_CLIFF_SECS) as u128;
+    // locked <= 2e27 and since_cliff < 7e7, so the product fits in u128.
+    locked.saturating_mul(since_cliff) / span
+}
+
+fn read_phase() -> Result<u8, ContractError> {
+    match storage_load(KEY_PHASE) {
+        Ok(bytes) if !bytes.is_empty() => Ok(bytes[0]),
+        // Contracts initialized before the lock existed have no phase: they
+        // behave as proof of stake (nothing is locked).
+        _ => Ok(PHASE_POS),
+    }
+}
+
+fn is_lock_recipient(did_hash: &[u8; 32]) -> Result<bool, ContractError> {
+    match storage_load(&lock_flag_key(did_hash)) {
+        Ok(bytes) => Ok(bytes.first() == Some(&1)),
+        Err(_) => Ok(false),
+    }
+}
+
+/// `(locked_total, released, releasable_now)` for a DID.
+fn lock_position(did_hash: &[u8; 32]) -> Result<(u128, u128, u128), ContractError> {
+    let locked = read_u128_or_zero(&locked_key(did_hash))?;
+    let released = read_u128_or_zero(&released_key(did_hash))?;
+    if locked == 0 {
+        return Ok((0, released, 0));
+    }
+    let genesis = read_u64_or_zero(KEY_GENESIS_TS)?;
+    let vested = vested_amount(locked, genesis, block_timestamp());
+    Ok((locked, released, vested.saturating_sub(released)))
+}
+
+/// Move vested, unreleased ASTRA into the spendable balance. Returns the amount moved.
+fn release_vested(did_hash: &[u8; 32]) -> Result<u128, ContractError> {
+    let (locked, released, releasable) = lock_position(did_hash)?;
+    if releasable == 0 {
+        return Ok(0);
+    }
+    let new_released = released.checked_add(releasable).ok_or(ContractError::InvalidInput)?;
+    let new_balance = read_balance(did_hash)?
+        .checked_add(releasable)
+        .ok_or(ContractError::InvalidInput)?;
+    write_u128(&released_key(did_hash), new_released)?;
+    write_balance(did_hash, new_balance)?;
+
+    // did (32) + released_now (16) + released_total (16) + locked_total (16)
+    let mut payload = Vec::with_capacity(80);
+    payload.extend_from_slice(did_hash);
+    payload.extend_from_slice(&releasable.to_le_bytes());
+    payload.extend_from_slice(&new_released.to_le_bytes());
+    payload.extend_from_slice(&locked.to_le_bytes());
+    emit_event_bytes("astra_rewards.released", &payload);
+    Ok(releasable)
+}
+
+fn op_get_locked(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
+    let did_hash = read_did_hash(input, cursor)?;
+    let (locked, released, releasable) = lock_position(&did_hash)?;
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&locked.to_le_bytes());
+    out.extend_from_slice(&released.to_le_bytes());
+    out.extend_from_slice(&releasable.to_le_bytes());
+    Ok(out)
+}
+
+fn op_get_phase() -> Result<Vec<u8>, ContractError> {
+    let genesis = read_u64_or_zero(KEY_GENESIS_TS)?;
+    let mut out = Vec::with_capacity(33);
+    out.push(read_phase()?);
+    out.extend_from_slice(&genesis.to_le_bytes());
+    out.extend_from_slice(&genesis.saturating_add(LOCK_CLIFF_SECS).to_le_bytes());
+    out.extend_from_slice(&genesis.saturating_add(LOCK_END_SECS).to_le_bytes());
+    out.extend_from_slice(&read_u64_or_zero(KEY_POS_ACTIVATED_TS)?.to_le_bytes());
+    Ok(out)
+}
+
+/// Admin: mark (`flag = 1`) or unmark (`flag = 0`) a DID whose PoA-phase
+/// credits are locked. Marking has no effect after END_POA.
+fn op_set_locked_recipient(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
+    require_initialized()?;
+    require_admin()?;
+    let did_hash = read_did_hash(input, cursor)?;
+    let flag = read_u8(input, cursor)?;
+    if did_hash == ZERO_HASH || flag > 1 {
+        return Err(ContractError::InvalidInput);
+    }
+    storage_save(&lock_flag_key(&did_hash), &[flag])?;
+    let mut payload = Vec::with_capacity(33);
+    payload.extend_from_slice(&did_hash);
+    payload.push(flag);
+    emit_event_bytes("astra_rewards.lock_recipient", &payload);
+    Ok(Vec::new())
+}
+
+/// Admin: end proof of authority. Irreversible; later credits are unlocked.
+fn op_end_poa() -> Result<Vec<u8>, ContractError> {
+    require_initialized()?;
+    require_admin()?;
+    if read_phase()? == PHASE_POS {
+        return Ok(Vec::new());
+    }
+    let now = block_timestamp();
+    storage_save(KEY_PHASE, &[PHASE_POS])?;
+    write_u64(KEY_POS_ACTIVATED_TS, now)?;
+    emit_event_bytes("astra_rewards.poa_ended", &now.to_le_bytes());
+    Ok(Vec::new())
+}
+
+/// Anyone: release a DID's vested locked ASTRA into its spendable balance.
+fn op_release(input: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ContractError> {
+    require_initialized()?;
+    let did_hash = read_did_hash(input, cursor)?;
+    let released = release_vested(&did_hash)?;
+    Ok(released.to_le_bytes().to_vec())
+}
+
+// ============================================================================
 // Authorization helpers
 // ============================================================================
 
@@ -411,6 +621,18 @@ fn withdrawn_key(did_hash: &[u8; 32]) -> String {
 
 fn wcount_key(did_hash: &[u8; 32]) -> String {
     format!("{}{}", KEY_PREFIX_WITHDRAWAL_COUNT, hex_encode(did_hash))
+}
+
+fn locked_key(did_hash: &[u8; 32]) -> String {
+    format!("{}{}", KEY_PREFIX_LOCKED, hex_encode(did_hash))
+}
+
+fn released_key(did_hash: &[u8; 32]) -> String {
+    format!("{}{}", KEY_PREFIX_RELEASED, hex_encode(did_hash))
+}
+
+fn lock_flag_key(did_hash: &[u8; 32]) -> String {
+    format!("{}{}", KEY_PREFIX_LOCK_FLAG, hex_encode(did_hash))
 }
 
 // ============================================================================
@@ -494,5 +716,246 @@ fn hex_char(nibble: u8) -> char {
     }
 }
 
-// Unit tests: see `spacekit-tokenomics/tokenomics_update/AstraRewards.rs` (host tests)
-// or run `cargo check -p astra-rewards --target wasm32-unknown-unknown`.
+// Host tests below mock the SDK imports: `cargo test --lib` from this directory.
+// Build for deployment: `cargo build --release --target wasm32-unknown-unknown`.
+
+// ============================================================================
+// Host tests: the SDK's host imports are provided by an in-memory mock.
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    const YEAR: u64 = 365 * 86_400;
+    const GENESIS: u64 = 1_800_000_000;
+    const ASTRA: u128 = 1_000_000_000_000_000_000;
+
+    struct Host {
+        storage: HashMap<Vec<u8>, Vec<u8>>,
+        caller: String,
+        now: u64,
+        events: Vec<String>,
+    }
+
+    thread_local! {
+        static HOST: RefCell<Host> = RefCell::new(Host {
+            storage: HashMap::new(),
+            caller: String::new(),
+            now: 0,
+            events: Vec::new(),
+        });
+    }
+
+    #[no_mangle]
+    extern "C" fn storage_save(kp: *const u8, kl: usize, vp: *const u8, vl: usize) -> i32 {
+        let (k, v) = unsafe { (std::slice::from_raw_parts(kp, kl).to_vec(), std::slice::from_raw_parts(vp, vl).to_vec()) };
+        HOST.with(|h| h.borrow_mut().storage.insert(k, v));
+        0
+    }
+
+    #[no_mangle]
+    extern "C" fn storage_load(kp: *const u8, kl: usize, out: *mut u8, max: usize) -> i32 {
+        let k = unsafe { std::slice::from_raw_parts(kp, kl) };
+        HOST.with(|h| match h.borrow().storage.get(k) {
+            Some(v) => {
+                let n = v.len().min(max);
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, n) };
+                n as i32
+            }
+            None => -1,
+        })
+    }
+
+    #[no_mangle]
+    extern "C" fn get_caller_did(out: *mut u8, max: usize) -> i32 {
+        HOST.with(|h| {
+            let c = h.borrow().caller.clone();
+            let n = c.len().min(max);
+            unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), out, n) };
+            n as i32
+        })
+    }
+
+    #[no_mangle]
+    extern "C" fn get_timestamp() -> i64 {
+        HOST.with(|h| h.borrow().now as i64)
+    }
+
+    #[no_mangle]
+    extern "C" fn emit_event(tp: *const u8, tl: usize, _dp: *const u8, _dl: usize) {
+        let t = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(tp, tl)) }.to_string();
+        HOST.with(|h| h.borrow_mut().events.push(t));
+    }
+
+    fn as_caller(did: &str) {
+        HOST.with(|h| h.borrow_mut().caller = did.to_string());
+    }
+    fn at(now: u64) {
+        HOST.with(|h| h.borrow_mut().now = now);
+    }
+    fn events() -> Vec<String> {
+        HOST.with(|h| h.borrow().events.clone())
+    }
+
+    fn call(input: Vec<u8>) -> Result<Vec<u8>, ContractError> {
+        AstraRewards.handle(&input)
+    }
+    fn u128_at(bytes: &[u8], i: usize) -> u128 {
+        u128::from_le_bytes(bytes[i * 16..i * 16 + 16].try_into().unwrap())
+    }
+
+    const ADMIN: &str = "did:spacekit:network:sra";
+    fn h(did: &str) -> [u8; 32] {
+        spacekit_contract_sdk::hash_did_bytes(did.as_bytes())
+    }
+
+    fn init() {
+        as_caller(ADMIN);
+        at(GENESIS);
+        let mut i = vec![OP_INIT];
+        i.extend_from_slice(&h("did:spacekit:network:treasury"));
+        call(i).unwrap();
+    }
+    fn credit(to: &str, amount: u128) -> Result<Vec<u8>, ContractError> {
+        as_caller(ADMIN);
+        let mut i = vec![OP_CREDIT];
+        i.extend_from_slice(&h(to));
+        i.extend_from_slice(&amount.to_le_bytes());
+        i.extend_from_slice(&[7u8; 32]);
+        call(i)
+    }
+    fn mark(did: &str, flag: u8) -> Result<Vec<u8>, ContractError> {
+        let mut i = vec![OP_SET_LOCKED_RECIPIENT];
+        i.extend_from_slice(&h(did));
+        i.push(flag);
+        call(i)
+    }
+    fn balance(did: &str) -> u128 {
+        let mut i = vec![OP_GET_BALANCE];
+        i.extend_from_slice(&h(did));
+        u128_at(&call(i).unwrap(), 0)
+    }
+    fn locked(did: &str) -> (u128, u128, u128) {
+        let mut i = vec![OP_GET_LOCKED];
+        i.extend_from_slice(&h(did));
+        let r = call(i).unwrap();
+        (u128_at(&r, 0), u128_at(&r, 1), u128_at(&r, 2))
+    }
+    fn withdraw(from: &str, to: &str, amount: u128) -> Result<Vec<u8>, ContractError> {
+        as_caller(from);
+        let mut i = vec![OP_WITHDRAW];
+        i.extend_from_slice(&h(to));
+        i.extend_from_slice(&amount.to_le_bytes());
+        call(i)
+    }
+    fn total_emitted() -> u128 {
+        u128_at(&call(vec![OP_GET_TOTAL_EMITTED]).unwrap(), 0)
+    }
+
+    #[test]
+    fn vesting_curve() {
+        let l = 1_200 * ASTRA;
+        assert_eq!(vested_amount(l, GENESIS, GENESIS), 0);
+        assert_eq!(vested_amount(l, GENESIS, GENESIS + YEAR - 1), 0);
+        assert_eq!(vested_amount(l, GENESIS, GENESIS + YEAR), 0);
+        assert_eq!(vested_amount(l, GENESIS, GENESIS + 2 * YEAR), l / 2);
+        assert_eq!(vested_amount(l, GENESIS, GENESIS + 3 * YEAR), l);
+        assert_eq!(vested_amount(l, GENESIS, GENESIS + 10 * YEAR), l);
+        assert_eq!(vested_amount(2_000_000_000 * ASTRA, GENESIS, GENESIS + 3 * YEAR - 1) > 0, true);
+    }
+
+    #[test]
+    fn poa_credits_to_authorities_are_locked_and_vest() {
+        init();
+        let authority = "did:spacekit:testnet:aaaa";
+        let independent = "did:spacekit:testnet:bbbb";
+        as_caller(ADMIN);
+        mark(authority, 1).unwrap();
+
+        credit(authority, 900 * ASTRA).unwrap();
+        credit(independent, 100 * ASTRA).unwrap();
+        assert_eq!(balance(authority), 0);
+        assert_eq!(locked(authority), (900 * ASTRA, 0, 0));
+        assert_eq!(balance(independent), 100 * ASTRA);
+        // Locked credits still count against the cap.
+        assert_eq!(total_emitted(), 350_000_000 * ASTRA + 1_000 * ASTRA);
+        assert!(events().iter().any(|e| e == "astra_rewards.credit_locked"));
+
+        // Nothing can move before the cliff.
+        at(GENESIS + YEAR / 2);
+        assert!(matches!(withdraw(authority, independent, 1).unwrap_err(), ContractError::InsufficientBalance));
+
+        // Halfway through vesting: half is releasable, and WITHDRAW releases it.
+        at(GENESIS + 2 * YEAR);
+        assert_eq!(locked(authority), (900 * ASTRA, 0, 450 * ASTRA));
+        withdraw(authority, independent, 400 * ASTRA).unwrap();
+        assert_eq!(balance(authority), 50 * ASTRA);
+        assert_eq!(locked(authority), (900 * ASTRA, 450 * ASTRA, 0));
+        assert!(withdraw(authority, independent, 100 * ASTRA).is_err());
+
+        // Anyone can RELEASE after full vesting.
+        at(GENESIS + 3 * YEAR);
+        as_caller(independent);
+        let mut i = vec![OP_RELEASE];
+        i.extend_from_slice(&h(authority));
+        assert_eq!(u128_at(&call(i).unwrap(), 0), 450 * ASTRA);
+        assert_eq!(balance(authority), 500 * ASTRA);
+        assert_eq!(locked(authority), (900 * ASTRA, 900 * ASTRA, 0));
+    }
+
+    #[test]
+    fn end_poa_stops_new_locks_but_keeps_schedule() {
+        init();
+        let authority = "did:spacekit:testnet:cccc";
+        as_caller(ADMIN);
+        mark(authority, 1).unwrap();
+        credit(authority, 100 * ASTRA).unwrap();
+
+        at(GENESIS + 30 * 86_400);
+        as_caller(ADMIN);
+        call(vec![OP_END_POA]).unwrap();
+        let phase = call(vec![OP_GET_PHASE]).unwrap();
+        assert_eq!(phase[0], PHASE_POS);
+        assert_eq!(u64::from_le_bytes(phase[25..33].try_into().unwrap()), GENESIS + 30 * 86_400);
+
+        credit(authority, 50 * ASTRA).unwrap();
+        assert_eq!(balance(authority), 50 * ASTRA);
+        assert_eq!(locked(authority).0, 100 * ASTRA);
+        // Still locked until the cliff.
+        at(GENESIS + YEAR - 1);
+        assert_eq!(locked(authority).2, 0);
+    }
+
+    #[test]
+    fn lock_admin_ops_require_admin() {
+        init();
+        as_caller("did:spacekit:testnet:mallory");
+        assert!(matches!(mark("did:spacekit:testnet:x", 1).unwrap_err(), ContractError::Unauthorized));
+        assert!(matches!(call(vec![OP_END_POA]).unwrap_err(), ContractError::Unauthorized));
+        as_caller(ADMIN);
+        assert!(matches!(mark("did:spacekit:testnet:x", 2).unwrap_err(), ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn unmarked_or_legacy_contracts_credit_normally() {
+        init();
+        // Unmarking restores normal credits during PoA.
+        let d = "did:spacekit:testnet:dddd";
+        as_caller(ADMIN);
+        mark(d, 1).unwrap();
+        mark(d, 0).unwrap();
+        credit(d, 5 * ASTRA).unwrap();
+        assert_eq!(balance(d), 5 * ASTRA);
+
+        // A contract initialized before the lock existed has no phase key.
+        HOST.with(|h| {
+            h.borrow_mut().storage.remove(KEY_PHASE.as_bytes());
+        });
+        mark(d, 1).unwrap();
+        credit(d, 5 * ASTRA).unwrap();
+        assert_eq!(balance(d), 10 * ASTRA);
+    }
+}

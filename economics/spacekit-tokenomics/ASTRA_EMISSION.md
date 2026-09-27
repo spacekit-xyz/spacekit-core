@@ -1,7 +1,7 @@
 # ASTRA Emission Schedule
 
 **Status:** Canonical technical reference
-**Version:** 1.0
+**Version:** 1.1: bootstrap is proof of authority with no stake pool; PoA-phase reward locking (§8, §8a); per-epoch settlement (§5)
 **Owner:** SWTCH Labs
 **Date:** 2026
 **References:** ASTRA Economic Model Decision Memo; SpaceKit Tokenomics v2.0
@@ -34,7 +34,7 @@ ASTRA emission follows a halving curve similar to Bitcoin's, adapted for SpaceKi
 
 **Asymptotic total:** Integrating the decay function from t=0 to infinity yields `initial * 4 / ln(2) ≈ 1.154 * initial`. With initial = 200M, asymptotic total ever-emitted = ~1.154 * 200M = ~1,154 million = 1.154B ASTRA.
 
-**Unused headroom:** 2B cap minus 1.154B asymptotic emission = ~846M ASTRA reserved for treasury allocation, governance reserves, and bootstrap subsidies.
+**Unused headroom:** 2B cap minus 1.154B asymptotic emission = ~846M ASTRA reserved for treasury allocation and governance reserves.
 
 ## 3. Year-by-year emission projection
 
@@ -95,7 +95,7 @@ In practice this is implemented as a per-epoch (e.g., per-day) computation:
 2. During the epoch, events accumulate against the epoch's allocation.
 3. At the end of the epoch, each event's earned ASTRA is computed as `(event_resource / epoch_total_resource) * epoch_emission_per_category`.
 
-If an epoch sees no activity in a category, its allocation rolls over to the next epoch. If an epoch sees activity exceeding the natural distribution, all events in that epoch share the epoch's fixed allocation (no overshoot of annual budget).
+If an epoch sees no activity in a category, its allocation rolls over to the next epoch. If an epoch sees activity exceeding the natural distribution, all events in that epoch share the epoch's fixed allocation (no overshoot of annual budget). Credits for an epoch are issued in the first block of the following epoch.
 
 ## 6. Resource measurement per category
 
@@ -131,7 +131,6 @@ A portion of the 2B cap is held in a multi-signature wallet controlled by SWTCH 
 - Protocol development funding (paying contributors who build SpaceKit)
 - Audit and security work (paying for independent audits, bug bounties)
 - Operational reserves (covering operational costs during the network's pre-revenue period)
-- Bootstrap subsidies (initial allocations to early validators when no operator has earned enough through service to stake)
 - Future ecosystem grants (subject to legal review and on-chain governance approval)
 
 **Treasury initial allocation: 350,000,000 ASTRA (17.5% of cap).**
@@ -142,17 +141,40 @@ This is minted to the treasury wallet at protocol genesis. It is NOT subject to 
 
 **Treasury cannot be expanded.** Once the 350M treasury is allocated at genesis, the cap is binding. No additional treasury minting is possible. If the treasury depletes, governance can extend operator emission (if cap allows), but no new treasury allocation can be created beyond the genesis 350M.
 
-## 8. Bootstrap allocation
+## 8. Bootstrap: proof of authority, no stake pool
 
 The protocol faces a chicken-and-egg problem: validators need staked ASTRA to participate in consensus, but ASTRA is earned through service (including validation). At genesis, no one has earned ASTRA yet.
 
-**Solution: Bootstrap pool of 50,000,000 ASTRA (2.5% of cap), drawn from treasury allocation at genesis.**
+**Solution, part 1: proof of authority while the network is small.** The network starts in proof of authority. Genesis authorities validate without stake, and new validators are admitted by a two-thirds vote of the authorities. The network can move to proof of stake only once it has at least 10 validators, and only through a passed `lift_poa` proposal. After the lift, authorities have 30 days to register stake. No ASTRA is handed to the genesis validators to make this work.
 
-This is distributed to initial validators (the set that launches the network) as stake. Each initial validator receives a fixed allocation sufficient to meet the minimum stake requirement.
+**No bootstrap pool, no lending, no seeding.** No ASTRA is set aside for validator stake, lent or delegated to operators, or supplied to markets. After proof of authority ends, every validator stakes ASTRA it earned:
 
-After bootstrap, validators self-fund their stake from earned ASTRA. The bootstrap pool is one-time only and not refilled.
+- **Authorities** stake from their PoA-phase earnings. Locked ASTRA is stakeable (§8a), so the launch operators can meet the minimum without selling anything or receiving anything.
+- **Independent operators** earn unlocked ASTRA from compute, storage and messaging service during PoA, and stake from that.
+- **Liquidity** comes only from operators trading ASTRA they earned. Neither SWTCH Labs nor the treasury seeds markets.
 
-Bootstrap allocations are subject to vesting (e.g., 4-year linear vesting from network genesis). This prevents early validators from immediately liquidating their bootstrap stake.
+The 50M that earlier drafts earmarked for bootstrap stake stays in the genesis treasury.
+
+## 8a. Operator rewards during proof of authority
+
+Emission during the PoA phase follows the normal schedule (§2–6): same curve, same category shares, same per-epoch proportional allocation. Nothing is capped or redirected.
+
+**Locking.** ASTRA credited during the PoA phase to an authority DID, or to any operator DID affiliated with SWTCH Labs or the SpaceKit Foundation, is credited to a **locked balance** in AstraRewards:
+
+| Parameter | Value |
+|---|---|
+| Applies to | Credits during the PoA phase to authority or affiliated DIDs |
+| Cliff | 12 months from network genesis |
+| Vesting | Linear from month 12 to month 36 after genesis |
+| Stakeable while locked | Yes; slashable |
+| Transferable / spendable while locked | No |
+| After the PoA → PoS lift | New credits are unlocked (normal rules) |
+
+Unlocked amount at time `t` (months since genesis) for a locked balance `L`: `0` if `t < 12`; `L × (t − 12) / 24` if `12 ≤ t < 36`; `L` if `t ≥ 36`. Staked locked ASTRA that is slashed reduces `L`.
+
+**Illustration.** Year-1 emission is 200M, so the first three months emit about 50M across all categories. If 3 authorities provide all of that service, each earns about 16.7M ASTRA, and all of it is locked until month 12 of the network. Adding operators spreads the same emission more thinly: the schedule does not change with the operator count. These figures are illustrative; actual credits depend on measured service (§5–6).
+
+**Why lock instead of cap.** Capping would underpay the operators who carry the network's early risk and cost. Locking pays them for their work but removes early sell pressure and insider-liquidity concerns. It also turns the launch set's earnings into long-term stake.
 
 ## 9. Headroom utilization
 
@@ -161,7 +183,6 @@ Total cap: 2,000,000,000 ASTRA
 Allocations:
 - Operator emission (asymptotic): ~1,154,000,000 (~57.7%)
 - Treasury initial allocation: 350,000,000 (17.5%)
-- (Bootstrap drawn from treasury, included above)
 
 Total allocated/projected emission: ~1,504,000,000 (~75.2%)
 Unused headroom: ~496,000,000 (~24.8%)
@@ -170,7 +191,6 @@ Unused headroom: ~496,000,000 (~24.8%)
 
 1. On-chain governance proposal to extend operator emission (e.g., adjusting the decay curve to be slower)
 2. On-chain governance proposal to fund a specific ecosystem program (with legal review and disclosure)
-3. On-chain governance proposal to refill the bootstrap pool (if the network needs additional bootstrap allocation in the future)
 
 The reserve cannot be allocated unilaterally by SWTCH Labs. Governance approval is required.
 
@@ -202,13 +222,13 @@ Where:
 
 The formula is implemented in fixed-point arithmetic in the reward accumulator to maintain determinism across all validators computing the same emission limits.
 
-Per-event emission within an epoch is computed dynamically:
+Within an epoch the accumulator only records each operator's measured units per category. When the epoch closes (the first block of the next epoch), each operator is credited:
 
 ```
-event_emission = epoch_remaining_allocation * (event_resource / epoch_remaining_resource)
+operator_emission = epoch_category_allocation * (operator_units / epoch_total_units)
 ```
 
-Updated incrementally as events accumulate.
+Rounding dust and the allocation of idle categories roll over to the next epoch. (An earlier incremental formula credited each event on arrival, which gave the first event of every epoch the whole remaining allocation.)
 
 ## 12. Governance over the schedule
 
@@ -217,7 +237,7 @@ The following parameters may be adjusted by on-chain governance:
 **Adjustable:**
 - Per-category emission shares (each between 5% and 60%, summing to 100%)
 - Resource weighting within categories (e.g., balance between block proposal rewards and vote rewards in consensus category)
-- Bootstrap pool refill (using unused headroom)
+- The PoA-phase lock parameters (cliff, vesting length), for rewards not yet credited; never retroactively
 - Treasury spending decisions (within the 350M treasury allocation)
 
 **Constrained but adjustable with high quorum:**
@@ -258,6 +278,9 @@ A few honest acknowledgments:
 | **SRA (reward accumulator)** | Wired (compute host) | [`spacekit-service-rewards`](../spacekit-service-rewards/), [`spacekit-compute-node/src/service_reward_accumulator.rs`](../spacekit-compute-node/src/service_reward_accumulator.rs) — hooks `SwtchvmNode::mine_block`; enable via `[compute.sra_config] enabled = true` |
 | **SRA → AstraRewards CREDIT** | Wired (when WASM built) | `SraHost` calls `OP_CREDIT` via `SwtchvmRuntime::call_contract_public` from `sra_admin_address`; set `apply_credits_onchain = false` to audit-only |
 | **Service log schema** | `spacekit-log` | `EventKind::Service` — canonical SRA topics; compute-node emits `ContractExecuted` on mined txs |
+| **Proof-of-authority bootstrap** | Implemented | `spacekit-compute-node/src/validator_governance.rs`, [`GOVERNANCE.md`](../../infra/spacekit-compute-node/GOVERNANCE.md): authorities, signed proposals, 10-validator lift, 30-day PoS grace |
+| **PoA-phase reward lock (§8a)** | Implemented | AstraRewards `SET_LOCKED_RECIPIENT` / `END_POA` / `RELEASE` / `GET_LOCKED` / `GET_PHASE`; locked balances vest from the INIT block time. `SraHost` marks the current authorities and `affiliated_operator_dids` (`SPACEKIT_AFFILIATED_OPERATOR_DIDS`) before crediting, and withholds a block's credits if the marks cannot be applied |
+| **Per-epoch settlement (§5)** | Implemented | `SraState::record_events` + `maybe_advance_epoch`: each category's epoch budget is split by measured units when the epoch closes |
 | **Storage/compute node minting** | Legacy testnet | Per-node calculators + daily caps — disable `enable_token_minting` when SRA is enabled — see [`operator-guides/README.md`](./operator-guides/README.md) |
 
 Legacy node `enable_token_minting` paths are **not** the production emission model; use SRA + AstraRewards for mainnet-aligned emission.

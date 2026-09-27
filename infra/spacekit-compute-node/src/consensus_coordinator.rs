@@ -30,6 +30,21 @@ pub struct ValidatorEntry {
     pub sphincs_public_key: Option<Vec<u8>>,
     /// Stake backing this validator, in micro-USD.
     pub stake_units: u128,
+    /// How the validator was admitted.
+    pub admission: ValidatorAdmission,
+}
+
+/// How a validator entered the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorAdmission {
+    /// The local node at bootstrap (no verifiable key).
+    LocalBootstrap,
+    /// Registered with stake at or above the minimum.
+    Stake,
+    /// Admitted without stake by proof-of-authority genesis or governance
+    /// ([`crate::validator_governance`]).
+    Authority,
 }
 
 /// Domain separator for validator registration proofs.
@@ -279,6 +294,7 @@ impl ConsensusCoordinator {
                 joined_at: Utc::now(),
                 sphincs_public_key: None,
                 stake_units: 0,
+                admission: ValidatorAdmission::LocalBootstrap,
             });
     }
 
@@ -340,9 +356,76 @@ impl ConsensusCoordinator {
                 joined_at: Utc::now(),
                 sphincs_public_key: Some(sphincs_public_key),
                 stake_units,
+                admission: ValidatorAdmission::Stake,
             },
         );
         Ok(())
+    }
+
+    /// Admit a proof-of-authority validator: no stake, but the DID must still
+    /// be derived from the key so votes are attributable.
+    ///
+    /// Only [`crate::validator_governance`] calls this, for genesis
+    /// authorities and executed `add_authority` proposals. An existing entry
+    /// with a different key is refused, as in
+    /// [`register_validator_with_key`](Self::register_validator_with_key).
+    pub async fn register_authority(&self, did: String, sphincs_public_key: Vec<u8>) -> Result<()> {
+        let expected_address = {
+            use sha2::Digest;
+            hex::encode(&sha2::Sha256::digest(&sphincs_public_key)[..20])
+        };
+        if !did.ends_with(&expected_address) {
+            anyhow::bail!("DID {did} is not derived from the supplied public key");
+        }
+        let mut validators = self.validators.write().await;
+        if let Some(existing) = validators.get(&did) {
+            if existing
+                .sphincs_public_key
+                .as_ref()
+                .is_some_and(|k| k != &sphincs_public_key)
+            {
+                anyhow::bail!("validator {did} is already registered with a different key");
+            }
+            if existing.admission == ValidatorAdmission::Stake {
+                // Already staked; keep the stake record.
+                return Ok(());
+            }
+        }
+        validators.insert(
+            did.clone(),
+            ValidatorEntry {
+                did,
+                joined_at: Utc::now(),
+                sphincs_public_key: Some(sphincs_public_key),
+                stake_units: 0,
+                admission: ValidatorAdmission::Authority,
+            },
+        );
+        Ok(())
+    }
+
+    /// After proof of stake activates and its grace period ends, drop the
+    /// listed authorities that never registered stake. Returns the DIDs removed.
+    pub async fn remove_unstaked_authorities(&self, dids: &[String]) -> Vec<String> {
+        let mut validators = self.validators.write().await;
+        let mut removed = Vec::new();
+        for did in dids {
+            if validators
+                .get(did)
+                .is_some_and(|v| v.admission == ValidatorAdmission::Authority)
+            {
+                validators.remove(did);
+                removed.push(did.clone());
+            }
+        }
+        removed
+    }
+
+    /// Current validator entries, for status endpoints.
+    pub async fn validator_entries(&self) -> Vec<ValidatorEntry> {
+        let mut entries: Vec<_> = self.validators.read().await.values().cloned().collect();
+        entries.sort_by(|a, b| a.did.cmp(&b.did));
+        entries
     }
 
     /// Remove a validator.

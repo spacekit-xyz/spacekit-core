@@ -3,6 +3,7 @@
 mod code_session;
 mod repo_lang;
 mod fact_cmd;
+mod governance_cmd;
 mod identity_cmd;
 mod keymaster_cmd;
 mod migration_cmd;
@@ -432,6 +433,9 @@ enum Commands {
     /// Network operations and service discovery
     #[command(subcommand)]
     Network(NetworkCommands),
+
+    /// Proof-of-authority validator governance: propose, sign, and vote
+    Governance(governance_cmd::GovernanceArgs),
 
     // Disabled: consensus operations and governance
     // /// Consensus operations and governance
@@ -16399,7 +16403,8 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
         // Network profile, manifest, diagnostics, and E2E commands own their
         // configuration loading. In particular, `network init` and `network
         // test` must work from an empty HOME on a clean developer machine.
-        | Commands::Network(_) => None,
+        | Commands::Network(_)
+        | Commands::Governance(_) => None,
         Commands::Keypair { .. }
         | Commands::Encapsulate { .. }
         | Commands::Decapsulate { .. }
@@ -16432,6 +16437,10 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
     // Handle network operations commands
     if let Commands::Network(network_command) = &cli.command {
         return handle_network_command(network_command).await;
+    }
+
+    if let Commands::Governance(governance_args) = &cli.command {
+        return governance_cmd::handle_governance_command(governance_args).await;
     }
 
     // Disabled: consensus operations commands

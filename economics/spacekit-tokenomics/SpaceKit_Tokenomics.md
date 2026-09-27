@@ -1,6 +1,7 @@
-# SpaceKit Tokenomics v2.0
+# SpaceKit Tokenomics v2.1
 
 **Status:** Canonical technical specification
+**Version:** 2.1: adds the proof-of-authority bootstrap phase and its operator reward rules (§1.5, §1.7, §1.10, §1.11)
 **Date:** 2026
 **Owner:** SWTCH Labs
 **Location:** [`spacekit-tokenomics/`](./) (canonical). **Supersedes:** [`archive/SpaceKit_Tokenomics_v1.md`](./archive/SpaceKit_Tokenomics_v1.md) (April 2026, aUSD-era)
@@ -95,6 +96,8 @@ This separates the "access right" (the stake) from the "earning mechanism" (the 
 
 Slashing parameters (minimum stake, slashing fractions per misbehavior category, withdrawal delay) are set by protocol governance. Initial parameters are documented separately in the validator operations guide.
 
+**Exception: the proof-of-authority bootstrap.** The staking requirement applies from the end of the bootstrap phase. While the network has fewer than 10 validators, it runs in proof of authority: validators are admitted by vote of the existing authorities and validate without stake. See §1.11.
+
 ### 1.6 Network resource pricing
 
 ASTRA is consumed when network resources are used:
@@ -124,6 +127,8 @@ Governance votes are weighted by stake — operators who have ASTRA locked as va
 
 The governance mechanism is described in detail in the governance specification (`SpaceKit_Governance.md`).
 
+During the proof-of-authority bootstrap there is no stake to weight votes by. Only validator-set governance runs in that phase, with one vote per authority. It covers admitting authorities, removing them, and lifting PoA (§1.11). Protocol parameters (emission, category shares, slashing, fees) stay at their genesis values until stake-weighted governance begins at the end of the bootstrap. A security fix may be shipped before then as a coordinated protocol upgrade, announced publicly with its reasoning.
+
 ### 1.8 No yield products
 
 SpaceKit does not offer (and the protocol does not implement) any of the following:
@@ -131,6 +136,8 @@ SpaceKit does not offer (and the protocol does not implement) any of the followi
 - ASTRA staking pools that pay yield denominated in ASTRA
 - Lending mechanisms where ASTRA holders deposit ASTRA and receive interest
 - Liquidity mining programs
+- Liquidity seeding: neither SWTCH Labs nor the treasury supplies ASTRA to markets
+- Stake lending or delegation from the treasury
 - Inflation rewards for passive ASTRA holders
 - Any other passive-yield instrument denominated in ASTRA
 
@@ -152,11 +159,40 @@ If SWTCH Labs at any future point considers any form of token distribution beyon
 
 **Genesis treasury: 350,000,000 ASTRA (17.5% of cap).** Minted to the treasury DID at protocol genesis via the AstraRewards `INIT` operation. Held under multi-sig control by SWTCH Labs. Used for protocol development, audits, operational reserves, and ecosystem grants (subject to legal review per Section 1.9). **Not subject to the halving curve** — it exists at genesis and decreases only when spent. **Cannot be expanded** beyond the genesis 350M allocation.
 
-**Bootstrap pool: 50,000,000 ASTRA (2.5% of cap)** drawn from treasury at genesis for initial validator stake. One-time only; subject to vesting (e.g. 4-year linear from genesis). See **[`ASTRA_EMISSION.md`](./ASTRA_EMISSION.md)** sections 7–8.
+**No bootstrap pool, no lending, no liquidity seeding.** No ASTRA is set aside to stake for validators, lent or delegated to operators, or supplied to markets. In proof of authority, validators need no stake. After it ends, every validator stakes ASTRA it earned itself through service, locked or unlocked (§1.11). Markets for ASTRA form only from operators trading what they earned; neither SWTCH Labs nor the treasury seeds liquidity. The 50M that earlier drafts earmarked for bootstrap stake stays in the genesis treasury under §1.9's rules. See **[`ASTRA_EMISSION.md`](./ASTRA_EMISSION.md)** §8.
 
 **Protocol reserve:** ~496M ASTRA headroom under the 2B cap (cap minus asymptotic operator emission minus treasury) allocatable only by on-chain governance.
 
 Operator emission and treasury credits are tracked in **AstraRewards** (`total_emitted`). ASTRA paid as gas for network resources flows to operators serving work; it is separate from the SRA emission path.
+
+### 1.11 Proof-of-authority bootstrap and operator rewards
+
+A new SpaceKit network starts with a small set of **authorities**: operators named in the genesis file, run by SWTCH Labs and invited partners. Early on there is no earned ASTRA to stake, and a handful of validators cannot provide meaningful stake-based Sybil resistance. Admission by known operators is the honest security model for that stage.
+
+**Phase rules.**
+
+| | Proof of authority (bootstrap) | Proof of stake |
+|---|---|---|
+| Who validates | Authorities admitted by genesis or by governance vote | Operators who register the minimum stake |
+| Stake | None required | Required, slashable |
+| Validator-set changes | Signed proposals, one vote per authority, passes at two-thirds | Stake registration |
+| Protocol-parameter governance | Frozen at genesis values | Stake-weighted (§1.7) |
+| Service rewards | Full category emission, **locked** for authorities (below) | Full category emission, unlocked |
+
+**Leaving proof of authority.** The authorities can vote to lift PoA only once there are at least **10 validators**. Nothing switches automatically: the lift takes a passed `lift_poa` proposal. After the lift, authorities have a **30-day grace period** to register stake from ASTRA they earned, including their locked balance. Authorities that do not stake stop validating. The mechanism is specified in the compute node's `GOVERNANCE.md`.
+
+**Authority rewards are locked.** Authorities earn the normal emission for the service they provide (consensus, compute, storage, messaging) under §1.3–1.4. Nothing is capped or redirected. But ASTRA credited during the PoA phase to authority DIDs, or to any operator DID affiliated with SWTCH Labs or the SpaceKit Foundation, is locked:
+
+- **Cliff:** nothing unlocks for 12 months from network genesis.
+- **Linear vesting:** after the cliff, the locked balance unlocks linearly until month 36.
+- **Stakeable while locked:** locked ASTRA can be registered as validator stake when PoS begins, and remains slashable. It cannot be transferred, sold or spent on gas until it unlocks.
+- **Scope:** only PoA-phase credits are locked. ASTRA earned after the lift follows the normal rules. Independent operators who are not authorities and not affiliated earn unlocked rewards throughout.
+
+**Why.** With three or four authorities sharing the whole consensus category, and often the other categories too, a few operators receive most of the early emission. For example, with 3 authorities running all four categories in the first three months, about 50M ASTRA would be split roughly 16.7M each. Locking those rewards means the operators who launched the network cannot sell into the first year. It also keeps their incentive tied to the network's long-term health, and puts their early earnings to work as stake rather than as liquid supply. It is not a sale or an allocation: authorities earn only for measured service, like every operator.
+
+**Disclosure.** The current authorities, their operators, and their affiliation with SWTCH Labs are published on spacekit.xyz/governance and spacekit.xyz/economics. Governance proposals and votes are public and signed.
+
+This section is subject to the Withers Worldwide review of ASTRA's regulatory status (see ASTRA.md).
 
 ## Part 2 — SpaceKit Pay
 
@@ -308,11 +344,13 @@ Any existing implementation code referencing aUSD (specifically the legacy `aUsd
 
 ## Part 6 — Versioning
 
-This spec is v2.0. Future revisions follow semantic versioning:
+This spec is v2.1. Future revisions follow semantic versioning:
 
 - **Patch** (v2.0.x): clarifications, corrections, additional examples. No mechanic changes.
 - **Minor** (v2.x.0): non-breaking additions (new service categories, new supported tokens, new payment networks).
 - **Major** (v3.0.0): breaking changes (e.g., adjustments to the no-public-sale commitment, changes to the hard cap, removal of the non-custodial property).
+
+**Changelog.** v2.1 (September 2026) adds the proof-of-authority bootstrap phase. There is no bootstrap stake pool, no stake lending or delegation, and no liquidity seeding: validators stake only ASTRA they earned. PoA-phase rewards to authorities and affiliated operators vest (12-month cliff, 36 months), enforced by AstraRewards. Epoch rewards are split in proportion to each operator's measured units when the epoch closes. Supply, cap, emission curve and category shares are unchanged.
 
 Major version changes require explicit on-chain governance for protocol parameters affected, and a fresh round of legal review. The team does not commit to never producing a v3, but commits that v3 would be a deliberate, transparent change rather than a quiet drift from v2.
 
