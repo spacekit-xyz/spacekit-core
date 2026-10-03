@@ -18,7 +18,7 @@ Host parity: [`../infra/spacekit-compute-node/documentation/VM_PARITY.md`](../in
 
 ## Abstract
 
-SpaceKit is a post-quantum-aware blockchain and decentralized infrastructure platform where WebAssembly smart contracts invoke **narrow AI inference**, durable storage, encrypted messaging, and multi-rail payments through **policy-gated host modules**. Layer 1 validators run **SwtchVM** (`spacekit-compute-node`, Wasmtime); Layer 2 clients run the same contracts in browsers and Node.js via **SpaceKit-JS**, with simulate / relay / execute modes and L1 finalization.
+SpaceKit is a post-quantum-aware blockchain and decentralized infrastructure platform where WebAssembly smart contracts invoke **narrow AI inference**, durable storage, encrypted messaging, and ASTRA payments through **policy-gated host modules**. Layer 1 validators run **SwtchVM** (`spacekit-compute-node`, Wasmtime); Layer 2 clients run the same contracts in browsers and Node.js via **SpaceKit-JS**, with simulate / relay / execute modes and L1 finalization.
 
 Operators earn **ASTRA** (2 billion hard cap) for measured consensus, compute, storage, and messaging service. **Growformer** — SWTCH Labs’ narrow-AI substrate — is integrated across the CLI, JS VM, and compute node so agents train, deploy, and infer inside the same stack that settles on-chain.
 
@@ -241,14 +241,15 @@ Agent contracts that need production inference on L1 should be validated against
 
 ## 9. Payments and economics
 
-### 9.1 Three economic primitives
+### 9.1 One currency
 
 | Primitive | Mints ASTRA? | Purpose |
 |-----------|--------------|---------|
-| **ASTRA** | Yes (capped) | Gas, staking, governance, operator rewards via SRA → AstraRewards |
-| **SpaceKit Pay** | No | Non-custodial stablecoin routing for AI/service settlement |
+| **ASTRA** | Yes (capped) | Gas, staking, governance, paying for services; operator rewards via SRA → native rewards system calls |
 
-Implementation: [`spacekit-payments`](../economics/spacekit-payments/) prices, verifies and routes payments in ASTRA only: a payment is an ASTRA transfer on the chain, checked by transaction hash (`PaymentVerifier`); sponsorship is the `spacekit-paymaster` contract, which holds deposited ASTRA. There are no USD-denominated balances (no aUSD, no vault charges) and no x402/USDC rail in spacekit-core.
+ASTRA exists only as the native account balance on L1 (wei, 18 decimals), covered by the block state root ([`ASTRA_LEDGER.md`](../infra/spacekit-compute-node/ASTRA_LEDGER.md)). It is a utility token, not a stablecoin, and is not pegged.
+
+Implementation: [`spacekit-payments`](../economics/spacekit-payments/) prices, verifies and routes payments in ASTRA only: a payment is an ASTRA transfer on the chain, checked by transaction hash (`PaymentVerifier`); sponsorship is the `spacekit-paymaster` contract, which holds deposited ASTRA. Marketplace, app, content and channel sales use the `astra-entitlement-ledger` contract, which pays the listing price in ASTRA straight to the publisher's address. There are no USD-denominated balances (no aUSD, no vault charges) and no x402/USDC rail in spacekit-core. SpaceKit Pay, the earlier stablecoin router, is retired. See [`PAYMENTS_AND_CURRENCY.md`](PAYMENTS_AND_CURRENCY.md).
 
 Canonical public spec is v2 in
 [`../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md`](../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md)
@@ -268,7 +269,7 @@ Operator emission has three protocol-level properties:
 |-----------|-------|
 | **Hard cap** | **2,000,000,000 ASTRA** |
 | **Decimals** | 18 (atomic unit: 1 wei-ASTRA = 10⁻¹⁸ ASTRA) |
-| **Inflation / auto-burn** | None |
+| **Inflation / burn** | No inflation above the cap; used gas is burned |
 | **Genesis treasury** | **350,000,000 ASTRA (17.5%)** — minted at INIT; **not** on the halving curve |
 | **Bootstrap stake pool** | **50,000,000 ASTRA (2.5%)** — drawn from treasury at genesis; one-time; vesting (e.g. 4-year linear) |
 | **Year-1 operator emission** | **200,000,000 ASTRA (10% of cap)** |
@@ -361,7 +362,7 @@ Exact weights and conversion formulas are **protocol parameters** — adjustable
 
 ### 9.8 Treasury, bootstrap, and cap accounting
 
-**Treasury (350M at INIT)** — multi-sig under SWTCH Labs; counts against the 2B cap; **cannot be expanded** after genesis. Used for development, audits, bug bounties, operational reserves, ecosystem grants (with legal review), and similar protocol needs.
+**Treasury (350M at INIT)** — minted by INIT to the on-chain treasury contract `0x…0004`, which pays M-of-N approved spends (signers and threshold set in the PoA genesis `treasury` section); counts against the 2B cap; **cannot be expanded** after genesis. Used for development, audits, bug bounties, operational reserves, ecosystem grants (with legal review), and similar protocol needs.
 
 **Bootstrap (50M)** — initial validator stake from treasury; fixed per-validator allocation to meet minimum stake; **one-time**, not refilled; vesting applies.
 
@@ -376,16 +377,16 @@ Exact weights and conversion formulas are **protocol parameters** — adjustable
 
 Reserve may only be allocated by **on-chain governance** (e.g. slower decay curve, ecosystem program with disclosure, bootstrap refill) — not unilaterally by SWTCH Labs.
 
-### 9.9 Cap enforcement (AstraRewards)
+### 9.9 Cap enforcement (native rewards)
 
-The **AstraRewards** contract is the backstop:
+ASTRA is minted only inside blocks, by the rewards system calls to `0x…0003` that the SRA places at the start of each block. The node executes them natively (`native_rewards.rs`); there is no rewards contract ledger. **INIT** mints the treasury allocation, **CREDIT** mints into the recipient's native balance, **CREDIT_LOCKED** (during PoA) records rewards that vest from genesis (nothing before 365 days, linear to 1,095 days), and **END_POA** stops locking. Every importer re-derives and checks these calls. The native rewards state is the backstop:
 
-- `total_emitted` tracks cumulative minted ASTRA via **CREDIT**.
+- `total_emitted` tracks cumulative minted ASTRA (locked amounts included).
 - Each credit requires `total_emitted + amount ≤ 2_000_000_000 × 10^18` wei-ASTRA.
 - Over-cap credits are **rejected in full** (no partial mint).
 - **No code path** mints above the cap — not for admin, governance, or emergency keys.
 
-The decay curve should make hitting the cap unlikely in practice; the contract enforces it regardless.
+The decay curve should make hitting the cap unlikely in practice; the node enforces it regardless. No payment, faucet, bridge, rollup settlement or PoTW award mints ASTRA on a consensus (PoA/PoS) network.
 
 ### 9.10 Governance over the schedule
 
@@ -393,7 +394,7 @@ The decay curve should make hitting the cap unlikely in practice; the contract e
 |------------|----------------|
 | Per-category shares (5–60% each, sum 100%) | **2B hard cap** |
 | Resource weighting within categories | **350M treasury INIT** (genesis-only) |
-| Treasury spending (within 350M) | Automatic burn (none exists) |
+| Treasury spending (within 350M) | Burns beyond used gas (none exist) |
 | Bootstrap refill from reserve (proposal) | |
 | Halving period (2–8 y, super-majority + 30-day notice) | |
 | Initial annual rate (50M–350M, same quorum) | |
@@ -403,13 +404,14 @@ The decay curve should make hitting the cap unlikely in practice; the contract e
 | Component | Location |
 |-----------|----------|
 | Constants (`ASTRA_MAX_SUPPLY_WEI`, `ASTRA_GENESIS_TREASURY_WEI`, `ASTRA_INITIAL_ANNUAL_EMISSION_WEI`, …) | `spacekit-primitives::v1::sdk::token` |
-| **AstraRewards** WASM | `spacekit-standard-library/rewards/astra-rewards` |
+| **Native rewards** (system address `0x…0003`) | `spacekit-compute-node` `native_rewards.rs` — INIT / CREDIT / CREDIT_LOCKED / END_POA executed by the node |
+| **Treasury** contract `0x…0004` | Holds native ASTRA; M-of-N spends via `transfer_u128` |
 | **SRA** (Service Reward Accumulator) | `spacekit-service-rewards`, `spacekit-compute-node/src/service_reward_accumulator.rs` — hooks `mine_block`; enable `[compute.sra_config] enabled = true` |
-| SRA → on-chain CREDIT | `SraHost` → `OP_CREDIT` via `SwtchvmRuntime::call_contract_public`; `apply_credits_onchain = false` for audit-only runs |
+| SRA → on-chain CREDIT | Rewards system calls placed at the start of each block; re-derived and checked by every importer |
 | Service log schema | `spacekit-log` (`EventKind::Service`) |
 
 **Testnet note:** legacy per-node `enable_token_minting` calculators are **not**
-the production model. Mainnet-aligned emission uses **SRA + AstraRewards** only
+the production model. Mainnet-aligned emission uses **SRA + native rewards system calls** only
 ([`../economics/spacekit-tokenomics/operator-guides/README.md`](../economics/spacekit-tokenomics/operator-guides/README.md)).
 
 ### 9.12 Honest limitations
@@ -422,7 +424,7 @@ Parameters (40/30/20/10, 200M year-1, 4-year halving, 350M treasury) are **calib
 
 ### 9.13 How users pay vs how operators earn
 
-- **Users** spend ASTRA for gas and for services.
+- **Users** spend ASTRA for gas and for services. Used gas is burned; it is not paid to validators.
 - **Operators earn** newly emitted ASTRA only through **measured service** in the four categories — not through passive holding. Validators **stake** for Sybil resistance and slashing exposure; stake does **not** pay yield by itself.
 
 ---
@@ -488,7 +490,7 @@ The **testnet is deployed** and exercised by operators and internal dApps. **Mai
 - DID registration, resolve, and registry contract completion
 - Storage ACL, federation handoff, and MCP tool authorization
 - Payments: on-chain ASTRA payment verification, FeeRouter, paymaster contract, and treasury configuration
-- Supply cap enforcement in AstraRewards + SRA accounting
+- Supply cap enforcement in native rewards + SRA accounting
 
 No HIPAA, SOC 2, or financial regulatory certification is implied by this software.
 
@@ -522,7 +524,8 @@ Together they separate **immutable content** from **mutable contract state** whi
 
 - **ASTRA emission (canonical):** [`../economics/spacekit-tokenomics/ASTRA_EMISSION.md`](../economics/spacekit-tokenomics/ASTRA_EMISSION.md)
 - Tokenomics v2: [`../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md`](../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md)
-- AstraRewards + SRA: [`ASTRA_REWARDS_CONTRACT_SPEC.md`](../economics/spacekit-tokenomics/ASTRA_REWARDS_CONTRACT_SPEC.md), [`SERVICE_REWARD_ACCUMULATOR_SPEC.md`](../economics/spacekit-tokenomics/SERVICE_REWARD_ACCUMULATOR_SPEC.md)
+- ASTRA ledger and native rewards: [`ASTRA_LEDGER.md`](../infra/spacekit-compute-node/ASTRA_LEDGER.md); SRA: [`SERVICE_REWARD_ACCUMULATOR_SPEC.md`](../economics/spacekit-tokenomics/SERVICE_REWARD_ACCUMULATOR_SPEC.md)
+- Payments and currency: [`PAYMENTS_AND_CURRENCY.md`](PAYMENTS_AND_CURRENCY.md)
 - Documentation index: [`README.md`](README.md)
 - Tool-call spec: [`SPACEKIT-TOOL-CALL-SPEC.md`](SPACEKIT-TOOL-CALL-SPEC.md)
 - VM parity: [`spacekit-compute-node/documentation/VM_PARITY.md`](spacekit-compute-node/documentation/VM_PARITY.md)

@@ -39,6 +39,10 @@ Lower-ranked material must not override executable behavior.
 - [Consensus implementation notes](../infra/spacekit-compute-node/documentation/SPACEKIT_CONSENSUS_UNIFIED.md).
 - [JavaScript host ABI](../runtimes/spacekit-js/docs/host-abi-contracts.md).
 - [Canonical economics](../economics/spacekit-tokenomics/README.md).
+- [Payments and currency](PAYMENTS_AND_CURRENCY.md) — ASTRA is the only
+  currency.
+- [ASTRA ledger](../infra/spacekit-compute-node/ASTRA_LEDGER.md) — native
+  balances, rewards, treasury and payment verification.
 
 ## Document status
 
@@ -47,6 +51,9 @@ Lower-ranked material must not override executable behavior.
 - `SPACETIME_DOCS_INPROGRESS/` contains unreviewed drafts.
 - Historical whitepaper chapters, pitch material, and status reports are
   retained for research only.
+- `infra/spacekit-pay/` (SpaceKit Pay, the USDC/USDT/DAI router) is retired and
+  kept for history only. Marketplace and app sales are paid in ASTRA through
+  the `astra-entitlement-ledger` contract.
 - CLI `scratch/`, build output, generated reports, and model experiment logs
   are not documentation and are excluded from publication.
 

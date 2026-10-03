@@ -90,6 +90,8 @@ Nothing does on a consensus (PoA/PoS) network. The faucet, rollup settlement, Po
 
 ## Payments
 
+Overview, what was removed, and launch recommendations: [`docs/PAYMENTS_AND_CURRENCY.md`](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 ASTRA is the only currency. There are no USD-denominated balances, no stablecoin rails (x402/USDC, aUSD, the Ethereum DAI/USDC entitlement contract) and no exchange rates anywhere in the node, the SDKs or the browser runtime.
 
 - **A payment is a chain transaction.** The payee checks it by hash: `GET /v1/tx/{hash}` or `POST /v1/payments/verify` (`spacekit_payments::PaymentVerifier`), which requires success, the right recipient, at least the price, and refuses a transaction it has already accepted. A service that grants something lasting must also store the hash with the grant.

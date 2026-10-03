@@ -1,6 +1,6 @@
 # SpaceKit Content Publishing Guide
 
-**Status:** Active (dev monetization soak green; live Pay Phase 4 in progress)
+**Status:** Active (dev monetization soak green; live ASTRA payment path in progress)
 **Version:** 1.0
 **Owner:** SWTCH Labs
 **Date:** 2026
@@ -41,7 +41,7 @@ Also: `./spacekit-cli/scripts/content-monetization-soak.sh dev` or `./spacekit-s
 |-------|-------------------|-------------|
 | **Tier flag** | `content access --tier free\|commercial` | **Not implemented.** Use separate publications: `--pricing free` vs `--pricing pay_per_view --price N`, or two `content_id`s. |
 | **Channel** | Publisher channel | `spacekit content create-channel` |
-| **Paid settlement** | Pay → settle → view | **Dev:** `record-payment` + `listen-settlements` + `pay --pending-id … --await-settlement`. **Live:** SpaceKit Pay router (Phase 4). |
+| **Paid settlement** | Pay → settle → view | **Dev:** `record-payment` + `listen-settlements` + `pay --pending-id … --await-settlement`. **Live:** buyer pays the listing price in ASTRA through `astra-entitlement-ledger` (straight to the publisher); compute `POST /v1/payments/verify` checks the ASTRA tx hash and forwards to the storage settlement inbox. |
 | **Multi-tier on one fact** | One publication, many tiers | **One pricing model per publish today.** Prefer two publishes until tier metadata exists. |
 | **Encryption at rest** | Envelope on publish | Paid facts use access policy + grants; full at-rest KEM for `Conditional` policies is deferred (tags carry `pricing:` / `price:`). |
 | **Publisher = buyer in tests** | Soak realism | Soak often uses one `spacekit init` DID; use **two identities** for commercial sign-off. |
@@ -92,7 +92,7 @@ spacekit content publish \
   --file ./premium.bin \
   --title "Premium Asset" \
   --pricing pay_per_view \
-  --price 10
+  --price 10   # ASTRA
 
 spacekit content pay --content-id <content_id>
 spacekit content record-payment --reference <tx> --recipient <publisher> --scope content:<id> --amount 10
@@ -159,7 +159,7 @@ spacekit content publish \
   --price <ASTRA>
 ```
 
-Run dev settlement chain or live Pay per [content-monetization-live-deploy.md](documentation/guides/content-monetization-live-deploy.md).
+Run dev settlement chain or the live ASTRA payment path per [content-monetization-live-deploy.md](documentation/guides/content-monetization-live-deploy.md).
 
 ### Step 3 — Docs and soak
 
@@ -175,7 +175,7 @@ Decisions before broad paid launch:
 
 - **Free tier:** open vs allow-list vs quota (recommendation: open for initial adoption window).
 - **Commercial price model:** PPV vs subscription vs hybrid.
-- **Currency:** ASTRA + stablecoins via SpaceKit Pay where enabled.
+- **Currency:** ASTRA only, priced by the publisher (SpaceKit Pay is retired; see [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md)).
 - **Refunds:** e.g. 14-day window for commercial PPV; document in terms of service.
 
 ---
@@ -185,7 +185,7 @@ Decisions before broad paid launch:
 - [ ] `content soak dev` passes (5/5)
 - [ ] Free publish → view → non-empty payload
 - [ ] Paid publish → dev settlement → view after grant
-- [ ] Live Pay path documented and signed off (when required)
+- [ ] Live ASTRA payment path documented and signed off (when required)
 - [ ] `CONTENT-SYSTEM-SPEC.md` work items tracked for production gaps
 - [ ] Publisher onboarding doc / website quickstart aligned with real commands
 

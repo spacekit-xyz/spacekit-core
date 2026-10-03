@@ -1,21 +1,23 @@
 # SpaceKit Unification Strategy
 
-**Document type:** Technical specification (identity, onboarding, deposits, client–node sync)  
+**Document type:** Technical specification (identity, onboarding, ASTRA transfers, client–node sync)  
 **Status:** Draft for implementation alignment  
-**Scope:** `spacekit.xyz-website`, `@spacekit/spacekit-js`, `spacekit-compute-node`, `spacekit-simulator`, future L1 vaults (Ethereum, BSC, Solana, Bitcoin)
+**Scope:** `spacekit.xyz-website`, `@spacekit/spacekit-js`, `spacekit-compute-node`, `spacekit-simulator`; external chains (Ethereum, BSC, Solana, Bitcoin) for **identity linking only**
 
-This document merges **architectural unification** (identity, rollup sync, vault minting) with the **Progressive Trust Onboarding** state machine below. Where they overlap, the state machine governs **UX gating and sequencing**; the architecture sections govern **protocol semantics**.
+> **Currency update.** ASTRA is the only currency. It exists only as native balances on the SpaceKit chain. The earlier design in this document (USDC/USDT vault deposits on external chains minting ASTRA "credits", relayer/LayerZero minting, USD-denominated caps) is **removed**: no vault, bridge or rollup mints ASTRA on a consensus (PoA/PoS) network, and spacekit-js keeps no balance. Thresholds below are ASTRA amounts set by product. See [`PAYMENTS_AND_CURRENCY.md`](PAYMENTS_AND_CURRENCY.md) and [`ASTRA_LEDGER.md`](../infra/spacekit-compute-node/ASTRA_LEDGER.md).
+
+This document merges **architectural unification** (identity, client–node sync) with the **Progressive Trust Onboarding** state machine below. Where they overlap, the state machine governs **UX gating and sequencing**; the architecture sections govern **protocol semantics**.
 
 ---
 
 ## 1. Goals
 
 1. **Minimum friction for Ethereum users:** Connect MetaMask / WalletConnect (already in `WalletConnectLanding.tsx` and Agent Hub via wagmi/RainbowKit) and obtain a **usable SpaceKit identity** without upfront seed-phrase friction.
-2. **Progressive trust:** Users explore SpaceKit **before** heavy security steps; **PQ key backup is deferred** until the user attempts a first deposit **at or above $10** (see §3).
+2. **Progressive trust:** Users explore SpaceKit **before** heavy security steps; **PQ key backup is deferred** until the user attempts a first **large transfer** (at or above a product-set ASTRA threshold; see §3).
 3. **Single logical user:** One **DID** is the canonical SpaceKit account; **external chain addresses** are **linked controllers**, not separate accounts.
-4. **Spend and meter on SpaceKit:** High-frequency use (e.g. per-call API spend) is enforced on **SpaceKit compute / VM state**; **custody and deposits** use **external chain vaults** (USDC/USDT on Ethereum or BSC, later Solana programs, etc.).
+4. **Spend and meter on SpaceKit:** All value is ASTRA on the SpaceKit chain. High-frequency use (e.g. per-call API spend) is paid with ASTRA transactions on the chain; there are no external chain vaults or stablecoin deposits.
 5. **Path to multi-chain:** Same linking pattern for **Solana** and **Bitcoin** (address + signature proof); enabled from **State 5** onward in the progressive model.
-6. **Client + node coherence:** **spacekit-js** is a **client sequencer / rollup participant**; **spacekit-compute-node** is **always canonical for balances**. The client **never** wins a conflict with the node.
+6. **Client + node coherence:** **spacekit-js** is a **client** that simulates locally and submits signed chain transactions (it keeps no balance); **spacekit-compute-node** is **always canonical for balances**. The client **never** wins a conflict with the node.
 
 ---
 
@@ -36,7 +38,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 1. **PQ keypair (Kyber / Dilithium or project-standard PQ suite)**  
    - Generated in the **browser** (WASM / Web Crypto) when the user reaches the **backup-secured** milestone.  
-   - **Mandatory PQ backup is deferred** until the user’s **first deposit attempt at or above $10** (State 4 → 5 transition). Until then, the user operates under **wallet-linked session** and **registry-backed DID** without full self-custody PQ backup (States 2–4).
+   - **Mandatory PQ backup is deferred** until the user’s **first large-transfer attempt** (at or above the product-set ASTRA threshold; State 4 → 5 transition). Until then, the user operates under **wallet-linked session** and **registry-backed DID** without full self-custody PQ backup (States 2–4).
 
 2. **Binding to Ethereum (UX: “manage SpaceKit with MetaMask”)**  
    - User signs a **single EIP-712 batch** (State 2 → 3) containing link attestation **and** **session grant**: `{ did, chainId, address, nonce, expiry, sessionGranted }`.  
@@ -45,13 +47,13 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 3. **KEK from wallet (post–State 5)**  
    - After PQ key generation, a **KEK** may be derived from `personal_sign(challenge)` **only to encrypt** the PQ private key blob locally (MetaMask never holds Kyber secrets in clear).  
-   - User completes **download encrypted keystore** OR **recovery phrase with confirmation** before the triggering **≥ $10** deposit completes.
+   - User completes **download encrypted keystore** OR **recovery phrase with confirmation** before the triggering large transfer completes.
 
 **Future chains (State 5+)**
 
 - **Solana:** `ed25519` signature over the same structured payload; store `solana:<pubkey>` in the linkage table.  
 - **Bitcoin:** BIP-322 signmessage; store `bip322:<address>`.  
-- **Policy:** Which link type is required for which operation (e.g. Ethereum-only for USDC deposits).
+- **Policy:** Which link type is required for which operation. Linked addresses prove control for identity; they do not move value into SpaceKit.
 
 ### 2.3 Ethereum RPC bridge (simulator / dev)
 
@@ -63,7 +65,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 ### 3.1 Design principles
 
-- Users **explore without upfront friction**; trust-gated capabilities unlock with **natural actions** (connect wallet, register DID, sync node, deposit).  
+- Users **explore without upfront friction**; trust-gated capabilities unlock with **natural actions** (connect wallet, register DID, sync node, first large transfer).  
 - **States 2 and 3 are distinct:** link attestation (user action) vs node RPC sync (automatic) — aids debugging and progressive UI disclosure.  
 - **State 3 → 4** is **fully automatic** (no extra user action) once registrar and RPC are available — reduces re-engagement friction.  
 - **Transitions are forward-only.** If the client is inconsistent (wagmi cleared, `localStorage` wiped), the client **re-syncs from last confirmed node state**; it does **not** regress the user through earlier “states” in a way that implies loss of on-chain/registry facts.  
@@ -74,10 +76,10 @@ This document merges **architectural unification** (identity, rollup sync, vault
 | State | Name | Summary |
 |-------|------|--------|
 | **1** | Unconnected | Browse only; no wallet, no DID, no VM. |
-| **2** | Wallet linked | Demo VM + faucet + DID **preview**; EIP-712 session; no canonical DID / no real node balance / no deposits. |
-| **3** | DID registered | Canonical DID in registry; Phase A read path; micro-payments; handle registration; no deposits **> $10**, no withdrawals, no full self-custody. |
-| **4** | Balance synced | Confirmed node balance; small deposits **≤ $10**; Phase B write path + vault + proof_bridge commitments; still no large deposits / withdrawals until backup. |
-| **5** | Backup secured | PQ backup done; large deposits; withdrawals; multi-chain linking; production execution policy as defined by product. |
+| **2** | Wallet linked | Demo VM (dev chain only) + dev faucet + DID **preview**; EIP-712 session; no canonical DID / no real node balance / no transfers. |
+| **3** | DID registered | Canonical DID in registry; Phase A read path; micro-payments; handle registration; no large transfers, no full self-custody. |
+| **4** | Balance synced | Confirmed node balance; small ASTRA transfers (below the threshold); Phase B signed chain transactions + proof_bridge commitments; still no large transfers until backup. |
+| **5** | Backup secured | PQ backup done; large transfers; multi-chain identity linking; production execution policy as defined by product. |
 
 ### 3.3 State definitions
 
@@ -85,7 +87,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 | Unlocked | Blocked |
 |----------|---------|
-| Browse public site and documentation | API access, balance visibility, faucet, deposits |
+| Browse public site and documentation | API access, balance visibility, faucet, transfers |
 
 **Transition → State 2:** User connects wallet (wagmi session active).
 
@@ -99,14 +101,14 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 | Unlocked | Blocked |
 |----------|---------|
-| Local / demo VM, testnet faucet, **DID preview** (non-canonical), Agent Hub exploration | Canonical DID, real node balance, deposits, PQ key operations |
+| Local / demo VM, dev-chain faucet (the faucet is refused on PoA/PoS networks), **DID preview** (non-canonical), Agent Hub exploration | Canonical DID, real node balance, transfers, PQ key operations |
 
 **Transition → State 3:** User completes **EIP-712** link attestation + session grant; registrar persists DID + link; `spacekit:identityDid` becomes **canonical**.
 
 **Implementation notes**
 
 - `useAccount` active; `spacekit:identityDid` may hold **preview** value until registrar confirms — then same key holds canonical DID.  
-- Local ASTRA seed in `SpacekitVmContext` — **always** labeled **Demo** in UI.  
+- Local ASTRA seed in `SpacekitVmContext` — **always** labeled **Demo** in UI, and only in a development mode: spacekit-js keeps no balance, and its local VM refuses value in its default "chain" mode.  
 - **DID preview:** render **non-copyable** (grayed / italic + “Preview” label). Users habitually copy address-like strings; do not present preview as a copy field.
 
 **UI:** **Demo** badge on **all** balance figures; persistent nudge: “Complete identity setup to unlock real balances.”
@@ -117,7 +119,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 | Unlocked | Blocked |
 |----------|---------|
-| Canonical DID in registry, **micro-payments** (metered on compute-node), **node balance read-only**, handle registration | Deposits **> $10**, withdrawals, full self-custody |
+| Canonical DID in registry, **micro-payments** (ASTRA transactions on the compute-node chain), **node balance read-only**, handle registration | Large transfers, full self-custody |
 
 **Transition → State 4:** Automatic when compute-node RPC returns **confirmed** account state (Phase A complete for this session).
 
@@ -128,7 +130,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 - Balance label: **“Syncing…”** until node responds with confirmed state.  
 - Metering: SWTCHVM host functions (`msg_value`, `get_balance`, `transfer`).
 
-**UI:** Replace **Demo** with **Syncing…** until confirmed; then show **real** balance **without** Demo/Syncing badge. Enable handle registration. Nudge: “Secure your wallet to unlock deposits.”
+**UI:** Replace **Demo** with **Syncing…** until confirmed; then show **real** balance **without** Demo/Syncing badge. Enable handle registration. Nudge: “Secure your wallet to unlock larger transfers.”
 
 ---
 
@@ -136,18 +138,18 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 | Unlocked | Blocked |
 |----------|---------|
-| Real-time compute-node balance, **small deposits (≤ $10 per transaction)**, per-call metering, **RollupBundle** submission (Phase B), vault events + `proof_bridge` state roots | Large deposits **(> $10)**, withdrawals until State 5 |
+| Real-time compute-node balance, **small ASTRA transfers (below the threshold)**, per-call payments, signed chain transactions (Phase B), `proof_bridge` state roots | Large transfers until State 5 |
 
-**Transition → State 5:** User completes **PQ backup flow** triggered by **first deposit attempt ≥ $10** (backup must complete **before** that deposit transaction completes).
+**Transition → State 5:** User completes **PQ backup flow** triggered by **first large-transfer attempt** (backup must complete **before** that transaction is submitted).
 
 **Implementation notes**
 
-- **Phase B (write path):** `SpacekitSequencer` submits signed **RollupBundles** to SpaceKit **ingress API**; on mismatch, client **drops or replays** from last committed height.  
-- Vault contracts accept USDC/USDT (and configured assets) up to **$10 per tx** at this tier.  
-- `proof_bridge.ts` Ethereum adapter active for **state root** commitments.  
-- LayerZero (`layerzero_bridge.rs`): validate config; **trusted relayer** acceptable for mint until production bridge is relied upon.
+- **Phase B (write path):** the client submits signed transactions to the compute node; on mismatch, client **drops or replays** from last committed height. `RollupBundle` settlement is refused on PoA/PoS networks and never mints or moves ASTRA there.  
+- The large-transfer threshold is an ASTRA amount enforced in the UI (and in any contract that needs it).  
+- `proof_bridge.ts` Ethereum adapter active for **state root** commitments (attestation only; it moves no value).  
+- No vault, LayerZero or relayer path mints ASTRA.
 
-**UI:** No Demo or Syncing; deposit UI for **≤ $10** only. Nudge: “Secure your wallet to unlock larger deposits and withdrawals.”
+**UI:** No Demo or Syncing; transfer UI below the threshold only. Nudge: “Secure your wallet to unlock larger transfers.”
 
 ---
 
@@ -155,15 +157,14 @@ This document merges **architectural unification** (identity, rollup sync, vault
 
 | Unlocked | Blocked |
 |----------|---------|
-| Full self-custody, **uncapped** USDC/USDT deposits (per product risk limits), **withdrawals**, Solana/Bitcoin linking, production execution as defined | — |
+| Full self-custody, **uncapped** ASTRA transfers (per product risk limits), Solana/Bitcoin identity linking, production execution as defined | — |
 
 **Implementation notes**
 
-- Bridge/indexer: `Deposit` events `(payer, amount, asset, destination_did_hash, nonce)`; mint ASTRA to DID address on compute-node; idempotency `(source_chain, tx_hash, log_index)`.  
-- Relayer trust: **disclosed in-product** (operator, upgrade keys).  
-- Phase B fully required for production bundle submission where policy demands.
+- ASTRA enters an account only through chain transfers or protocol rewards minted in blocks. There is no `Deposit`-event indexer or relayer mint.  
+- Phase B fully required for production transaction submission where policy demands.
 
-**UI:** Remove secure-wallet nudges; full deposit and withdrawal UI; multi-chain linking visible; settings link to relayer trust disclosure.
+**UI:** Remove secure-wallet nudges; full transfer UI; multi-chain identity linking visible.
 
 ---
 
@@ -174,7 +175,7 @@ This document merges **architectural unification** (identity, rollup sync, vault
 | 1 | 2 | Wallet connect |
 | 2 | 3 | EIP-712 link + session; registrar success |
 | 3 | 4 | Node RPC confirms balance (automatic) |
-| 4 | 5 | PQ backup completed (gate for ≥ $10 deposit) |
+| 4 | 5 | PQ backup completed (gate for the first large transfer) |
 
 Valid transitions are **forward-only** in the product sense above; **client cache loss** triggers **re-derivation of effective state from node + registry**, not arbitrary backward UX.
 
@@ -196,25 +197,25 @@ Users must always know which state they are in.
 
 ---
 
-## 4. Deposits: USDC / USDT / BSC → ASTRA credits
+## 4. Deposits (removed)
+
+The earlier design here (USDC/USDT/BSC vault deposits on external chains, a bridge/indexer/relayer minting "credits" on SpaceKit, 6-decimal USD-pegged credit units, LayerZero mint transport) is **removed**.
 
 ### 4.1 Economic split
 
 | Layer | Role |
 |-------|------|
-| **Solidity (Ethereum / BSC)** | Vault custody; **Deposit** events with `(payer, amount, asset, destination_did_hash, nonce)`. **Per-tx cap ≤ $10** until State 5 policy unlocks uncapped (contract + UI must agree). |
-| **Bridge / indexer / relayer** | Watches events, **anti-replay**, mint credits on SpaceKit. |
-| **spacekit-compute-node / SWTCHVM** | **Canonical** ASTRA balance; execution + metering. |
+| **spacekit-compute-node / SWTCHVM** | **Canonical** ASTRA balance (native, wei, 18 decimals); execution + metering. The only place value lives. |
+| **External chains** | Identity linking only. No vault custody, no deposits. |
 
 ### 4.2 Mint semantics
 
-- Define **credit units** (e.g. 6-decimal USD peg or native ASTRA decimals).  
-- **Idempotency:** `(source_chain, tx_hash, log_index)`.  
-- **Destination:** DID’s `SwtchvmAddress` (see `WALLET_DID_SYSTEM.md`).
+- ASTRA is created only inside blocks, by the native rewards system calls (`0x…0003`). No deposit, bridge, relayer or rollup mints ASTRA on a consensus network.  
+- **Destination** of any ASTRA transfer: the DID's address (`did:spacekit:<address hex>`; see `WALLET_DID_SYSTEM.md`).
 
 ### 4.3 LayerZero / Alloy module
 
-`spacekit-compute-node` — `layerzero_bridge.rs` as transport when production-ready; until then **trusted relayer** with identical idempotent mint rules.
+`layerzero_bridge.rs` is not a mint path. Any cross-chain use is limited to attestations.
 
 ---
 
@@ -230,20 +231,20 @@ Users must always know which state they are in.
 | Phase | Description | Typical state |
 |-------|-------------|---------------|
 | **A — Read** | Client queries node RPC for balance + nonce on connect | 3 → 4 |
-| **B — Write** | Signed `RollupBundle` to ingress API; `proof_bridge` commitments | 4+ |
+| **B — Write** | Signed chain transactions to the compute node; `proof_bridge` commitments (rollup settlement is refused on PoA/PoS networks) | 4+ |
 | **C — Reconciliation** | On mismatch, **node wins**; client replays or resets from last committed height | Always |
 
 ### 5.3 Proof bridge vs balance mint
 
-- **Proof bridge:** commitments / dispute / interoperability — **not** a substitute for vault minting.  
-- Use **both** where product requires L1 attestations and vault-sourced credits.
+- **Proof bridge:** commitments / dispute / interoperability. It never mints or moves ASTRA.  
+- There is no vault-sourced credit; balances change only through chain transactions and in-block rewards.
 
 ---
 
 ## 6. Payments for services (micro-metering)
 
-- **Deposits / refunds:** External vaults.  
-- **Per-call metering (e.g. $0.002):** SpaceKit compute / WASM host path.  
+- **Payments / refunds:** ASTRA transfers on the SpaceKit chain, verified by transaction hash. Sponsored calls use the `spacekit-paymaster` contract.  
+- **Per-call metering (priced in ASTRA by the service):** paid calls attach the fee as value; SpaceKit compute / WASM host path.  
 - **Storage receipts:** Register artifact manifest with compute node or registry so billing matches deployed bytes.
 
 ---
@@ -256,7 +257,7 @@ Users must always know which state they are in.
 | SpaceKit DID | `localStorage` `spacekit:identityDid`, `SpacekitClient` / `useSpacekitClient` |
 | Local native ASTRA | `SpacekitVmContext` — `ensureNativeBalance` / `native:astra:balance:${did}` → must align with **State 2 Demo** rules |
 | VM payment primitives | `spacekit-compute-node` `swtchvm_node.rs` |
-| Cross-chain plumbing | `layerzero_bridge.rs` |
+| Cross-chain plumbing | `layerzero_bridge.rs` (attestations only; no mint) |
 | Client attestations | `spacekit-js` — `proof_bridge.ts`, `proof_bridge_service.ts` |
 | Reference | `spacekit-simulator/WALLET_DID_SYSTEM.md` |
 
@@ -265,7 +266,7 @@ Users must always know which state they are in.
 ## 8. Security and product notes
 
 - **Linked ETH ≠ custodied ETH on SpaceKit** — clear chain labeling in UI by state.  
-- **Relayer trust** — disclosed in settings from State 5.  
+- **No relayer custody** — no relayer or bridge holds or mints value for users.  
 - **Handle squatting** — reserved names, rate limits, optional stake.  
 - **Strict path variants** (e.g. separate payment link) remain available for high-risk SKUs without breaking the progressive default.
 
@@ -294,15 +295,15 @@ Users must always know which state they are in.
 - [ ] Phase A: query compute-node RPC on wallet connect.  
 - [ ] **Syncing…** until response; then real balance, no badge.  
 - [ ] Handle registration UI enabled.  
-- [ ] Nudge: secure wallet for deposits (non-blocking).
+- [ ] Nudge: secure wallet for larger transfers (non-blocking).
 
 ### State 4 → 5: PQ backup (deferred)
 
-- [ ] Backup flow opens on **first deposit attempt ≥ $10** only.  
+- [ ] Backup flow opens on **first large-transfer attempt** (ASTRA threshold) only.  
 - [ ] PQ keygen in browser (WASM / Web Crypto).  
 - [ ] KEK from `personal_sign`; encrypted keystore **or** phrase + confirmation.  
-- [ ] **Backup must complete before** triggering ≥ $10 deposit succeeds.  
-- [ ] Phase B: ingress + `RollupBundles`; vault uncapped (policy); withdrawals; proof_bridge; settings disclosure for relayer.
+- [ ] **Backup must complete before** the triggering large transfer is submitted.  
+- [ ] Phase B: signed chain transactions; transfers uncapped (policy); proof_bridge.
 
 ### Cross-cutting: balance invariants
 
@@ -330,20 +331,19 @@ Ordered for **dependency flow** and **visible user value**:
    - On connect + after State 3, poll or subscribe until success → transition UI to State 4.  
    - **Remove or hide** demo balance when node balance is shown (or dual-label only during explicit debug mode).
 
-4. **Vault + policy for ≤ $10 (State 4)**  
-   - Smart contract **per-tx cap** and UI validation aligned with progressive spec.  
-   - Relayer mint with idempotency key; index **Deposit** events.
+4. **Transfer policy below the threshold (State 4)**  
+   - UI validation of the ASTRA large-transfer threshold aligned with progressive spec.  
+   - No deposit indexing or relayer mint (removed).
 
 5. **PQ backup gate (State 4 → 5)**  
-   - Deposit flow: if `amount >= $10` (in configured decimals), **interrupt** to backup wizard; on success, allow tx broadcast.  
+   - Transfer flow: if `amount_wei >= threshold_wei`, **interrupt** to backup wizard; on success, allow tx broadcast.  
    - Implement keystore download + phrase path; wire KEK from `personal_sign`.
 
-6. **Phase B: RollupBundle ingress**  
-   - Define ingress API on `spacekit-compute-node` (verify batch signature, ordering, DID/session).  
-   - Wire `SpacekitSequencer` in `spacekit-js` to submit bundles when `state >= balanceSynced` and policy allows.
+6. **Phase B: chain transaction submission**  
+   - Submit signed transactions to `spacekit-compute-node` (`POST /transaction`) when `state >= balanceSynced` and policy allows. Rollup bundle settlement is refused on PoA/PoS networks.
 
 7. **proof_bridge + disclosure**  
-   - Enable Ethereum adapter for state roots per environment.  
-   - Settings page: relayer operator, contract addresses, upgrade key policy.
+   - Enable Ethereum adapter for state roots per environment (attestation only).  
+   - Settings page: contract addresses, upgrade key policy.
 
-This document should be updated when registrar contracts, ingress APIs, and vault caps are finalized.
+This document should be updated when registrar contracts and the transfer threshold are finalized.

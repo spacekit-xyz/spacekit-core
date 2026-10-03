@@ -21,7 +21,7 @@
 7. [Workspaces](#workspaces)
 8. [App Packaging (.spkg)](#app-packaging-spkg)
 9. [Embedded App SDK (iframe)](#embedded-app-sdk-iframe)
-10. [SpaceKit Pay (Payments)](#spacekit-pay-payments)
+10. [Payments in ASTRA](#payments-in-astra)
 11. [Content Monetization](#content-monetization)
 12. [MCP Server (Agent Tools)](#mcp-server-agent-tools)
 13. [Growformer Agents](#growformer-agents)
@@ -56,7 +56,8 @@ Your SPA  →  packaged as .spkg  →  loaded in iframe
 | **`.spkg`** | Signed app package (HTML/JS/CSS + manifest) |
 | **iframe** | Sandboxed frame where your app runs on the site |
 | **bridge** | Parent-frame code that answers `window.spacekit` calls |
-| **marketplace** | Where deployed apps are listed and sold (USDC) |
+| **marketplace** | Where deployed apps are listed and sold (in ASTRA) |
+| **ASTRA** | The network's only currency: native balances on the SpaceKit chain, in wei (18 decimals) |
 
 ### What are you building?
 
@@ -100,7 +101,7 @@ A few built-in apps use custom bridges (Notes/Cairn, Quay, Hermes, Harmonia CRM,
 | Layer | Package / file | Role |
 |-------|----------------|------|
 | Portable runtime | `@spacekit/sdk` → `SpacekitAppFrame`, package loader, inject shim | Load `.spkg`, inject `window.spacekit`, route postMessage calls |
-| Website shell | `WebPackageFrame` | Resolve storage origin, SpaceKit Pay, bridge registry, desktop cache |
+| Website shell | `WebPackageFrame` | Resolve storage origin, ASTRA payments, bridge registry, desktop cache |
 | Your app | iframe SPA | Call `window.spacekit.*` only — never talk to parent APIs directly |
 
 Do **not** invent per-app website wiring for a new marketplace app unless you need a custom bridge (files, contracts facets, etc.).
@@ -179,19 +180,18 @@ Full API reference is in this document under "Embedded App SDK (iframe)".
 │  │ Athena, Janus │                        │  port 8545            │ │
 │  └───────────────┘                        └───────────────────────┘ │
 │                                                                     │
-│  ┌───────────────┐  ┌──────────────────┐  ┌───────────────────────┐ │
-│  │  spacekit-cli │  │  spacekit-pay    │  │  Ethereum / Base      │ │
-│  │  (Rust binary)│  │  (Solidity)      │  │  (USDC payments)      │ │
-│  └───────────────┘  └──────────────────┘  └───────────────────────┘ │
+│  ┌───────────────┐                                                  │
+│  │  spacekit-cli │                                                  │
+│  │  (Rust binary)│                                                  │
+│  └───────────────┘                                                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key components:**
 - **Storage Node** — persistent data layer: files, facts, blobs, documents, workspaces
 - **Website API** — proxy/orchestration layer: auth sessions, repos, social, marketplace
-- **Compute Node** — WASM VM, smart contracts, ASTRA token
+- **Compute Node** — WASM VM, smart contracts, the ASTRA ledger (native balances; ASTRA is the only currency, and all payments are ASTRA transfers on this chain)
 - **CLI** — `spacekit` binary for identity, repos, workspaces, agents, contracts
-- **SpaceKit Pay** — non-custodial USDC payment router (Ethereum/Base)
 - **`@spacekit/sdk` embed** — `SpacekitAppFrame` loads `.spkg` packages, injects `window.spacekit`; website `WebPackageFrame` is the thin host
 
 > Shipping an app or game UI? Jump to [Ship a SpaceKit App](#ship-a-spacekit-app-vibe-coders).
@@ -478,12 +478,11 @@ Base URL: `http://127.0.0.1:3001` (local) or `https://api.spacekit.xyz` (product
   "tier": "basic",
   "used_bytes": 5242880,
   "limit_bytes": 52428800,
-  "expires_at": null,
-  "upgrade_price_cents": 400
+  "expires_at": null
 }
 ```
 
-Tiers: `basic` (free, 50 MB) / `team` ($4/mo, 1 GB)
+Tiers: `basic` (free, 50 MB) / `team` (paid monthly in ASTRA, 1 GB; the price is set by the operator). USD-cent pricing (`upgrade_price_cents`) is retired.
 
 ### Social
 
@@ -847,11 +846,9 @@ const result = await window.spacekit.payments.subscribe({
 
 const config = await window.spacekit.payments.config();
 // config.configured → boolean
-
-await window.spacekit.payments.charge(400, "USDC"); // amount + token hint
 ```
 
-Parent host runs SpaceKit Pay (wallet) and records marketplace purchase when configured.
+All payments are in ASTRA on the SpaceKit chain. The parent host must sign and submit the chain transaction (an entitlement purchase or an ASTRA transfer to the publisher) and return its transaction hash; the app never holds a balance or a key. A one-shot `charge` must be an ASTRA amount, not USD cents or a stablecoin. The host bridge in `spacekit.xyz-website` implements these calls and must be updated to match (see [`PAYMENTS_AND_CURRENCY.md`](PAYMENTS_AND_CURRENCY.md#recommendations)). See [Payments in ASTRA](#payments-in-astra).
 
 ### Messaging
 
@@ -938,61 +935,36 @@ This pattern keeps Vite `npm run dev` working while the same build ships as a `.
 
 ---
 
-## SpaceKit Pay (Payments)
+## Payments in ASTRA
 
-Non-custodial USDC payment router on Ethereum/Base. 95% goes to the publisher, 5% to the SpaceKit treasury.
+ASTRA is the only currency. It exists only as the native account balance on the SpaceKit chain, in wei (18 decimals). There are no USD-denominated balances, no stablecoin rails (USDC/x402, aUSD) and no exchange rates. spacekit-js keeps no balance in the browser. SpaceKit Pay, the earlier USDC router on Ethereum/Base, is retired; see [`PAYMENTS_AND_CURRENCY.md`](PAYMENTS_AND_CURRENCY.md).
 
-### Contracts
+### Building blocks
 
-| Contract | Purpose |
-|----------|---------|
-| `SpaceKitPayRouter` | Routes USDC payments (publisher 95% / treasury 5%) |
-| `SpaceKitOperatorRegistry` | Maps DIDs to Ethereum payout addresses |
+| Piece | Purpose |
+|-------|---------|
+| `ChainClient` / `ChainAccount` (`@spacekit/spacekit-js/chain`) | Read balances and transactions from a compute node; sign and submit chain transactions |
+| `parseAstra` | Convert an ASTRA amount to wei |
+| `chainContractCaller` | Call a contract on the chain (for example the entitlement ledger) |
+| `astra-entitlement-ledger` contract | Listings, purchases, renewals and entitlement checks for apps, content and channels |
+| `spacekit-paymaster` contract | Sponsored calls, paid from ASTRA that sponsors deposit |
 
-### Payment Flow
+Exact signatures are in [`runtimes/spacekit-js/docs/CURRENCY.md`](../runtimes/spacekit-js/docs/CURRENCY.md) and [`runtimes/spacekit-js/docs/ENTITLEMENT_PROTOCOL.md`](../runtimes/spacekit-js/docs/ENTITLEMENT_PROTOCOL.md).
 
-1. User connects wallet (MetaMask, WalletConnect, etc.)
-2. App calls `payPublisher(publisherDid, amountCents)`
-3. Router resolves DID → payout address via OperatorRegistry
-4. USDC is transferred: 95% to publisher, 5% to treasury
-5. Transaction hash is returned for verification
+### Buying an app or content
 
-### React Hook
+1. The publisher creates a listing on the entitlement ledger (`OP_CREATE_LISTING`), priced in ASTRA wei.
+2. The buyer sends `OP_PURCHASE(listing, buyer_pk_hash)` with the price attached as value (`msg_value >= price`). Subscriptions renew with `OP_RENEW`.
+3. The contract forwards the whole payment to the publisher's address (the address in their `did:spacekit:<hex>`). It keeps nothing, and there is no platform split.
+4. Storage and messaging nodes check access with read-only calls: `OP_VERIFY_LISTING` against the listing they trust, and `OP_GET_LISTING` to check its publisher.
 
-```typescript
-import { useSpaceKitPay } from "../hooks/useSpaceKitPay";
+### Paying a service directly
 
-function PayButton() {
-  const { payPublisher, isConfigured, isBusy } = useSpaceKitPay();
+A payment is a successful ASTRA transfer on the chain, proven by its transaction hash. The payee checks it with `GET /v1/tx/{hash}` or `POST /v1/payments/verify { tx_hash, pay_to, amount_wei }`, which checks the payee, the amount and success, and refuses a hash it has already accepted. A service that grants something lasting must store the hash with the grant. Paid HTTP endpoints can use the `spacekit-payments` middleware, where the client sends `X-PAYMENT: <tx hash>`.
 
-  const handlePay = async () => {
-    const { txHash } = await payPublisher(
-      "did:spacekit:user:publisher",
-      400  // $4.00 in cents
-    );
-    console.log("Paid:", txHash);
-  };
+### Local testing
 
-  return <button onClick={handlePay} disabled={!isConfigured || isBusy}>Pay</button>;
-}
-```
-
-### Local Testing (Anvil)
-
-```bash
-# Start local EVM chain
-anvil --chain-id 31337
-
-# Deploy contracts (from spacekit.xyz-contracts/)
-forge script script/DeploySpaceKitPayLocal.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
-
-# Configure .env.local
-VITE_SPACEKIT_PAY_CHAIN_ID=31337
-VITE_SPACEKIT_PAY_RPC_URL=http://127.0.0.1:8545
-VITE_SPACEKIT_PAY_ROUTER_ADDRESS=0x...
-VITE_SPACEKIT_PAY_USDC_ADDRESS=0x...
-VITE_SPACEKIT_PAY_REGISTRY_ADDRESS=0x...
-```
+Run a single-node development compute node (the faucet works only there) and point `ChainClient` at it. No EVM chain, router contract or token address is needed.
 
 ---
 
@@ -1000,11 +972,11 @@ VITE_SPACEKIT_PAY_REGISTRY_ADDRESS=0x...
 
 ### Entitlement Flow
 
-1. Publisher creates a listing on the entitlement ledger (WASM contract)
-2. Access is minted by either:
-   - **Paid:** buyer `OP_PURCHASE(listing, buyer_pk_hash)`, or
+1. Publisher creates a listing on the entitlement ledger (`astra-entitlement-ledger` WASM contract), priced in ASTRA wei
+2. Access is granted by either:
+   - **Paid:** buyer `OP_PURCHASE(listing, buyer_pk_hash)` with the price attached in ASTRA, paid straight to the publisher's address, or
    - **Owner approve:** publisher `OP_GRANT(listing, recipient_did, recipient_pk_hash)`
-3. Storage verifies via `OP_VERIFY` on `POST /files/{id}/rewrap`
+3. Storage verifies with read-only calls (`OP_VERIFY_LISTING` + `OP_GET_LISTING`) on `POST /files/{id}/rewrap`
 4. Delivery:
    - **True E2E:** owner posts a recipient-wrapped DEK capsule (`PUT .../delivery-capsule`); storage streams ciphertext without unwrapping the DEK
    - **Server-wrapped blobs:** storage re-wraps the DEK header (bounded stream)
@@ -1328,12 +1300,9 @@ MESSAGING_NODE_URL=http://127.0.0.1:3040
 ```bash
 VITE_API_URL=http://127.0.0.1:3001
 VITE_STORAGE_NODE_URL=http://127.0.0.1:3030
-VITE_SPACEKIT_PAY_CHAIN_ID=31337
-VITE_SPACEKIT_PAY_RPC_URL=http://127.0.0.1:8545
-VITE_SPACEKIT_PAY_ROUTER_ADDRESS=0x...
-VITE_SPACEKIT_PAY_USDC_ADDRESS=0x...
-VITE_SPACEKIT_PAY_REGISTRY_ADDRESS=0x...
 ```
+
+The `VITE_SPACEKIT_PAY_*` variables (router, USDC and registry addresses) are retired with SpaceKit Pay.
 
 ### CLI Configuration (`~/.spacekit/config.toml`)
 
@@ -1449,6 +1418,8 @@ GET /api/did/check/alice
 }
 // → { "ok": true, "did": "did:spacekit:user:alice", "username": "alice", "airdrop_astra": 100 }
 ```
+
+`airdrop_astra` applies only on a single-node development chain, where the faucet works. On a consensus (PoA/PoS) network the faucet is refused and nothing mints ASTRA outside blocks.
 
 ### Resolve
 
@@ -1619,7 +1590,7 @@ spacekit brain-registry publish --manifest brain-manifest.json
 | Git-like code hosting | `/blobs` + `/facts` + ref docs, or `spacekit repo` CLI |
 | Website login | `/api/auth/passkey/*` or `/api/auth/email/*` → Bearer session (~30 days) |
 | Browser CAS upload | Mint upload token → `PUT /blobs/{hash}` with `UploadToken` |
-| Buy app/content | SpaceKit Pay `payForService` → `POST /api/marketplace/purchase` |
+| Buy app/content | Entitlement ledger `OP_PURCHASE` in ASTRA (paid to the publisher) → `POST /api/marketplace/purchase` |
 | Run AI brain | `spacekit agent infer --brain brain.bin --prompt "..."` |
 | Generate API SDK from OpenAPI | `spacekit agent sdk --spec openapi.yaml --lang python\|typescript` |
 | Publish agent | `storage deploy` → `brain-registry build` → `brain-registry publish` |
@@ -1640,7 +1611,8 @@ spacekit brain-registry publish --manifest brain-manifest.json
 | CLI commands | `spacekit-cli/src/full_client.rs` + submodules |
 | OpenAPI SDK generation | `spacekit-cli/documentation/AGENT_SDK_GENERATION.md` · `spacekit-cli/src/full_client/sdkgen.rs` |
 | JS SDK | `spacekit-sdk/lib/spacekit-sdk/index.ts` |
-| SpaceKit Pay contracts | `spacekit-pay/SpaceKitPayRouter.sol` |
+| ASTRA payments | `runtimes/spacekit-js/docs/CURRENCY.md` · `infra/spacekit-compute-node/ASTRA_LEDGER.md` |
+| Entitlement ledger | `runtimes/spacekit-js/docs/ENTITLEMENT_PROTOCOL.md` · `spacekit-standard-library/marketplace/astra-entitlement-ledger` |
 | Repo types | `spacekit-repo/src/lib.rs` |
 | Storage node docs | `spacekit-storage-node/documentation/` |
 

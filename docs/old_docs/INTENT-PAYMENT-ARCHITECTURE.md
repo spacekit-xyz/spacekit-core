@@ -1,5 +1,15 @@
 # Intent-Based Payment Architecture
 
+> **Historical — removed design.** This document describes the aUSD vault /
+> x402 (USDC) payment design, which has been removed. ASTRA is now the only
+> currency, held as native balances on the SpaceKit chain. Intents
+> (`POST /v1/execute`) carry ASTRA wei only and are validated, not executed:
+> the node lists the chain transactions the actor must sign. Vault charges and
+> non-ASTRA transfers are refused. See
+> [`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md) and
+> [`../../infra/spacekit-compute-node/ASTRA_LEDGER.md`](../../infra/spacekit-compute-node/ASTRA_LEDGER.md).
+> Kept for history only.
+
 **How RouteKit's Intent Protocol unifies with the SpaceKit Payment System**
 
 ## Current State

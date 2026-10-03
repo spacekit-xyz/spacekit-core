@@ -52,6 +52,8 @@ export SPACEKIT_CONTENT_SETTLEMENT_SECRET=<shared-secret>   # optional but recom
 
 On **compute**, set the same `SPACEKIT_STORAGE_NODE_URL` and `SPACEKIT_CONTENT_SETTLEMENT_SECRET` so `POST /v1/payments/verify` forwards to `POST /api/content/settlements`.
 
+Payments are in ASTRA only. The buyer pays the listing price (ASTRA wei) through the entitlement ledger, which pays the publisher's address directly. `POST /v1/payments/verify` (`{ tx_hash, pay_to, amount_wei }`) checks the ASTRA transaction by hash (payee, amount, success, not already used) and forwards `content:` / `channel:` scopes to the storage inbox with `amount_wei`, asset `ASTRA` and `payer_did`.
+
 ## 4. Live soak
 
 ```bash
@@ -63,10 +65,10 @@ Or manual H2:
 
 ```bash
 spacekit content publish --channel did:spacekit:channel:live:pub \
-  --file ./fixture.txt --title "Live PPV" --pricing pay_per_view --price 10
+  --file ./fixture.txt --title "Live PPV" --pricing pay_per_view --price 10   # ASTRA
 
 spacekit content pay --content-id <CONTENT_ID>
-# complete SpaceKit Pay; verify hits compute → storage inbox
+# send the ASTRA payment; verify (by tx hash) hits compute → storage inbox
 
 spacekit content pay --content-id <CONTENT_ID> --await-settlement
 # or: spacekit content listen-settlements --once

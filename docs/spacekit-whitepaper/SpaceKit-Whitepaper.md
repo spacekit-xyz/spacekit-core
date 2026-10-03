@@ -148,9 +148,10 @@ application, key custody, operator topology, and enabled cryptographic features.
 ### Revenue Stream #1 — Usage-Based Infrastructure Billing
 
 SpaceKit's intended service model is usage-based infrastructure billing.
-Protocol resources use ASTRA; stablecoin service settlement can use SpaceKit
-Pay where deployed. Availability, accepted assets, and fees are
-deployment-specific.
+Protocol resources and services are paid in ASTRA, the network's only
+currency, by transfers on the SpaceKit chain. Services are priced in ASTRA by
+their operators or publishers. See
+[`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md).
 
 - **Compute**: CPU/GPU compute, AI inference, ML training, smart contract execution, video transcoding, analytics processing
 - **Storage**: GB stored, GB retrieved, retention tiers, hot vs cold storage
@@ -163,9 +164,9 @@ This is the most reliable and predictable revenue stream because it scales direc
 ASTRA becomes the economic engine across the platform:
 
 - **ASTRA is used for**: gas, compute, storage, CDN, analytics, ads, video monetization, governance, staking
-- **Operators earn**: measured protocol service rewards and applicable user-paid service fees
+- **Operators earn**: measured protocol service rewards (used gas is burned, not paid to operators); publishers and service providers receive ASTRA payments for what they sell
 
-This creates a flywheel: more apps → more usage → more ASTRA demand → more revenue.
+This creates a flywheel: more apps → more usage → more measured service → more operators.
 
 ### The Business Model in One Sentence
 
@@ -2857,7 +2858,7 @@ verification paths. This section describes integration targets, not six
 production deployments.
 
 ### Integration Targets
-- **Ethereum and EVM networks**: payment-contract deployment tooling and EVM adapter work
+- **Ethereum and EVM networks**: EVM adapter work
 - **Solana**: DID bridge serialization and registration helpers
 - **Cosmos/IBC and additional EVM networks**: planned or simulated adapter paths requiring production implementation and independent review
 
@@ -2865,7 +2866,7 @@ production deployments.
 
 #### Implementation Features
 
-- **Same-network settlement**: SpaceKit Pay deployments route supported assets on their host network and do not imply a token bridge
+- **Single-chain settlement**: payments settle in ASTRA on the SpaceKit chain only; no bridge, rollup or external chain mints or moves ASTRA on a consensus network
 - **Bridge verification**: production paths must verify source-chain finality and proofs rather than simulated transaction checks
 - **Identity portability**: DID bridge helpers require deployment-specific registries and security review
 
@@ -2880,8 +2881,11 @@ specification controls.
 
 ## ASTRA Overview
 
-ASTRA is SpaceKit's native L1 utility token. It is used for protocol resource
-fees, active validator stake, and on-chain governance. Operators earn ASTRA for
+ASTRA is SpaceKit's native L1 utility token and its only currency. It exists
+only as the native account balance on the SpaceKit chain (in wei, 18
+decimals), covered by the block state root. It is not a stablecoin and is not
+pegged. It is used for protocol resource fees, paying for services, active
+validator stake, and on-chain governance. Operators earn ASTRA for
 measured consensus, compute, storage, and messaging service. Holding or staking
 ASTRA without providing service does not produce yield.
 
@@ -2890,7 +2894,7 @@ ASTRA without providing service does not produce yield.
 | Hard supply cap | 2,000,000,000 ASTRA |
 | Decimals | 18 |
 | Inflation above cap | None |
-| Automatic transaction burn | None |
+| Burn | Used gas only (no burn tied to fee volume) |
 | Primary emission path | Measured operator service through the Service Reward Accumulator |
 | Public sale or pre-sale | None |
 
@@ -2902,11 +2906,16 @@ endorsed by this paper.
 ## Operator Service Emission
 
 The Service Reward Accumulator reads structured service logs, calculates an
-epoch allocation, and submits capped credit instructions to the AstraRewards
-contract. The initial annual operator-emission target is 200,000,000 ASTRA and
+epoch allocation, and places capped rewards system calls (to the system
+address `0x…0003`) at the start of each block. The node executes them natively:
+CREDIT mints straight into the recipient's native balance, and during proof of
+authority CREDIT_LOCKED records rewards for authorities and affiliated
+operators that vest from genesis (nothing before 365 days, then linearly until
+1,095 days). There is no separate rewards contract ledger, and every importer
+re-derives and checks these calls. The initial annual operator-emission target is 200,000,000 ASTRA and
 decays on a four-year halving curve. The continuous curve approaches
 approximately 1.154 billion ASTRA in cumulative operator emission while the
-contract-level 2 billion cap remains binding.
+protocol-level 2 billion cap remains binding.
 
 Default category shares are:
 
@@ -2924,7 +2933,9 @@ bounds defined by the canonical specification.
 
 ## Validator Stake and Governance
 
-Validator stake is a security deposit and Sybil-resistance mechanism. Validators
+Validator stake is a security deposit and Sybil-resistance mechanism. Staking is
+native: stake is backed by the validator's ASTRA holdings (balance plus locked,
+unreleased rewards), and there is no staking receipt token. Validators
 earn for measured validation service, not for passively locking tokens.
 Misbehavior can trigger slashing. Governance voting power is tied to active
 stake and covers bounded protocol parameters and upgrades; governance cannot
@@ -2932,8 +2943,9 @@ raise the hard cap.
 
 ## Genesis Treasury, Bootstrap, and Ecosystem Programs
 
-At network genesis, 350,000,000 ASTRA (17.5% of the cap) is allocated to a
-multi-signature SpaceKit treasury. This startup allocation is part of the hard
+At network genesis, 350,000,000 ASTRA (17.5% of the cap) is minted by INIT to
+the on-chain treasury contract `0x…0004`, which pays M-of-N approved spends
+(signers and threshold set in the proof-of-authority genesis). This startup allocation is part of the hard
 cap and is separate from operator service emission. A one-time 50,000,000 ASTRA
 bootstrap pool for initial validator stake is drawn from that treasury rather
 than minted in addition to it. Approximately 496,000,000 ASTRA remains protocol
@@ -2952,20 +2964,27 @@ may create ASTRA outside the capped ledger.
 - **Compute gas** is metered in ASTRA according to the active network fee rules.
 - **Storage and messaging** consume ASTRA according to measured resource use.
 - **Identity operations** may consume ASTRA according to their protocol cost.
-- User-paid resource fees flow to the operators serving the request under the
-  active protocol rules; they are distinct from scheduled service emission.
+- Used gas is burned; it is not paid to validators. Operator income is
+  scheduled service emission for measured service.
+- Service and content payments are ASTRA transfers on the chain, verified by
+  transaction hash. Paid content, channels and app listings use the
+  `astra-entitlement-ledger` contract, which pays the listing price straight to
+  the publisher's address. Sponsored calls use the `spacekit-paymaster`
+  contract, which holds ASTRA deposited by sponsors.
 
 Published gas examples are configuration-specific testnet observations, not
 fixed prices or financial projections.
 
-## SpaceKit Pay and x402
+## One Currency
 
-SpaceKit Pay is a separate non-custodial settlement primitive for supported
-stablecoins and, on SpaceKit where configured, ASTRA. It does not mint ASTRA or
-change the ASTRA emission schedule. x402 supplies HTTP payment semantics and can
-use SpaceKit Pay as a settlement rail. Supported networks, assets, fees, and
-contract status are specified in the canonical tokenomics and deployment
-documentation.
+ASTRA is the only currency. The network has no USD-denominated balances, no
+stablecoin rails (x402/USDC, aUSD vault credits, and the Ethereum DAI/USDC
+entitlement deposits have been removed), and no exchange rates or oracles for
+pricing. SpaceKit Pay, an earlier stablecoin router, is retired. Payments do
+not mint ASTRA: faucets, rollup settlement, bridges and PoTW awards are refused
+on consensus networks. See
+[`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md) and
+[`../../infra/spacekit-compute-node/ASTRA_LEDGER.md`](../../infra/spacekit-compute-node/ASTRA_LEDGER.md).
 
 ## Economic Separation for Event Applications
 
@@ -3717,7 +3736,7 @@ SpaceKit's quantum-resistant identity and cryptography layers can integrate with
 - Comprehensive documentation and tutorials
 
 **Developer Incentives**
-- Grant program for ecosystem development (funded from Community allocation)
+- Grant program for ecosystem development (funded by approved spends from the treasury contract)
 - Bug bounties for security research and vulnerability disclosure
 - Hackathon sponsorship and prize pools
 - Developer advocacy and technical support
@@ -3727,7 +3746,7 @@ SpaceKit's quantum-resistant identity and cryptography layers can integrate with
 **App Store Model**
 - Developers publish agent bundles to the SpaceKit marketplace
 - Users discover, purchase, and deploy agents using ASTRA
-- Revenue sharing: 70% to developers, 30% to protocol/nodes
+- Purchases go through the `astra-entitlement-ledger` contract, which pays the listing price in ASTRA straight to the publisher's address (the ledger keeps nothing)
 - Quality metrics and reputation scoring for agents
 
 **Agent Categories**

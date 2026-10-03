@@ -7,7 +7,7 @@
 **Type:** Protocol-level function (not a smart contract)
 **References:** AstraRewards Contract Specification; ASTRA Emission Schedule
 
-This document specifies the Service Reward Accumulator (SRA) — the protocol-level function that reads structured service log events, computes ASTRA rewards per the emission schedule, and submits credit instructions to the AstraRewards contract.
+This document specifies the Service Reward Accumulator (SRA) — the protocol-level function that reads structured service log events, computes ASTRA rewards per the emission schedule, and places credit system calls to the rewards address `0x…0003`. The node executes those calls natively (`native_rewards.rs`) and mints each reward straight into the recipient's native account balance; there is no AstraRewards contract ledger.
 
 The SRA is the bridge between service events (operators actually doing work) and ASTRA emissions (operators getting paid). It runs as part of consensus execution, not as a smart contract called by users.
 
@@ -27,13 +27,13 @@ On finalization, validators execute the block atomically:
   2. Service log events are emitted to the structured log
   3. SRA reads the log events for this block
   4. SRA computes rewards per the emission schedule
-  5. SRA submits CREDIT operations to AstraRewards for each rewarded event
+  5. SRA places CREDIT system calls to 0x…0003 for the rewarded operators
   6. Block is committed to state
   ↓
 Next block begins; cycle continues
 ```
 
-The SRA's submissions to AstraRewards happen as part of the same block's execution. They are inseparable from the block's other state changes. All validators executing the same block compute the same SRA outputs (deterministic), so consensus naturally agrees.
+The SRA's rewards system calls happen as part of block execution (as system transactions at the start of a block). They are inseparable from the block's other state changes. All validators executing the same block compute the same SRA outputs (deterministic), so consensus naturally agrees.
 
 This is similar to how Ethereum's beacon chain credits validators for consensus work: not via smart contract calls from arbitrary users, but as part of the protocol's execution layer.
 
@@ -148,7 +148,7 @@ For each event, the SRA does:
 4. Compute the reward: `reward = rate * event_resource_units`.
 5. Check that `epoch_consumed_emission[category] + reward <= epoch_emission_budget[category]`. If exceeded, cap to remaining.
 6. Update `epoch_consumed_emission[category] += reward`.
-7. Submit a CREDIT to AstraRewards with: operator_did, reward, log_event_hash.
+7. Place a CREDIT system call to `0x…0003` with: operator address, reward, log_event_hash.
 
 ### 4.1 Dynamic rate adjustment within an epoch
 
@@ -194,16 +194,16 @@ Not all logged events earn ASTRA. The SRA applies validation rules to filter:
 
 The SRA logs the unapproved events for auditing but does not submit credits for them. This means the operator did provide some work but it didn't earn ASTRA. Operators can investigate why their events were not rewarded by checking the SRA's audit log.
 
-## 6. Integration with the AstraRewards contract
+## 6. Integration with native rewards
 
-The SRA submits CREDIT operations to AstraRewards in a batched fashion:
+The SRA issues CREDIT operations to the rewards system address `0x…0003` in a batched fashion. The node executes them natively and mints into native account balances:
 
 **Per-block batching.** All credits earned from a block's events are submitted as a batch when the block is executed. The SRA executes:
 
 ```
 for each approved event in this block:
-  AstraRewards.CREDIT(
-    recipient_did_hash = event.operator_did_hash,
+  rewards(0x…0003).CREDIT(
+    recipient = event.operator_address,
     amount = computed_reward,
     log_event_hash = event.content_hash
   )
@@ -213,7 +213,7 @@ The batch is part of the block's execution. All validators execute the same batc
 
 **Atomicity.** If any CREDIT operation in the batch fails (e.g., cap exceeded), only that specific credit reverts. Other credits in the same batch succeed. The SRA logs the failure for auditing.
 
-**Cap enforcement at the SRA level.** Before submitting a CREDIT, the SRA verifies `AstraRewards.total_emitted + this_credit_amount <= 2B * 10^18`. If exceeded, the CREDIT is cancelled (and the cap_reached event is emitted in the contract). The remaining budget is split proportionally among the affected events.
+**Cap enforcement at the SRA level.** Before submitting a CREDIT, the SRA verifies `rewards.total_emitted + this_credit_amount <= 2B * 10^18`. If exceeded, the CREDIT is cancelled (and the cap_reached event is emitted). The remaining budget is split proportionally among the affected events.
 
 ## 7. Reputation integration (post-fork)
 
@@ -231,8 +231,8 @@ For other service categories (compute, storage, messaging), reputation is a seco
 
 When an operator is slashed for misbehavior:
 
-- Their staked ASTRA is slashed at the AstraRewards level (separate operation, handled by the slashing contract).
-- Their pending rewards (balance in AstraRewards) are NOT slashed. Earned rewards are payment for service already provided, not at risk.
+- Their staked ASTRA (native holdings, locked rewards included) is slashed (separate operation, handled by the slashing logic).
+- Rewards already credited to their balance are NOT slashed. Earned rewards are payment for service already provided, not at risk.
 - Their reward stream is suspended for a slashing penalty period. During the penalty period, the SRA does not submit CREDIT operations for events from this operator. The operator can still earn for their work during the penalty period — the work just doesn't yield ASTRA until the penalty ends.
 - After the penalty period, normal rewards resume.
 
@@ -268,9 +268,9 @@ fn execute_block(block: &Block, state: &mut State) -> Result<(), ExecutionError>
     // 3. Run the service reward accumulator
     let credits = service_reward_accumulator(log_events, &block.epoch, &state.registry);
 
-    // 4. Submit credits to AstraRewards (as part of state)
+    // 4. Apply credits natively (system calls to 0x…0003, minted into native balances)
     for credit in credits {
-        astra_rewards_credit(state, credit)?;
+        native_rewards_credit(state, credit)?;
     }
 
     // 5. Other block-end processing
@@ -349,7 +349,7 @@ A few items that need future decision:
 
 ## 13. References
 
-- [`AstraRewards_Contract_Spec.md`](./AstraRewards_Contract_Spec.md)
+- [`ASTRA_REWARDS_CONTRACT_SPEC.md`](./ASTRA_REWARDS_CONTRACT_SPEC.md) (rewards system calls, now executed natively by the node)
 - [`ASTRA_EMISSION.md`](./ASTRA_EMISSION.md)
 - ASTRA Economic Model Decision Memo (internal)
 - SpaceKit Tokenomics v2.0

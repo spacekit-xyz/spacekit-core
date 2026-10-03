@@ -2376,6 +2376,9 @@ impl SwtchComputeNode {
                         if scope.starts_with("content:") || scope.starts_with("channel:") {
                             let webhook = serde_json::json!({
                                 "tx_hash": receipt.tx_hash,
+                                // The settlement inbox compares `amount` (decimal ASTRA) with the
+                                // listing price; `amount_wei` is exact.
+                                "amount": spacekit_payments::format_astra(receipt.amount_wei),
                                 "amount_wei": receipt.amount_wei.to_string(),
                                 "asset": "ASTRA",
                                 "payer_did": format!("did:spacekit:{}", receipt.from.trim_start_matches("0x")),

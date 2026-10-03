@@ -31,14 +31,14 @@ can import them without an extra crate.
 
 ### Tokens & Finance
 - **sk-erc20**, **sk-erc721**, **sk-erc1155**, **sk-erc8004** — Token standards (`tokens/`)
-- **astra-escrow**, **astra-payment-router** — Escrow and payment routing (`payments/`)
-- **spacekit-paymaster** — ERC-4337–inspired paymaster for sponsored agent execution (`payments/`)
-- **payable-demo** — Payable / payment integration demo (`payments/`)
+- **astra-escrow**, **astra-payment-router** — Escrow and payment routing in ASTRA (`payments/`)
+- **spacekit-paymaster** — ERC-4337–inspired paymaster for sponsored agent execution: holds native ASTRA deposited by sponsors and pays permitted callers under a policy (per-call and daily limits, allowed DIDs and ops, expiry) (`payments/`)
+- **payable-demo** — Payable / payment integration demo: receiving ASTRA attached to a call (`payments/`)
 - **spacekit-reputation** — Reputation primitive (`reputation/`)
 - **app-store** — App distribution & licensing (`app-store/`)
 
 ### Marketplace
-- **astra-entitlement-ledger** — Entitlement / marketplace ledger (`marketplace/`)
+- **astra-entitlement-ledger** — Entitlement / marketplace ledger for paid content, channels and app listings. Purchase and renewal pay the listing price in ASTRA straight to the publisher's address; the ledger keeps no funds (`marketplace/`)
 
 ### Storage & infra
 - **sk-storage-box** (spacekit-box) — Blob/store contract using `spacekit_storage` → `storage/`
@@ -48,17 +48,20 @@ can import them without an extra crate.
 ### System & identity
 - **spacekit-did-registry** — DID registry (`system/`)
 - **spacekit-session-keys** — Session keys for delegated agent execution (`system/`)
-- **spacekit-shared-vault** — Shared vault (`system/`)
+- **spacekit-shared-vault** — Shared vault for multi-signer file access control; it holds no funds (`system/`)
 
 ### Agents & AI
 - **spacekit-agent** — Kit on-chain agent (CHAT, ANALYZE, SUMMARIZE, CODE_REVIEW, CLASSIFY, STATUS) → `agents/`
 - **spacekit-agent-microgpt** — Micro-GPT next-token agent (uses `microgpt_forward` host primitive; Rust + AssemblyScript) → `agents/spacekit-agent-microgpt`
 - **spacekit-growformer-agent** — Growformer brain on-chain agent (`agents/`)
 - **spacekit-growformer-sentiment-analysis**, **spacekit-growformer-crypto-analysis**, **spacekit-growformer-fintech-analysis** — Growformer-backed domain analysis agents (`agents/`)
-- **routekit-agent** — RouteKit agent (Growformer + web search + vault + messaging + remote storage) → `agents/routekit-agent`
+- **routekit-agent** — RouteKit agent (Growformer + web search + messaging + remote storage) → `agents/routekit-agent`
 - **spacekit-agent-inference-market**, **spacekit-inference-mesh** — Agent inference (`agents/`)
 - **spacekit-intent-classifier** — Intent classification (`agents/`)
 - **spacekit-spacetime** — Spacetime discussion forum (`agents/`)
+
+### Payments in contracts
+ASTRA is the only currency. A contract receives ASTRA as the value attached to a call and can pay only from its own balance (`transfer_u128`, or `payment_transfer` with asset `ASTRA`); it can never spend its caller's balance. Other assets are refused, and the old vault charge (`payment_vault_charge`) is always refused. Paid operations use the SDK's `collect_fee(price_wei, payee)`, which forwards everything attached to the payee: the standard-library agents and the anchor contract charge their fees in ASTRA (priced in micro-ASTRA) and pay them to the treasury contract.
 
 ---
 

@@ -1,3 +1,5 @@
+> **Retired (October 2026).** SpaceKit Pay is no longer part of SpaceKit. The network has one currency, ASTRA; marketplace sales are paid in ASTRA through the entitlement ledger. This memo's analysis applies to the retired SpaceKit Pay product only and should not be relied on for the current network. Kept for history only. See [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 # SpaceKit Pay: Legal Posture Memorandum
 
 **Prepared by:** SWTCH Labs (internal)

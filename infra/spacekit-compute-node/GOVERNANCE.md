@@ -18,7 +18,7 @@ The CLI side is `spacekit governance` (`tools/spacekit-cli/src/full_client/gover
 
 1. **Genesis (proof of authority).** The network starts with the authorities named in its genesis file. Authorities produce blocks without stake.
 2. **Growing the set.** Authorities admit operators with `add_authority` proposals and drop them with `remove_authority`. One vote per authority; a proposal passes with `ceil(2n/3)` approvals.
-3. **Staking.** Any operator can bond ASTRA it holds in AstraRewards as validator stake, before or after the lift. Authorities earn the consensus share of emission for every block they produce, locked during PoA, and locked ASTRA is stakeable.
+3. **Staking.** Any operator can bond ASTRA it holds (its native balance plus locked rewards not yet released) as validator stake, before or after the lift. Authorities earn the consensus share of emission for every block they produce, locked during PoA, and locked ASTRA is stakeable.
 4. **Lifting PoA.** Once there are at least `min_validators_to_lift` authorities (default 10), an authority can propose `lift_poa`. Nothing switches automatically.
 5. **Proof of stake.** After the lift, validators whose effective stake reaches the minimum produce blocks, chosen in proportion to stake. Authorities keep producing unstaked for the grace period (`pos_grace_days`, default 30). Governance continues, weighted by stake, for protocol settings. If no validator has the minimum stake once the grace period ends, the authorities keep producing so the chain does not halt.
 
@@ -79,7 +79,7 @@ When blocks are produced is a network setting, `block_production`, in the genesi
 | `batch_window_ms` | `500` | `on_demand`: after the first pending transaction arrives, wait this long so a burst lands in one block. |
 | `heartbeat_secs` | `300` | `on_demand`: an empty block after this much idle time. `0` turns heartbeats off. |
 
-With `on_demand`, a block becomes due at the earliest of: the oldest pending transaction plus `batch_window_ms`; the moment a system transaction is due (reward settlement, `END_POA`); the parent's time plus `heartbeat_secs`. It is never due sooner than `block_time_ms` after the parent. Heartbeats keep block timestamps moving (AstraRewards vesting reads them) and let explorers tell an idle chain from a stalled one. Keep `heartbeat_secs` at 300 or less on mainnet: it bounds how late a reward settlement can be on an idle chain.
+With `on_demand`, a block becomes due at the earliest of: the oldest pending transaction plus `batch_window_ms`; the moment a system transaction is due (reward settlement, `END_POA`); the parent's time plus `heartbeat_secs`. It is never due sooner than `block_time_ms` after the parent. Heartbeats keep block timestamps moving (vesting of locked rewards reads them) and let explorers tell an idle chain from a stalled one. Keep `heartbeat_secs` at 300 or less on mainnet: it bounds how late a reward settlement can be on an idle chain.
 
 **Who produces.** The producer set comes from the chain:
 
@@ -139,7 +139,7 @@ Block production is an operational setting, so the authorities may change it dur
 
 ## Staking
 
-Validators stake ASTRA they hold in AstraRewards: the spendable balance plus locked PoA-phase earnings not yet released. A stake operation is signed with the validator DID's key:
+Staking is native. Validators stake ASTRA they hold: the native balance of the DID's address plus locked PoA-phase earnings not yet released. There is no staking receipt token. A stake operation is signed with the validator DID's key:
 
 ```text
 SPACEKIT-STAKE-v1\n{body_json}
@@ -151,13 +151,15 @@ body: { "version": 1, "network", "did", "sphincs_pk_hex", "action": "bond" | "un
 - `nonce` is the validator's operation count (`GET /v1/staking` → `next_nonce`), so a message cannot be replayed.
 - **Effective stake** is `min(bonded, holdings − unbonding)`. If holdings fall, the weight falls with them.
 
-Genesis staking rules: `"staking": { "min_stake_astra": 10000, "unbonding_secs": 1814400 }` (defaults) and `"pos_grace_days": 30`. `POST /v1/consensus/register-validator` answers 403 during PoA and 410 afterwards on a network with a genesis: stake goes through `/v1/staking`.
+Genesis staking rules: `"staking": { "min_stake_astra": 10000, "unbonding_secs": 1814400 }` (defaults) and `"pos_grace_days": 30`. `POST /v1/consensus/register-validator` answers 403 during PoA and 410 afterwards on a network with a genesis: stake goes through `/v1/staking`. On a network without a genesis, `register-validator` takes `stake_wei`, which must be backed by the DID's native holdings and be at least `SPACEKIT_MIN_VALIDATOR_STAKE_WEI` (default 10,000 ASTRA).
 
-There is no slashing yet, and ASTRA credited to a SPHINCS+ DID in AstraRewards cannot be withdrawn to an address yet (AstraRewards `WITHDRAW` is called from an address, whose DID differs). Both are needed before stake is at real economic risk.
+There is no slashing yet, so stake is not at risk. A SPHINCS+ DID holds its ASTRA at its own address and spends it with SPHINCS+-signed transfers (`POST /v1/transfer`, see [`ASTRA_LEDGER.md`](ASTRA_LEDGER.md)).
 
 ## Service rewards
 
-Rewards are settled once per epoch as system transactions at the start of the first block after the epoch ends: `INIT` of AstraRewards (once), `END_POA` after the lift, then one `CREDIT` per recipient. During PoA, credits to authorities and affiliated operators are `CREDIT_LOCKED` (12-month cliff from genesis, vesting to month 36, stakeable, not transferable). Every node derives the same list from the chain (including the lock list, which comes from the on-chain governance state) and rejects a block whose leading system transactions differ.
+Rewards are settled once per epoch as system transactions to the rewards system address `0x…0003` at the start of the first block after the epoch ends. The node executes them natively (`native_rewards.rs`); there is no rewards contract ledger. `INIT` (once) mints the genesis treasury allocation, 350,000,000 ASTRA, to the treasury contract `0x…0004`; `END_POA` after the lift; then one `CREDIT` per recipient, minted straight into the recipient address's native balance. During PoA, credits to authorities and affiliated operators are `CREDIT_LOCKED` (12-month cliff from genesis, vesting to month 36, stakeable, not transferable). Every node derives the same list from the chain (including the lock list, which comes from the on-chain governance state) and rejects a block whose leading system transactions differ. Total emission, locked amounts included, is capped at 2,000,000,000 ASTRA.
+
+**Treasury.** The treasury contract `0x…0004` holds native ASTRA and pays M-of-N approved spends from its own balance with `transfer_u128`. Its signers and threshold come from the genesis `treasury` section (`{ "threshold": 2, "signer_dids": [...] }`). Anyone can deposit ASTRA to it (`DEPOSIT`, op 0x20).
 
 Events counted: service logs and gas of user transactions, and **one consensus unit per block to its `proposer_did`**. The consensus unit is how block producers earn the consensus share of emission, and so how they come to hold stake.
 
@@ -190,10 +192,9 @@ Reads are public. Writes carry their own signatures and are queued for the next 
 | `SPACEKIT_SRA_EPOCH_SECS` | `86400` | Reward epoch length |
 | `SPACEKIT_SRA_GENESIS_TS` | node default | Epoch origin; must be the same on every node |
 | `SPACEKIT_AFFILIATED_OPERATOR_DIDS` | unset | DIDs whose PoA credits are locked like the authorities' |
-| `SPACEKIT_ASTRA_REWARDS_WASM` | built SDK path | AstraRewards contract installed at genesis |
 | `SPACEKIT_LEGACY_TX_SIGNATURES` | unset | `1` also accepts pre-v2 transaction signatures (test networks) |
 
-Removed: `SPACEKIT_GOVERNANCE_STATE_PATH` and `SPACEKIT_GOVERNANCE_SYNC_URLS` (governance is in the chain) and `SPACEKIT_POS_GRACE_DAYS` (now `pos_grace_days` in the genesis file, since every node must agree on it).
+Removed: `SPACEKIT_GOVERNANCE_STATE_PATH` and `SPACEKIT_GOVERNANCE_SYNC_URLS` (governance is in the chain), `SPACEKIT_ASTRA_REWARDS_WASM` (rewards are native; there is no AstraRewards contract) and `SPACEKIT_POS_GRACE_DAYS` (now `pos_grace_days` in the genesis file, since every node must agree on it).
 
 The CLI sets these from `[blockchain]` and `[blockchain.poa]` in the network profile (`spacekit network init --poa-genesis … --authority-wallet …`).
 
@@ -230,7 +231,7 @@ spacekit governance propose --title "Admit Operator 5" \
 spacekit governance proposals --status pending      # once the proposal is in a block
 spacekit governance vote <proposal-id> approve
 
-# Stake (from ASTRA this DID holds in AstraRewards, locked or not)
+# Stake (from ASTRA this DID holds, locked or not)
 spacekit governance staking
 spacekit governance stake bond 15000 --name "Operator 5"
 spacekit governance stake unbond 5000
@@ -251,8 +252,7 @@ Keep `did_wallet.json` on an operator machine. It is the producer's sealing key 
 ```sh
 # Four authorities and one observer on this machine (ports from 39000)
 spacekit network devnet init --authorities 4 --observers 1 \
-  --fund 0xYOUR_ADDRESS=10000000000 --rewards \
-  --astra-rewards-wasm sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm
+  --fund 0xYOUR_ADDRESS=10000000000 --rewards
 spacekit network devnet up
 spacekit network devnet status
 spacekit governance --node http://127.0.0.1:39002 --wallet ~/.spacekit/devnet/node-0/wallet.json status
@@ -264,7 +264,7 @@ spacekit network test --suite poa --report poa-e2e.xml
 
 Devnet flags: `--production on-demand|interval`, `--block-time-ms`, `--batch-window-ms`, `--heartbeat-secs`, `--min-stake-astra`, `--unbonding-days`, `--pos-grace-days`.
 
-The `poa` suite checks: sealed round-robin production and head agreement; an idle chain makes only heartbeat blocks; genesis balances and the disabled faucet; shared contract storage across two signers, with transactions sent to different nodes; a late joiner (blocks, seals, governance; cannot produce; a transaction sent to it is included); `lift_poa` refused below the minimum; admission by `add_authority` (the new authority then produces); locked reward settlement; validators staking their earnings; the lift (staked validators take over, or the authorities as fallback); and a stake-weighted `set_block_production` vote. The reward and staking gates need the AstraRewards WASM. `.github/workflows/poa-e2e.yml` runs the suite nightly.
+The `poa` suite checks: sealed round-robin production and head agreement; an idle chain makes only heartbeat blocks; genesis balances and the disabled faucet; shared contract storage across two signers, with transactions sent to different nodes; a late joiner (blocks, seals, governance; cannot produce; a transaction sent to it is included); `lift_poa` refused below the minimum; admission by `add_authority` (the new authority then produces); locked reward settlement; validators staking their earnings; the lift (staked validators take over, or the authorities as fallback); and a stake-weighted `set_block_production` vote. `.github/workflows/poa-e2e.yml` runs the suite nightly.
 
 ## Upgrading
 
@@ -273,7 +273,6 @@ This release changes block contents (`proposer_did`), the state root, transactio
 ## Known limits
 
 - **No slashing.** Stake carries weight but is not at risk yet.
-- **SPHINCS+ DID balances cannot be withdrawn to an address** in AstraRewards yet.
 - **Rollup settlement** is off on governed networks until it is a consensus transaction.
 - **Reorganizations** go back at most 64 blocks, and competing blocks are checked against the current producer set (exact for PoA; a close approximation in PoS).
 - **Seal size.** Each block carries a 29,792-byte SPHINCS+ seal, which dominates block size for small blocks (about 30 KB per block, 8.6 MB a day at the default heartbeat, more under load). Nodes keep the latest 2,048 seals in memory and index the rest on disk. A smaller post-quantum signature (ML-DSA/Dilithium, about 2.4 KB) for seals would cut this by an order of magnitude; the governance and staking signatures could stay SPHINCS+.

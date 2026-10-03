@@ -46,7 +46,7 @@ spacekit-core/
 │   ├── spacekit-gateway/
 │   ├── spacekit-keymaster/           # nested workspace
 │   ├── spacekit-messaging-node/
-│   ├── spacekit-pay/                 # TypeScript
+│   ├── spacekit-pay/                 # retired (historical); see docs/PAYMENTS_AND_CURRENCY.md
 │   └── spacekit-storage-node/
 ├── observability/
 │   └── spacekit-log/
@@ -76,7 +76,9 @@ in the relevant domain directory.
   structures. These are not generic utilities.
 - `identity` owns DID creation, verification, bridges, and browser/WASM identity.
 - `consensus` owns consensus algorithms and extensions, not node process wiring.
-- `economics` owns payment, routing, accounting, and reward policy.
+- `economics` owns payment, routing, accounting, and reward policy. ASTRA, held
+  as native balances on the SpaceKit chain, is the only currency; see
+  [`docs/PAYMENTS_AND_CURRENCY.md`](docs/PAYMENTS_AND_CURRENCY.md).
 - `observability` owns structured protocol and operational event logging.
 - `infra` contains binaries and process-level integration for network services.
 - `runtimes` executes SpaceKit contracts in non-node environments.
