@@ -114,29 +114,6 @@
       }
     },
 
-    "payment_vault_charge": {
-      "module": "spacekit_payments",
-      "function": "payment_vault_charge",
-      "pattern": "fire_and_forget",
-      "params": {
-        "amount": {
-          "type": "string",
-          "required": true,
-          "validate": "numeric_string"
-        },
-        "beneficiary": {
-          "type": "did",
-          "max_bytes": 256,
-          "required": true,
-          "validate": "did_format"
-        }
-      },
-      "constraints": {
-        "requires_caller_did": true,
-        "beneficiary_must_match_caller": true
-      }
-    },
-
     "growformer_generation": {
       "module": "spacekit_agent",
       "function": "agent_growformer_generation",

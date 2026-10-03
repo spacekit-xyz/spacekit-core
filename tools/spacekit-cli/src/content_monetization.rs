@@ -105,7 +105,7 @@ fn astra_to_units(amount: f64) -> u64 {
 const WEI_PER_UNIT: u128 = 1_000_000_000_000;
 
 /// ASTRA (to micro precision) as native wei.
-fn astra_to_wei(amount: f64) -> u128 {
+pub(crate) fn astra_to_wei(amount: f64) -> u128 {
     astra_to_units(amount) as u128 * WEI_PER_UNIT
 }
 

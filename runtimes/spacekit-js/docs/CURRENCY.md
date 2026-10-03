@@ -43,7 +43,9 @@ The host token adapter reports no balance and refuses transfers.
 
 The Node and Bun entry points default to `"chain"`. Pass `--currency local-dev` (or set `SPACEKIT_CURRENCY=local-dev`) for an offline dev chain.
 
-## Not yet chain-backed
+## Contract payments and sponsorship
 
-- **The session paymaster.** `paymaster_set_policy` / `paymaster_sponsor_charge` budgets in aUSD are declared by the sponsor, not read from the chain. Do not rely on them for value until they are.
-- **`PaymentAdapter` endpoints.** `/transfer`, `/vault-charge` and `/sponsor-vault-charge` (aUSD) have no server in this repository.
+- **`payment_transfer`.** A contract run in the browser can ask to pay ASTRA (wei). The request is handed to the configured `PaymentAdapter` after execution, which must settle it as a chain transaction with the payer's consent. Any asset other than ASTRA is refused (`-22`). `NoopPaymentAdapter` moves nothing and reports failure.
+- **No vault charges, no USD.** `payment_vault_charge` (the former aUSD) is refused. Intents carry ASTRA wei only (`value_astra`, `max_fee_astra`, `max_value_wei`).
+- **Sponsorship** is the `spacekit-paymaster` contract on the chain: a sponsor deposits ASTRA into it and permitted callers draw on it. The host imports `spacekit_paymaster.*` kept budgets off chain and now always refuse.
+- **Fees charged by contracts** are ASTRA attached to the call (`collect_fee` in the contract SDK). In `"chain"` mode the local VM refuses value, so paid operations run against a compute node.

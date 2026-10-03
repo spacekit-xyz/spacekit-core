@@ -20,7 +20,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use spacekit_contract_sdk::{
-    block_timestamp, emit_event_bytes, get_caller_did_string, payments::payment_vault_charge,
+    block_timestamp, emit_event_bytes, get_caller_did_string, collect_fee, TREASURY_ADDRESS, WEI_PER_MICRO_ASTRA,
     spacekit_contract, storage_get, storage_set, ContractError, ContractErrorCode,
     SpacekitContract,
 };
@@ -40,7 +40,8 @@ const OP_ANCHOR: u8 = 0x01;
 const OP_VERIFY: u8 = 0x02;
 const OP_HEALTH: u8 = 0x10;
 
-const COST_ANCHOR: &str = "50";
+/// Fee per anchor in ASTRA wei, attached to the call and paid to the treasury.
+const COST_ANCHOR: u128 = 50 * WEI_PER_MICRO_ASTRA;
 const STORAGE_MAX: usize = 512;
 const HASH_HEX_LEN: usize = 64;
 
@@ -97,7 +98,7 @@ fn handle_anchor(body: &[u8]) -> Result<Vec<u8>, ContractError> {
     validate_hash_hex(content_hash)?;
 
     let caller = get_caller_did_string()?;
-    payment_vault_charge(COST_ANCHOR, caller.as_str())?;
+    collect_fee(COST_ANCHOR, &TREASURY_ADDRESS)?;
 
     let ts = block_timestamp();
     let record = format!(

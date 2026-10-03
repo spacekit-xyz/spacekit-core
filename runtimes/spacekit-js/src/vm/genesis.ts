@@ -104,7 +104,7 @@ export const NETWORK_DECIMAL_PRESETS: Record<
 
 /**
  * Testnet genesis config: each pre-funded address gets 100M ASTRA.
- * aUSD is funded separately via the payment system's AusdVault.
+ * ASTRA is the only currency.
  */
 export const TESTNET_GENESIS_CONFIG: GenesisConfig = {
   chainId: "spacekit-testnet",
@@ -128,7 +128,7 @@ export const TESTNET_GENESIS_CONFIG: GenesisConfig = {
 
 /**
  * Pre-funded testnet account addresses (0x10..0x1f).
- * Each receives 100M ASTRA at genesis and 100M aUSD via the faucet service.
+ * Each receives 100M ASTRA at genesis.
  */
 export const TESTNET_FUNDED_ADDRESSES: string[] = Array.from(
   { length: 16 },
@@ -137,9 +137,6 @@ export const TESTNET_FUNDED_ADDRESSES: string[] = Array.from(
 
 /** Amount each testnet account receives at genesis (ASTRA, 18 decimals). */
 export const TESTNET_ASTRA_PER_ACCOUNT = 100_000_000n * 10n ** 18n;
-
-/** Amount each testnet account receives via faucet (aUSD, human-readable). */
-export const TESTNET_AUSD_PER_ACCOUNT = 100_000_000;
 
 /**
  * Return a genesis config that uses the same decimal system (and symbol) as the given network.

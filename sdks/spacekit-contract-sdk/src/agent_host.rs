@@ -143,15 +143,13 @@ pub mod payments {
             asset_len: usize,
             amount: i64,
         ) -> i32;
-        #[link_name = "payment_vault_charge"]
-        fn sym_payment_vault_charge(
-            amount_ptr: *const u8,
-            amount_len: usize,
-            beneficiary_ptr: *const u8,
-            beneficiary_len: usize,
-        ) -> i32;
     }
 
+    /// Pay `amount` wei of ASTRA from this contract's own balance to `to`
+    /// (`0x…` address or `did:spacekit:<address>`). `asset` must be
+    /// `"ASTRA"`: SpaceKit settles only in ASTRA, and any other asset is
+    /// refused. The payment happens immediately and is undone if the
+    /// transaction fails. For amounts above `i64::MAX` use `transfer_u128`.
     pub fn payment_transfer(to: &str, asset: &str, amount: i64) -> Result<(), ContractError> {
         let code = unsafe {
             sym_payment_transfer(
@@ -165,17 +163,6 @@ pub mod payments {
         map_buffered_send(code)
     }
 
-    pub fn payment_vault_charge(amount: &str, beneficiary: &str) -> Result<(), ContractError> {
-        let code = unsafe {
-            sym_payment_vault_charge(
-                amount.as_ptr(),
-                amount.len(),
-                beneficiary.as_ptr(),
-                beneficiary.len(),
-            )
-        };
-        map_buffered_send(code)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -185,9 +172,9 @@ pub mod payments {
 /// Session-key management for delegated agent execution (ERC-4337 concept).
 ///
 /// A session key grants a **delegate DID** scoped, time-limited authority to act
-/// on behalf of an **owner DID**.  Agents use session keys to execute vault
-/// charges, transfers, and contract calls without requiring the owner to sign
-/// each operation individually.
+/// on behalf of an **owner DID**.  Agents use session keys to execute
+/// transfers and contract calls without requiring the owner to sign each
+/// operation individually.
 ///
 /// The host VM validates sessions; contracts only see the safe wrappers here.
 pub mod session_keys {
@@ -230,9 +217,8 @@ pub mod session_keys {
 
     /// Permission scope constants — use as the `scope` argument to
     /// [`session_create`].  Multiple scopes can be combined by
-    /// concatenating with `|` (e.g. `"vault_charge|transfer"`).
+    /// concatenating with `|` (e.g. `"transfer|contract_call"`).
     pub mod scope {
-        pub const VAULT_CHARGE: &str  = "vault_charge";
         pub const TRANSFER: &str      = "transfer";
         pub const CONTRACT_CALL: &str = "contract_call";
         pub const MESSAGING: &str     = "messaging";
@@ -291,108 +277,31 @@ pub mod session_keys {
     }
 }
 
-/// Paymaster / sponsored-operation support (ERC-4337 concept).
+/// Paymaster / sponsored operations (ERC-4337 concept).
 ///
-/// A **sponsor DID** deposits vault credit and defines policies that allow
-/// certain users or agents to execute operations at the sponsor's expense.
-/// This complements x402 (HTTP 402 payment) by enabling gasless on-chain
-/// agent execution for end-users whose API access is already paid via x402
-/// USDC settlement.
+/// Sponsorship is the `spacekit-paymaster` contract
+/// (`spacekit-standard-library/payments/spacekit-paymaster`): a sponsor
+/// deposits native ASTRA into it and sets a policy, and permitted callers draw
+/// on that deposit. Budgets are the ASTRA the contract actually holds.
+///
+/// The former host-side `spacekit_paymaster` imports kept budgets outside the
+/// chain and were removed. These constants describe the contract's wire format.
 pub mod paymaster {
-    use super::*;
-
-    #[link(wasm_import_module = "spacekit_paymaster")]
-    extern "C" {
-        /// Charge the sponsor instead of the caller.  The host validates that a
-        /// matching sponsorship policy exists and that the sponsor has
-        /// sufficient balance.  Returns 1 = ok, <0 = error.
-        #[link_name = "paymaster_sponsor_charge"]
-        fn sym_paymaster_sponsor_charge(
-            sponsor_ptr: *const u8,
-            sponsor_len: usize,
-            amount_ptr: *const u8,
-            amount_len: usize,
-            operation_ptr: *const u8,
-            operation_len: usize,
-        ) -> i32;
-
-        /// Register or update a sponsorship policy.  Only the sponsor DID
-        /// (the caller) can set its own policy.  Returns 1 = ok, <0 = error.
-        ///
-        /// `policy_json` is a UTF-8 JSON blob describing allowed beneficiary
-        /// DIDs, operation scopes, per-call and daily limits.
-        #[link_name = "paymaster_set_policy"]
-        fn sym_paymaster_set_policy(
-            policy_ptr: *const u8,
-            policy_len: usize,
-        ) -> i32;
-
-        /// Query the remaining sponsored budget for `sponsor_did`.
-        /// Returns the remaining amount written to dest (UTF-8 decimal string),
-        /// or <0 on error.
-        #[link_name = "paymaster_budget"]
-        fn sym_paymaster_budget(
-            sponsor_ptr: *const u8,
-            sponsor_len: usize,
-            dest_ptr: *mut u8,
-            dest_max: usize,
-        ) -> i32;
-    }
-
-    /// Charge `amount` to `sponsor_did` for the given `operation`, instead of
-    /// the calling DID.  Fails if no matching policy exists or sponsor balance
-    /// is insufficient.
-    pub fn sponsor_charge(
-        sponsor_did: &str,
-        amount: &str,
-        operation: &str,
-    ) -> Result<(), ContractError> {
-        let code = unsafe {
-            sym_paymaster_sponsor_charge(
-                sponsor_did.as_ptr(),
-                sponsor_did.len(),
-                amount.as_ptr(),
-                amount.len(),
-                operation.as_ptr(),
-                operation.len(),
-            )
-        };
-        map_buffered_send(code)
-    }
-
-    /// Set or update the caller's sponsorship policy.
-    ///
-    /// # Policy JSON schema
-    ///
-    /// ```json
-    /// {
-    ///   "allowed_dids": ["did:spacekit:*"],
-    ///   "allowed_ops":  ["vault_charge", "transfer"],
-    ///   "per_call_max": "1000",
-    ///   "daily_max":    "50000",
-    ///   "expires_at":   1735689600
-    /// }
-    /// ```
-    pub fn set_policy(policy_json: &str) -> Result<(), ContractError> {
-        let code = unsafe {
-            sym_paymaster_set_policy(policy_json.as_ptr(), policy_json.len())
-        };
-        map_buffered_send(code)
-    }
-
-    /// Query remaining sponsored budget for `sponsor_did` as a decimal string.
-    pub fn budget(sponsor_did: &str, buf_max: usize) -> Result<String, ContractError> {
-        let mut buf = vec![0u8; buf_max];
-        let n = unsafe {
-            sym_paymaster_budget(
-                sponsor_did.as_ptr(),
-                sponsor_did.len(),
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
-        let out = map_effect_buffer(n, buf)?;
-        String::from_utf8(out).map_err(|_| ContractError::InvalidInput)
+    /// Opcodes of the paymaster contract. Amounts are u128 little-endian wei;
+    /// strings are u16 little-endian length-prefixed UTF-8.
+    pub mod op {
+        /// Payload empty; the call's value is the deposit.
+        pub const DEPOSIT: u8        = 0x01;
+        /// `[amount:u128]` — back to the sponsor's address.
+        pub const WITHDRAW: u8       = 0x02;
+        /// `[policy_json:str]`.
+        pub const SET_POLICY: u8     = 0x03;
+        /// `[sponsor_did:str][amount:u128][operation:str]` — pays the caller.
+        pub const SPONSOR_CHARGE: u8 = 0x04;
+        /// `[sponsor_did:str]` → `[1][u128]`.
+        pub const GET_BUDGET: u8     = 0x05;
+        /// `[sponsor_did:str]` → `[1][json]`.
+        pub const GET_POLICY: u8     = 0x06;
     }
 }
 

@@ -98,6 +98,8 @@ extern "C" {
     fn msg_value() -> i64;
     fn get_balance(address_ptr: *const u8) -> i64;
     fn transfer(to_ptr: *const u8, amount: i64) -> i32;
+    fn msg_value_u128(out_ptr: *mut u8) -> i32;
+    fn transfer_u128(to_ptr: *const u8, amount_ptr: *const u8) -> i32;
     fn get_timestamp() -> i64;
 }
 
@@ -379,6 +381,47 @@ pub fn require_payment(min_amount: u64) -> Result<u64, ContractError> {
     } else {
         Ok(val)
     }
+}
+
+/// Wei per ASTRA (18 decimals). ASTRA is SpaceKit's only currency.
+pub const WEI_PER_ASTRA: u128 = 1_000_000_000_000_000_000;
+/// Wei per micro-ASTRA (10^-6 ASTRA).
+pub const WEI_PER_MICRO_ASTRA: u128 = 1_000_000_000_000;
+/// The network treasury contract's address (`0x…0004`).
+pub const TREASURY_ADDRESS: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
+
+/// The native ASTRA (wei) attached to this call, at full precision.
+pub fn msg_value_wei() -> u128 {
+    let mut out = [0u8; 16];
+    if unsafe { msg_value_u128(out.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Pay `amount` wei from this contract's own balance to `to_address`.
+pub fn transfer_wei(to_address: &[u8; 20], amount: u128) -> Result<(), ContractError> {
+    let bytes = amount.to_le_bytes();
+    if unsafe { transfer_u128(to_address.as_ptr(), bytes.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(ContractError::InsufficientBalance)
+    }
+}
+
+/// Charge a fee in ASTRA: the call must carry at least `price_wei`, and
+/// everything attached is forwarded to `payee`, so nothing is left stranded
+/// in the contract. A price of 0 makes the call free (any value attached is
+/// still forwarded). Returns the amount paid.
+pub fn collect_fee(price_wei: u128, payee: &[u8; 20]) -> Result<u128, ContractError> {
+    let paid = msg_value_wei();
+    if paid < price_wei {
+        return Err(ContractError::InsufficientPayment);
+    }
+    if paid > 0 {
+        transfer_wei(payee, paid)?;
+    }
+    Ok(paid)
 }
 
 /// Get the current block timestamp (seconds since Unix epoch).

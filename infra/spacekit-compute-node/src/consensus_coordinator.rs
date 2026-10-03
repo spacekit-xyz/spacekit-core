@@ -28,8 +28,8 @@ pub struct ValidatorEntry {
     /// the entry was created by local bootstrap and cannot have its votes
     /// verified — such entries are never credited with a peer vote.
     pub sphincs_public_key: Option<Vec<u8>>,
-    /// Stake backing this validator, in micro-USD.
-    pub stake_units: u128,
+    /// Native ASTRA backing this validator, in wei.
+    pub stake_wei: u128,
     /// How the validator was admitted.
     pub admission: ValidatorAdmission,
 }
@@ -53,15 +53,16 @@ const VALIDATOR_REGISTER_DOMAIN: &str = "SPACEKIT-VALIDATOR-REGISTER-v1";
 /// Domain separator for consensus votes.
 const CONSENSUS_VOTE_DOMAIN: &str = "SPACEKIT-CONSENSUS-VOTE-v1";
 
-/// Minimum stake to register as a validator, in micro-USD.
+/// Minimum stake to register as a validator, in ASTRA wei
+/// (`SPACEKIT_MIN_VALIDATOR_STAKE_WEI`, default 10,000 ASTRA).
 ///
 /// Registration is otherwise free, which makes vote counts meaningless: an
 /// attacker can register enough DIDs to hold a supermajority for nothing.
-pub fn min_validator_stake_units() -> u128 {
-    std::env::var("SPACEKIT_MIN_VALIDATOR_STAKE_UNITS")
+pub fn min_validator_stake_wei() -> u128 {
+    std::env::var("SPACEKIT_MIN_VALIDATOR_STAKE_WEI")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1_000_000_000) // 1,000 USD
+        .unwrap_or(10_000 * 1_000_000_000_000_000_000) // 10,000 ASTRA
 }
 
 /// Exact bytes a validator signs to prove key possession at registration.
@@ -144,9 +145,9 @@ pub struct ConsensusCoordinator {
     finalized: Arc<RwLock<HashMap<String, FinalityStatus>>>,
     /// Supermajority threshold (default 2/3).
     threshold: f64,
-    /// Minimum stake to register as a validator, in micro-USD. Resolved once
+    /// Minimum stake to register as a validator, in ASTRA wei. Resolved once
     /// at construction so a mid-flight environment change cannot lower the bar.
-    min_stake_units: u128,
+    min_stake_wei: u128,
     #[cfg(feature = "spacetime-consensus")]
     pending_blocks: Arc<RwLock<HashMap<String, crate::swtch_consensus::BlockData>>>,
     #[cfg(feature = "spacetime-consensus")]
@@ -213,8 +214,8 @@ impl ConsensusCoordinator {
     /// Override the validator stake floor. Intended for tests and for
     /// operators wiring the value from a config file rather than the
     /// environment.
-    pub fn with_min_stake_units(mut self, units: u128) -> Self {
-        self.min_stake_units = units;
+    pub fn with_min_stake_wei(mut self, wei: u128) -> Self {
+        self.min_stake_wei = wei;
         self
     }
 
@@ -227,7 +228,7 @@ impl ConsensusCoordinator {
             announced_blocks: Arc::new(RwLock::new(HashMap::new())),
             finalized: Arc::new(RwLock::new(HashMap::new())),
             threshold: 2.0 / 3.0,
-            min_stake_units: min_validator_stake_units(),
+            min_stake_wei: min_validator_stake_wei(),
             #[cfg(feature = "spacetime-consensus")]
             pending_blocks: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "spacetime-consensus")]
@@ -293,7 +294,7 @@ impl ConsensusCoordinator {
                 did,
                 joined_at: Utc::now(),
                 sphincs_public_key: None,
-                stake_units: 0,
+                stake_wei: 0,
                 admission: ValidatorAdmission::LocalBootstrap,
             });
     }
@@ -307,13 +308,13 @@ impl ConsensusCoordinator {
         &self,
         did: String,
         sphincs_public_key: Vec<u8>,
-        stake_units: u128,
+        stake_wei: u128,
         proof_signature: &[u8],
     ) -> Result<()> {
-        let minimum = self.min_stake_units;
-        if stake_units < minimum {
+        let minimum = self.min_stake_wei;
+        if stake_wei < minimum {
             anyhow::bail!(
-                "stake {stake_units} is below the {minimum} micro-USD minimum for a validator"
+                "stake {stake_wei} wei is below the {minimum} wei ASTRA minimum for a validator"
             );
         }
 
@@ -355,7 +356,7 @@ impl ConsensusCoordinator {
                 did,
                 joined_at: Utc::now(),
                 sphincs_public_key: Some(sphincs_public_key),
-                stake_units,
+                stake_wei,
                 admission: ValidatorAdmission::Stake,
             },
         );
@@ -397,7 +398,7 @@ impl ConsensusCoordinator {
                 did,
                 joined_at: Utc::now(),
                 sphincs_public_key: Some(sphincs_public_key),
-                stake_units: 0,
+                stake_wei: 0,
                 admission: ValidatorAdmission::Authority,
             },
         );
@@ -1593,7 +1594,7 @@ mod tests {
             .unwrap();
         // Keep the stake floor below what the tests register.
         let coord = ConsensusCoordinator::new(net, "did:spacekit:testnet:proposer".to_string())
-            .with_min_stake_units(1);
+            .with_min_stake_wei(1);
         for v in test_validators().iter().take(n_validators) {
             let proof = SphincsPlus::sign(
                 &v.secret_key,
@@ -1758,7 +1759,7 @@ mod tests {
             .await
             .unwrap();
         let coord = ConsensusCoordinator::new(net, "did:spacekit:testnet:proposer".to_string())
-            .with_min_stake_units(100);
+            .with_min_stake_wei(100);
         let v = &test_validators()[0];
         let proof = SphincsPlus::sign(
             &v.secret_key,
@@ -1794,7 +1795,7 @@ mod tests {
     /// possible; an unset environment variable must not mean "no stake".
     #[test]
     fn default_stake_floor_is_not_zero() {
-        assert!(min_validator_stake_units() > 0);
+        assert!(min_validator_stake_wei() > 0);
     }
 
     #[tokio::test]

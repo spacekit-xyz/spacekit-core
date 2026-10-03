@@ -15,7 +15,7 @@ The SpaceKit Tool-Call Spec (SKTCS) defines how WASM smart contracts declare, sc
 1. **Contracts propose, the VM decides.** Every tool invocation is an *effect* — the contract records intent, the VM validates and fulfills. The contract never directly executes I/O.
 2. **No schema exposure to callers.** External callers interact via opcode + binary payload. The tool manifest is internal to the contract-VM boundary and is never served to clients or embedded in prompts.
 3. **Capability-scoped, not role-based.** Each tool binding carries explicit constraints (rate limits, parameter bounds, storage key prefixes, allowed recipients). The VM enforces these at the host boundary, not inside the contract.
-4. **Pay-before-execute.** Vault charges are validated before any compute, storage, or network effect is fulfilled.
+4. **Pay-before-execute.** A paid call carries its fee as ASTRA attached to the call; the contract checks it (`collect_fee`) before any compute, storage, or network effect is fulfilled. ASTRA is the only currency.
 5. **Deterministic audit trail.** Every tool invocation produces a `ToolEffect` record in the block's execution trace, making all external interactions verifiable by light clients via verkle witnesses.
 
 ### 1.2 Threat Model
@@ -166,28 +166,30 @@ Every contract that uses host tools declares a `tool-manifest.json` (embedded in
       }
     },
 
-    "payment_vault_charge": {
+    "payment_transfer": {
       "module": "spacekit_payments",
-      "function": "payment_vault_charge",
+      "function": "payment_transfer",
       "pattern": "fire_and_forget",
 
       "params": {
-        "amount": {
+        "to": {
           "type": "string",
-          "required": true,
-          "validate": "numeric_string"
-        },
-        "beneficiary": {
-          "type": "did",
           "max_bytes": 256,
-          "required": true,
-          "validate": "did_format"
+          "required": true
+        },
+        "asset": {
+          "type": "string",
+          "required": true
+        },
+        "amount": {
+          "type": "integer",
+          "required": true
         }
       },
 
       "constraints": {
         "requires_caller_did": true,
-        "beneficiary_must_match_caller": true
+        "max_effects_per_execution": 4
       }
     },
 
@@ -241,7 +243,7 @@ Every contract that uses host tools declares a `tool-manifest.json` (embedded in
 | `constraints.requires_caller_did` | bool | If true, anonymous callers are rejected |
 | `constraints.storage_key_prefix` | string | Template for key scoping. `{caller_did}:` prefixes all keys with the caller's DID. |
 | `constraints.allowed_recipients` | string[] | DID patterns allowed for messaging. Supports `*` glob. |
-| `constraints.beneficiary_must_match_caller` | bool | Prevents vault charging against arbitrary DIDs |
+| `constraints.beneficiary_must_match_caller` | bool | Requires a `beneficiary`/`to` param to equal the caller DID |
 | `constraints.max_effects_per_execution` | u32 | Caps effect queue rounds for this tool |
 | `constraints.max_input_plus_output_bytes` | u32 | Total I/O budget for a single invocation |
 
@@ -272,7 +274,7 @@ Used by: `web_search`, `remote_storage_get`, `remote_storage_put`
        │                      │     manifest params    │
        │                      │     + constraints      │
        │                      │                        │
-       │                      │  4. Charge vault       │
+       │                      │  4. Check ASTRA fee    │
        │                      │     (pay-before-exec)  │
        │                      │                        │
        │                      │  5. Fulfill effect     │
@@ -295,12 +297,14 @@ The effect queue is capped at **4 rounds** per execution. Each round, the VM che
 1. **Manifest match** — the requested tool exists in the contract's manifest
 2. **Param validation** — all params pass type, bounds, and format checks
 3. **Constraint check** — rate limits, caller DID requirement, effect budget
-4. **Vault charge** — cost deducted before fulfillment begins
+4. **Payment** — the call's attached ASTRA covers the fee before fulfillment begins
 5. **Result sanitization** — if the tool output feeds into another tool (e.g. search → generation), apply the configured sanitizer
 
 ### 3.2 Fire-and-Forget (side effects)
 
-Used by: `messaging_send`, `payment_vault_charge`, `payment_transfer`
+Used by: `messaging_send`, `payment_transfer`
+
+`payment_transfer` pays native ASTRA (wei) from the executing contract's own balance; on the chain it happens immediately and is undone if the transaction fails. Any asset other than ASTRA is refused with `-22`. The former `payment_vault_charge` (aUSD) is always refused with `-22`.
 
 The contract buffers the effect and returns immediately. The VM validates and flushes the buffer after contract execution completes. Failed effects are recorded in the execution trace but do not revert the contract's state changes.
 
@@ -357,11 +361,11 @@ The `max_input_plus_output_bytes` constraint on synchronous tools caps the total
 
 ### 4.4 Recipient Validation
 
-For messaging tools, `allowed_recipients` defines a DID pattern whitelist. The `validate: "did_format"` check ensures the recipient string is a well-formed DID before the message reaches the Messaging Node. Combined with `rate_limit`, this bounds spam volume even if the vault has sufficient balance.
+For messaging tools, `allowed_recipients` defines a DID pattern whitelist. The `validate: "did_format"` check ensures the recipient string is a well-formed DID before the message reaches the Messaging Node. Combined with `rate_limit`, this bounds spam volume even if the caller pays.
 
-### 4.5 Vault Charge Integrity
+### 4.5 Payment Integrity
 
-`beneficiary_must_match_caller: true` on the `payment_vault_charge` tool ensures a contract can only charge the vault of the entity that invoked it. Without this, a malicious contract could pass an arbitrary DID to `payment_vault_charge` and drain someone else's vault.
+A contract can only spend its own ASTRA. Fees are paid by the caller attaching value to the call they sign; `payment_transfer` and `transfer_u128` pay from the executing contract's balance, never the caller's. There are no vaults to drain.
 
 ### 4.6 Effect Budgeting
 
@@ -396,7 +400,7 @@ Light clients can verify that a contract's tool usage was legitimate by checking
 
 ### 5.1 Rejection Records
 
-When the VM rejects a tool invocation (param validation failure, rate limit exceeded, insufficient vault balance), it still records a `ToolEffect` with `status: "rejected"` and a `reason` field. This makes policy violations auditable.
+When the VM rejects a tool invocation (param validation failure, rate limit exceeded, insufficient payment), it still records a `ToolEffect` with `status: "rejected"` and a `reason` field. This makes policy violations auditable.
 
 ---
 
@@ -410,7 +414,7 @@ When the VM rejects a tool invocation (param validation failure, rate limit exce
 | Who constructs the call | LLM (nondeterministic) | Contract code (deterministic WASM) |
 | Parameter validation | Application-level (optional) | VM-enforced before fulfillment |
 | Authorization | Application-level | Capability constraints in manifest |
-| Cost control | None (billing is per-token) | Pay-before-execute vault charges |
+| Cost control | None (billing is per-token) | Pay-before-execute: fee attached in ASTRA |
 | Audit trail | None | ToolEffect records in verkle-witnessed blocks |
 | Injection resistance | None (prompt engineering only) | Prompt fencing with unpredictable tokens |
 
@@ -482,18 +486,18 @@ let prev = remote_storage_get(hist_ref, CONVERSE_HIST_GET_MAX)?;
 
 ### 7.5 Messaging Spam (FRONTIER_SEND)
 
-**Current (vault-gated only):**
+**Current (fee-gated only):**
 ```rust
 messaging_send(recipient, &pld)?;  // any DID string accepted
 ```
 
-**With SKTCS:** The manifest adds `validate: "did_format"` on the recipient param, `rate_limit: "10/min"`, and `allowed_recipients: ["did:sk:*"]`. Malformed DIDs are rejected at the VM boundary, and the rate limit bounds spam volume independently of vault balance.
+**With SKTCS:** The manifest adds `validate: "did_format"` on the recipient param, `rate_limit: "10/min"`, and `allowed_recipients: ["did:sk:*"]`. Malformed DIDs are rejected at the VM boundary, and the rate limit bounds spam volume independently of what the caller pays.
 
-### 7.6 Vault Drain via Arbitrary Beneficiary
+### 7.6 Charging Someone Else
 
-**Current (vulnerable):** `payment_vault_charge(COST_LOCAL, beneficiary().as_str())` — if `beneficiary()` could be manipulated, charges could target any vault.
+**Former (removed):** `payment_vault_charge(COST_LOCAL, beneficiary().as_str())` charged an off-chain aUSD vault named by the contract, so a manipulated `beneficiary()` could target any vault.
 
-**With SKTCS:** `beneficiary_must_match_caller: true` enforces that the charged DID matches the caller. The VM compares the `beneficiary` param against `get_caller_did()` and rejects mismatches.
+**Now:** there are no vaults. A fee is ASTRA the caller attaches to a transaction they sign (`collect_fee(COST_LOCAL, &TREASURY_ADDRESS)`), and a contract can only spend its own balance.
 
 ---
 
@@ -595,10 +599,10 @@ The tool manifest is purely a VM-side concern. Callers (dapps, other contracts) 
 | `SKTCS_001` | `TOOL_NOT_IN_MANIFEST` | Contract attempted to call a host function not declared in its manifest |
 | `SKTCS_002` | `PARAM_VALIDATION_FAILED` | A parameter failed type, bounds, or format validation |
 | `SKTCS_003` | `RATE_LIMIT_EXCEEDED` | Tool invocation exceeds the configured rate limit |
-| `SKTCS_004` | `INSUFFICIENT_VAULT_BALANCE` | Vault charge would exceed available balance |
+| `SKTCS_004` | `INSUFFICIENT_PAYMENT` | Less ASTRA attached than the fee |
 | `SKTCS_005` | `CALLER_DID_REQUIRED` | Tool requires a caller DID but none was provided |
 | `SKTCS_006` | `EFFECT_BUDGET_EXHAUSTED` | Per-tool or global effect queue limit reached |
 | `SKTCS_007` | `INPUT_SIZE_EXCEEDED` | Param bytes exceed `max_bytes` or total I/O exceeds budget |
 | `SKTCS_008` | `RECIPIENT_NOT_ALLOWED` | Messaging recipient DID does not match `allowed_recipients` pattern |
-| `SKTCS_009` | `BENEFICIARY_MISMATCH` | Vault charge beneficiary does not match caller DID |
+| `SKTCS_009` | `BENEFICIARY_MISMATCH` | Payment beneficiary does not match caller DID |
 | `SKTCS_010` | `MANIFEST_PARSE_ERROR` | Embedded manifest is malformed or missing required fields |

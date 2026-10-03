@@ -151,7 +151,6 @@ export {
   TESTNET_GENESIS_CONFIG,
   TESTNET_FUNDED_ADDRESSES,
   TESTNET_ASTRA_PER_ACCOUNT,
-  TESTNET_AUSD_PER_ACCOUNT,
   NETWORK_DECIMAL_PRESETS,
   getGenesisPresetForNetwork,
   computeGenesisHash,
@@ -329,7 +328,6 @@ export {
 } from "./intent_builder.js";
 export type {
   ExecuteContractAction,
-  VaultChargeAction,
   TransferAction,
   IntentAction,
   IntentConstraints,

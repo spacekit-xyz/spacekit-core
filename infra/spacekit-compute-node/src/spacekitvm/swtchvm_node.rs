@@ -1405,7 +1405,6 @@ impl SwtchvmRuntime {
                     constraint_state: super::tool_policy::ConstraintState::new(),
                     tool_effects: Vec::new(),
                     buffered_messages: Vec::new(),
-                    buffered_payments: Vec::new(),
                     pending_tool_requests: Vec::new(),
                     limiter: ContractResourceLimiter::new(),
                 },
@@ -1869,7 +1868,6 @@ impl SwtchvmRuntime {
                 constraint_state: super::tool_policy::ConstraintState::new(),
                 tool_effects: Vec::new(),
                 buffered_messages: Vec::new(),
-                buffered_payments: Vec::new(),
                 pending_tool_requests: Vec::new(),
                 limiter: ContractResourceLimiter::new(),
             },
@@ -3132,134 +3130,93 @@ impl SwtchvmRuntime {
                     }
                 }
 
-                store.buffered_payments.push(BufferedPaymentEffect {
-                    effect_type: "transfer".into(),
-                    to: to.clone(),
-                    asset,
-                    amount: amount.to_string(),
-                    beneficiary: None,
-                });
-                store
+                // Payments are native ASTRA, paid now from the executing
+                // contract's own balance (like `transfer_u128`), and undone
+                // with the rest of the transaction if it fails.
+                let refused = if !spacekit_payments::intent::is_astra_asset(&asset) {
+                    Some((
+                        super::tool_policy::SKTCS_UNSUPPORTED_ASSET,
+                        format!("asset {asset} is not ASTRA; SpaceKit settles only in ASTRA"),
+                    ))
+                } else if amount <= 0 {
+                    Some((super::tool_policy::SKTCS_OUT_OF_RANGE, "amount must be positive".into()))
+                } else {
+                    None
+                };
+                let payee = payee_address(&to);
+                let outcome = match (refused, payee) {
+                    (Some(r), _) => Err(r),
+                    (None, None) => Err((
+                        super::tool_policy::SKTCS_INVALID_FORMAT,
+                        format!("payee {to} is not an address or did:spacekit DID"),
+                    )),
+                    (None, Some(payee)) => {
+                        if contract_transfer(&mut caller, &payee, amount as u128) == 0 {
+                            Ok(())
+                        } else {
+                            Err((
+                                super::tool_policy::SKTCS_PAYMENT_FAILED,
+                                "the contract's ASTRA balance does not cover the payment".into(),
+                            ))
+                        }
+                    }
+                };
+                let (code, status, reason, cost) = match outcome {
+                    Ok(()) => (1, "fulfilled", None, amount.to_string()),
+                    Err((code, reason)) => (code, "rejected", Some(reason), "0".to_string()),
+                };
+                caller
+                    .data_mut()
                     .tool_effects
                     .push(super::tool_policy::ToolEffectRecord {
                         tool_id: "payment_transfer".into(),
                         caller_did,
                         params_hash: String::new(),
                         result_hash: None,
-                        cost_charged: "0".into(),
+                        cost_charged: cost,
                         timestamp: ts_now_ms(),
                         effect_round: 0,
-                        status: "fulfilled".into(),
-                        reason: None,
+                        status: status.into(),
+                        reason,
                     });
-                1
+                code
             },
         )?;
 
+        // aUSD vault charges no longer exist: SpaceKit settles only in ASTRA.
+        // The import stays so existing contracts still link; every call is
+        // refused and recorded. Contracts pay with `payment_transfer` (asset
+        // "ASTRA") or `transfer_u128`.
         linker.func_wrap(
             "spacekit_payments",
             "payment_vault_charge",
             |mut caller: Caller<'_, SwtchvmStoreData>,
-             amount_ptr: i32,
-             amount_len: i32,
-             beneficiary_ptr: i32,
-             beneficiary_len: i32|
+             _amount_ptr: i32,
+             _amount_len: i32,
+             _beneficiary_ptr: i32,
+             _beneficiary_len: i32|
              -> i32 {
-                let amount_str =
-                    match Self::read_contract_mem_vec(&mut caller, amount_ptr, amount_len) {
-                        Some(b) => String::from_utf8_lossy(&b).to_string(),
-                        None => return -2,
-                    };
-                let beneficiary = match Self::read_contract_mem_vec(
-                    &mut caller,
-                    beneficiary_ptr,
-                    beneficiary_len,
-                ) {
-                    Some(b) => String::from_utf8_lossy(&b).to_string(),
-                    None => return -2,
-                };
-
                 let caller_did = {
                     let ctx = unsafe { &*caller.data().context };
                     format!("did:spacekit:{}", hex::encode(ctx.caller.as_bytes()))
                 };
-
-                let store = caller.data_mut();
-                if let Some(ref manifest) = store.tool_manifest {
-                    if let Some(tool_def) = manifest.tools.get("payment_vault_charge") {
-                        let mut params = std::collections::HashMap::new();
-                        params.insert(
-                            "amount".to_string(),
-                            serde_json::Value::String(amount_str.clone()),
-                        );
-                        params.insert(
-                            "beneficiary".to_string(),
-                            serde_json::Value::String(beneficiary.clone()),
-                        );
-                        if let Err((code, reason)) =
-                            super::tool_policy::validate_tool_params(tool_def, &params)
-                        {
-                            store
-                                .tool_effects
-                                .push(super::tool_policy::ToolEffectRecord {
-                                    tool_id: "payment_vault_charge".into(),
-                                    caller_did: caller_did.clone(),
-                                    params_hash: String::new(),
-                                    result_hash: None,
-                                    cost_charged: "0".into(),
-                                    timestamp: ts_now_ms(),
-                                    effect_round: 0,
-                                    status: "rejected".into(),
-                                    reason: Some(reason),
-                                });
-                            return code;
-                        }
-                        if let Err((code, reason)) = super::tool_policy::check_constraints(
-                            "payment_vault_charge",
-                            tool_def,
-                            &caller_did,
-                            &mut store.constraint_state,
-                            Some(&params),
-                        ) {
-                            store
-                                .tool_effects
-                                .push(super::tool_policy::ToolEffectRecord {
-                                    tool_id: "payment_vault_charge".into(),
-                                    caller_did: caller_did.clone(),
-                                    params_hash: String::new(),
-                                    result_hash: None,
-                                    cost_charged: "0".into(),
-                                    timestamp: ts_now_ms(),
-                                    effect_round: 0,
-                                    status: "rejected".into(),
-                                    reason: Some(reason),
-                                });
-                            return code;
-                        }
-                    }
-                }
-
-                store.buffered_payments.push(BufferedPaymentEffect {
-                    effect_type: "vault_charge".into(),
-                    to: beneficiary.clone(),
-                    asset: "ausd".into(),
-                    amount: amount_str.clone(),
-                    beneficiary: Some(beneficiary),
-                });
-                store
+                caller
+                    .data_mut()
                     .tool_effects
                     .push(super::tool_policy::ToolEffectRecord {
                         tool_id: "payment_vault_charge".into(),
                         caller_did,
                         params_hash: String::new(),
                         result_hash: None,
-                        cost_charged: amount_str,
+                        cost_charged: "0".into(),
                         timestamp: ts_now_ms(),
                         effect_round: 0,
-                        status: "fulfilled".into(),
-                        reason: None,
+                        status: "rejected".into(),
+                        reason: Some(
+                            "vault charges were removed; pay in ASTRA with payment_transfer".into(),
+                        ),
                     });
-                1
+                super::tool_policy::SKTCS_UNSUPPORTED_ASSET
             },
         )?;
 
@@ -5414,7 +5371,6 @@ impl SwtchvmRuntime {
                 constraint_state: super::tool_policy::ConstraintState::new(),
                 tool_effects: Vec::new(),
                 buffered_messages: Vec::new(),
-                buffered_payments: Vec::new(),
                 pending_tool_requests: Vec::new(),
                 limiter: ContractResourceLimiter::new(),
             },
@@ -5643,8 +5599,6 @@ pub struct SwtchvmStoreData {
     pub tool_effects: Vec<super::tool_policy::ToolEffectRecord>,
     /// Buffered fire-and-forget messages (`messaging_send`).
     pub buffered_messages: Vec<BufferedMessage>,
-    /// Buffered fire-and-forget payment intents (`payment_transfer`, `payment_vault_charge`).
-    pub buffered_payments: Vec<BufferedPaymentEffect>,
     /// Pending async tool requests returned as -3 PENDING to the guest (`remote_storage_put/get`, `web_search`).
     pub pending_tool_requests: Vec<PendingToolRequest>,
     /// Memory and table ceilings for this execution. Installed via
@@ -5657,16 +5611,6 @@ pub struct SwtchvmStoreData {
 pub struct BufferedMessage {
     pub recipient_did: String,
     pub payload: Vec<u8>,
-}
-
-/// A fire-and-forget payment intent buffered during contract execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BufferedPaymentEffect {
-    pub effect_type: String,
-    pub to: String,
-    pub asset: String,
-    pub amount: String,
-    pub beneficiary: Option<String>,
 }
 
 /// An async tool request that returned -3 PENDING to the guest.
@@ -5774,6 +5718,12 @@ fn native_balance(caller: &Caller<'_, SwtchvmStoreData>, address: &SwtchvmAddres
             .map(|a| a.balance)
             .unwrap_or(0)
     }
+}
+
+/// The address a `payment_transfer` payee names: `0x…` or
+/// `did:spacekit:<40 hex>`.
+fn payee_address(to: &str) -> Option<SwtchvmAddress> {
+    crate::native_rewards::did_address(to)
 }
 
 /// Move `amount` wei from the executing contract's own balance to `to`.
@@ -6447,6 +6397,33 @@ impl SwtchvmNode {
             .receipts_by_tx
             .get(tx_hash)
             .cloned()
+    }
+
+    /// The transaction with this hash, its receipt, and its block's
+    /// timestamp, if it is in a block on this node.
+    pub fn find_transaction(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Option<(SwtchvmTransaction, SwtchvmReceipt, u64)> {
+        let receipt = self.get_receipt(tx_hash)?;
+        let block = self.get_block_by_number(receipt.block_number)?;
+        let index = receipt.tx_index as usize;
+        // The receipt at that index must be this transaction's.
+        let stored = block.receipts.get(index)?;
+        if stored.tx_hash.trim_start_matches("0x") != receipt.tx_hash.trim_start_matches("0x") {
+            return None;
+        }
+        let tx = block.transactions.get(index)?.clone();
+        Some((tx, receipt, block.timestamp))
+    }
+
+    /// Native ASTRA held by an address: its balance and its locked rewards
+    /// not yet released (both wei).
+    pub async fn native_holdings(&self, addr: &SwtchvmAddress) -> (u128, u128) {
+        let state = self.runtime.state.read().await;
+        let balance = state.get_account(addr).map(|a| a.balance).unwrap_or(0);
+        let (locked, released) = crate::native_rewards::lock_position(&state, addr);
+        (balance, locked.saturating_sub(released))
     }
 
     /// Deploy a WASM contract via the runtime (MCP / external callers).
@@ -7942,6 +7919,15 @@ impl SwtchvmNode {
             .and_then(balance_handler)
             .map(Reply::into_response);
 
+        // GET /v1/tx/{hash} — a transaction in a block: sender, recipient,
+        // value (wei, decimal string) and whether it succeeded. This is how a
+        // payee checks an ASTRA payment.
+        let get_tx = warp::path!("v1" / "tx" / String)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(get_tx_handler)
+            .map(Reply::into_response);
+
         let call_contract = warp::path!("contract" / "call")
             .and(warp::post())
             .and(warp::body::json())
@@ -8091,6 +8077,8 @@ impl SwtchvmNode {
             .or(view_contract)
             .unify()
             .or(balance)
+            .unify()
+            .or(get_tx)
             .unify()
             .or(get_receipt)
             .unify();
@@ -8647,6 +8635,53 @@ async fn get_block_header_handler(
     match node.get_block_by_number(number) {
         Some(block) => Ok(warp::reply::json(&block.header(&node.chain_id))),
         None => Err(warp::reject::not_found()),
+    }
+}
+
+async fn get_tx_handler(
+    hash: String,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(transfer) = spacekit_payments::ChainLookup::transfer(node.as_ref(), &hash) else {
+        return Err(warp::reject::not_found());
+    };
+    Ok(warp::reply::json(&serde_json::json!({
+        "tx_hash": transfer.tx_hash,
+        "from": transfer.from,
+        "to": transfer.to,
+        "value_wei": transfer.value_wei.to_string(),
+        "success": transfer.success,
+        "block_number": transfer.block_number,
+        "block_timestamp": transfer.block_timestamp,
+        "confirmations": spacekit_payments::ChainLookup::head(node.as_ref())
+            .saturating_sub(transfer.block_number) + 1,
+    }))
+    .into_response())
+}
+
+/// Payment verification (`spacekit_payments::PaymentVerifier`) reads ASTRA
+/// transfers straight from this node's chain.
+impl spacekit_payments::ChainLookup for SwtchvmNode {
+    fn transfer(&self, tx_hash: &str) -> Option<spacekit_payments::ChainTransfer> {
+        let bytes = hex::decode(tx_hash.trim().trim_start_matches("0x")).ok()?;
+        let hash = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+        let (tx, receipt, timestamp) = self.find_transaction(&hash)?;
+        // A contract creation pays the created contract.
+        let to = tx.to.or(receipt.created_address)?;
+        Some(spacekit_payments::ChainTransfer {
+            tx_hash: format!("0x{}", hex::encode(hash)),
+            from: format!("0x{}", hex::encode(tx.from.as_bytes())),
+            to: format!("0x{}", hex::encode(to.as_bytes())),
+            value_wei: tx.value,
+            success: receipt.success,
+            block_number: receipt.block_number,
+            block_timestamp: timestamp as i64,
+        })
+    }
+
+    fn head(&self) -> u64 {
+        self.get_latest_block().number
     }
 }
 
@@ -10247,6 +10282,197 @@ mod tests {
             .map(|r| r.gas_used)
             .sum();
         assert_eq!(supply(&*node.runtime.state.read().await) + burned, before, "no value created");
+        Ok(())
+    }
+
+    /// A payment is checked against the chain by transaction hash: the right
+    /// payee, enough value, success, and only once.
+    #[tokio::test]
+    async fn astra_payments_verify_against_the_chain() -> Result<()> {
+        use spacekit_payments::{ChainLookup, PaymentAsset, PaymentRequirement, PaymentVerifier};
+        let node = Arc::new(SwtchvmNode::new(false, false).await?);
+        let alice = TestAccount::new();
+        let shop = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        node.runtime.state.write().await.checkpoint();
+
+        node.submit_transaction(alice.tx(Some(shop.address), Vec::new(), 2 * WEI, 0)).await?;
+        let block = node.mine_block().await?;
+        let tx_hash = block.receipts[0].tx_hash.clone();
+
+        let found = ChainLookup::transfer(node.as_ref(), &tx_hash).expect("transaction is on the chain");
+        assert_eq!(found.value_wei, 2 * WEI);
+        assert!(found.success);
+        assert_eq!(found.to, format!("0x{}", hex::encode(shop.address.as_bytes())));
+        assert_eq!(found.from, format!("0x{}", hex::encode(alice.address.as_bytes())));
+
+        let verifier = PaymentVerifier::new(node.clone() as Arc<dyn ChainLookup>);
+        let req = |amount: u128, to: &SwtchvmAddress| PaymentRequirement {
+            amount_wei: amount.to_string(),
+            asset: PaymentAsset::ASTRA,
+            pay_to: format!("0x{}", hex::encode(to.as_bytes())),
+            chain_id: None,
+            description: None,
+        };
+        assert!(verifier.verify(&tx_hash, &req(3 * WEI, &shop.address)).is_err(), "too little");
+        assert!(verifier.verify(&tx_hash, &req(WEI, &alice.address)).is_err(), "wrong payee");
+        let receipt = verifier.verify(&tx_hash, &req(2 * WEI, &shop.address))?;
+        assert_eq!(receipt.amount_wei, 2 * WEI);
+        assert!(verifier.verify(&tx_hash, &req(2 * WEI, &shop.address)).is_err(), "used twice");
+        assert!(ChainLookup::transfer(node.as_ref(), &format!("0x{}", "ab".repeat(32))).is_none());
+        Ok(())
+    }
+
+    /// `payment_transfer` pays ASTRA from the contract's own balance and
+    /// refuses any other asset; `payment_vault_charge` is always refused.
+    #[tokio::test]
+    async fn contract_payments_are_astra_only() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let alice = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        // Pays 1 ASTRA (as asset "ASTRA") to the DID at offset 0, then tries
+        // "USDC" and a vault charge; returns -1 unless the first succeeded and
+        // the others were refused with -22.
+        let payee = TestAccount::new();
+        let payee_did = payee.did();
+        let wat_src = format!(
+            r#"(module
+                (import "spacekit_payments" "payment_transfer"
+                    (func $pay (param i32 i32 i32 i32 i64) (result i32)))
+                (import "spacekit_payments" "payment_vault_charge"
+                    (func $vault (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{did}")
+                (data (i32.const 200) "ASTRA")
+                (data (i32.const 220) "USDC")
+                (func (export "main") (param i32 i32) (result i32)
+                    (if (i32.ne (call $pay (i32.const 0) (i32.const {len}) (i32.const 200) (i32.const 5)
+                                  (i64.const 1000000000000000000)) (i32.const 1))
+                        (then (return (i32.const -1))))
+                    (if (i32.ne (call $pay (i32.const 0) (i32.const {len}) (i32.const 220) (i32.const 4)
+                                  (i64.const 1)) (i32.const -22))
+                        (then (return (i32.const -1))))
+                    (if (i32.ne (call $vault (i32.const 220) (i32.const 1) (i32.const 0) (i32.const {len}))
+                                  (i32.const -22))
+                        (then (return (i32.const -1))))
+                    i32.const 0))"#,
+            did = payee_did,
+            len = payee_did.len()
+        );
+        let code = wat::parse_str(&wat_src)?;
+        let contract = SwtchvmAddress::new([0x55; 20]);
+        {
+            let mut state = node.runtime.state.write().await;
+            let acct = state.get_account_mut(&contract);
+            acct.code = Some(code);
+            acct.balance = 3 * WEI;
+            state.checkpoint();
+        }
+        node.submit_transaction(alice.tx(Some(contract), b"x".to_vec(), 0, 0)).await?;
+        let block = node.mine_block().await?;
+        assert!(block.receipts[0].success, "{:?}", block.receipts[0]);
+        assert_eq!(node.runtime.get_account_balance(&payee.address).await?, WEI);
+        assert_eq!(node.runtime.get_account_balance(&contract).await?, 2 * WEI);
+        Ok(())
+    }
+
+    fn paymaster_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_PAYMASTER_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_paymaster.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    /// The paymaster holds real ASTRA: deposits arrive as value, sponsored
+    /// draws and withdrawals are paid out on the chain, and policy limits hold.
+    #[tokio::test]
+    async fn paymaster_pays_out_native_astra() -> Result<()> {
+        let Some(wasm) = paymaster_wasm() else {
+            eprintln!("skipped: build spacekit-paymaster for wasm32 or set SPACEKIT_PAYMASTER_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let paymaster = SwtchvmAddress::new([0x9a; 20]);
+        let sponsor = TestAccount::new();
+        let user = TestAccount::new();
+        let stranger = TestAccount::new();
+        for a in [&sponsor, &user, &stranger] {
+            node.set_account_balance(&a.address, 100 * WEI).await?;
+        }
+        {
+            let mut state = node.runtime.state.write().await;
+            state.get_account_mut(&paymaster).code = Some(wasm);
+            state.checkpoint();
+        }
+        let s = |out: &mut Vec<u8>, v: &str| {
+            out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            out.extend_from_slice(v.as_bytes());
+        };
+        let charge = |amount: u128| {
+            let mut d = vec![0x04];
+            s(&mut d, &sponsor.did());
+            d.extend_from_slice(&amount.to_le_bytes());
+            s(&mut d, "gas");
+            d
+        };
+        let mut policy = vec![0x03];
+        s(&mut policy, &format!(
+            r#"{{"allowed_dids":["{}"],"allowed_ops":["gas"],"per_call_max":"{}","daily_max":"{}"}}"#,
+            user.did(), 2 * WEI, 3 * WEI
+        ));
+        let mut withdraw = vec![0x02];
+        withdraw.extend_from_slice(&(WEI).to_le_bytes());
+
+        let mut n = HashMap::<SwtchvmAddress, u64>::new();
+        let mut tx = |who: &TestAccount, data: Vec<u8>, value: u128| {
+            let k = n.entry(who.address).or_insert(0);
+            let t = who.tx(Some(paymaster), data, value, *k);
+            *k += 1;
+            t
+        };
+        let txs = vec![
+            tx(&sponsor, vec![0x01], 10 * WEI), // deposit
+            tx(&sponsor, policy, 0),
+            tx(&user, charge(2 * WEI), 0),      // ok
+            tx(&user, charge(3 * WEI), 0),      // over per-call max
+            tx(&user, charge(WEI), 0),          // ok: 3 today
+            tx(&user, charge(WEI), 0),          // over the daily max
+            tx(&stranger, charge(WEI), 0),      // not allowed
+            tx(&user, vec![0x05], WEI),         // value on a non-deposit op
+            tx(&sponsor, withdraw, 0),
+        ];
+        let user_before = node.runtime.get_account_balance(&user.address).await?;
+        for t in txs {
+            node.submit_transaction(t).await?;
+        }
+        let block = node.mine_block().await?;
+        let ok: Vec<bool> = block.receipts.iter().map(|r| r.success).collect();
+        assert_eq!(ok, vec![true, true, true, false, true, false, false, false, true]);
+
+        let user_gas: u128 = block.receipts[2..8]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4)
+            .map(|(_, r)| r.gas_used)
+            .sum();
+        assert_eq!(
+            node.runtime.get_account_balance(&user.address).await?,
+            user_before + 3 * WEI - user_gas,
+            "the user received exactly the sponsored 3 ASTRA"
+        );
+        // 10 deposited − 3 drawn − 1 withdrawn.
+        assert_eq!(node.runtime.get_account_balance(&paymaster).await?, 6 * WEI);
+        let budget = node.view_contract(&paymaster, &{
+            let mut d = vec![0x05];
+            s(&mut d, &sponsor.did());
+            d
+        }).await?;
+        assert_eq!(budget[0], 1);
+        assert_eq!(u128::from_le_bytes(budget[1..17].try_into().unwrap()), 6 * WEI);
         Ok(())
     }
 

@@ -889,21 +889,6 @@ export class SpacekitVm {
             pmt.effect.asset,
             BigInt(pmt.effect.amount),
           );
-        } else if (pmt.effect.type === "vault_charge") {
-          await ctx.payment.vaultCharge(
-            pmt.effect.amount,
-            pmt.effect.beneficiary ?? pmt.effect.to,
-          );
-        } else if (pmt.effect.type === "sponsor_vault_charge") {
-          const fn = ctx.payment.sponsorVaultCharge;
-          if (fn) {
-            await fn(
-              pmt.effect.sponsorDid ?? pmt.effect.to,
-              pmt.effect.amount,
-              pmt.effect.beneficiary ?? "",
-              pmt.effect.operation ?? "",
-            );
-          }
         }
       } catch (e) {
         console.error("[SpacekitVM] flush payment:", e);

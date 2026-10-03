@@ -2,13 +2,12 @@
 name = "spacekit-payments"
 version = "0.1.0"
 edition = "2021"
-description = "Unified payment layer for SpaceKit: x402 HTTP-native payments, aUSD vault charges, and VM credit routing"
+description = "SpaceKit payments in ASTRA: on-chain payment verification, pay-per-request gating and fee routing"
 license = "Apache-2.0"
 repository = "https://github.com/spacekit-xyz/spacekit-core"
 homepage = "https://github.com/spacekit-xyz/spacekit-core/tree/main/economics/spacekit-payments"
 [features]
-default = ["x402", "warp-middleware"]
-x402 = ["dep:reqwest"]
+default = ["warp-middleware"]
 warp-middleware = ["dep:warp"]
 
 [dependencies]
@@ -23,6 +22,3 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP middleware (optional, for compute-node integration)
 warp = { version = "0.3", optional = true }
-
-# x402 buyer-side HTTP client (for payment verification relay)
-reqwest = { version = "0.12", features = ["json"], optional = true }

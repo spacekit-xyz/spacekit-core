@@ -40,7 +40,7 @@ import {
   createConstraintState,
 } from "./tools/policy_gate.js";
 import { applySanitize } from "./tools/sanitize.js";
-import { PaymasterHostState, SessionHostState } from "./host_session_paymaster.js";
+import { SessionHostState } from "./host_session_paymaster.js";
 
 export interface TokenAdapter {
   balanceOf(did: string): bigint;
@@ -396,7 +396,6 @@ class HostContextImpl implements HostContext {
   effectManager: ToolEffectManager;
   sideEffects: ToolSideEffects;
   sessionHost: SessionHostState;
-  paymasterHost: PaymasterHostState;
 
   // SKTCS policy gate
   manifest?: ToolManifest;
@@ -436,7 +435,6 @@ class HostContextImpl implements HostContext {
     this.constraintState = createConstraintState();
     this.devMode = false;
     this.sessionHost = new SessionHostState();
-    this.paymasterHost = new PaymasterHostState();
   }
 
   setMemory(memory: WebAssembly.Memory) {
@@ -1384,8 +1382,15 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
           const gate = policyGate(ctx, "payment_transfer", { to, asset, amount }, 0);
           if (gate !== 0) return gate;
 
+          // ASTRA is the only currency.
+          if (!isAstraAsset(asset)) {
+            emitToolRecord(ctx, "payment_transfer", 0, "rejected");
+            return SKTCS_UNSUPPORTED_ASSET;
+          }
+          if (amount <= 0n) return TOOL_STATUS.ERROR;
+
           ctx.sideEffects.payments.push({
-            effect: { type: "transfer", to, asset, amount: amount.toString() },
+            effect: { type: "transfer", to, asset: "ASTRA", amount: amount.toString() },
           });
           emitToolRecord(ctx, "payment_transfer", 0, "fulfilled");
           return 1;
@@ -1396,38 +1401,12 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
       },
 
       /**
-       * Fire-and-forget vault charge. Buffered and flushed after execution.
-       * Returns 1 on success, -1 not configured, -2 error.
+       * Removed: aUSD vault charges no longer exist (SpaceKit settles only in
+       * ASTRA). Kept so existing contracts still link; always refused.
        */
-      payment_vault_charge: (
-        amountPtr: number,
-        amountLen: number,
-        beneficiaryPtr: number,
-        beneficiaryLen: number,
-      ): number => {
-        if (!ctx.payment) return TOOL_STATUS.NOT_CONFIGURED;
-        try {
-          const amount = ctx.readString(amountPtr, amountLen);
-          const beneficiary = ctx.readString(beneficiaryPtr, beneficiaryLen);
-
-          const gate = policyGate(ctx, "payment_vault_charge", { amount, beneficiary }, 0);
-          if (gate !== 0) return gate;
-
-          ctx.sideEffects.payments.push({
-            effect: {
-              type: "vault_charge",
-              to: beneficiary,
-              asset: "ausd",
-              amount,
-              beneficiary,
-            },
-          });
-          emitToolRecord(ctx, "payment_vault_charge", 0, "fulfilled");
-          return 1;
-        } catch (e) {
-          console.error("[SpacekitVM] payment_vault_charge error:", e);
-          return TOOL_STATUS.ERROR;
-        }
+      payment_vault_charge: (): number => {
+        emitToolRecord(ctx, "payment_vault_charge", 0, "rejected");
+        return SKTCS_UNSUPPORTED_ASSET;
       },
     },
 
@@ -1502,87 +1481,30 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
       },
     },
 
+    /**
+     * Removed: host-side sponsor budgets were kept outside the chain.
+     * Sponsorship is the `spacekit-paymaster` contract, which holds native
+     * ASTRA. Kept so existing contracts still link; always refused.
+     */
     spacekit_paymaster: {
-      /** Sponsor = ctx.callerDid. Policy JSON per SDK `paymaster_set_policy`. */
-      paymaster_set_policy: (policyPtr: number, policyLen: number): number => {
-        try {
-          const sponsorDid = ctx.callerDid;
-          const json = ctx.readString(policyPtr, policyLen);
-          ctx.paymasterHost.setPolicy(sponsorDid, json);
-          return 1;
-        } catch (e) {
-          console.error("[SpacekitVM] paymaster_set_policy error:", e);
-          return TOOL_STATUS.ERROR;
-        }
-      },
-
-      /**
-       * Validates in-memory sponsor policy + budget, decrements budget, buffers
-       * optional `PaymentAdapter.sponsorVaultCharge` flush.
-       */
-      paymaster_sponsor_charge: (
-        sponsorPtr: number,
-        sponsorLen: number,
-        amountPtr: number,
-        amountLen: number,
-        operationPtr: number,
-        operationLen: number,
-      ): number => {
-        try {
-          const sponsorDid = ctx.readString(sponsorPtr, sponsorLen);
-          const amount = ctx.readString(amountPtr, amountLen);
-          const operation = ctx.readString(operationPtr, operationLen);
-          const ok = ctx.paymasterHost.trySponsorCharge(
-            ctx.callerDid,
-            sponsorDid,
-            amount,
-            operation,
-          );
-          if (!ok) {
-            return TOOL_STATUS.ERROR;
-          }
-          ctx.sideEffects.payments.push({
-            effect: {
-              type: "sponsor_vault_charge",
-              to: sponsorDid,
-              asset: "ausd",
-              amount,
-              beneficiary: ctx.callerDid,
-              sponsorDid,
-              operation,
-            },
-          });
-          return 1;
-        } catch (e) {
-          console.error("[SpacekitVM] paymaster_sponsor_charge error:", e);
-          return TOOL_STATUS.ERROR;
-        }
-      },
-
-      /** Writes UTF-8 decimal budget string for sponsor (not necessarily caller). */
-      paymaster_budget: (
-        sponsorPtr: number,
-        sponsorLen: number,
-        destPtr: number,
-        destMax: number,
-      ): number => {
-        try {
-          const sponsorDid = ctx.readString(sponsorPtr, sponsorLen);
-          const s = ctx.paymasterHost.getBudgetString(sponsorDid);
-          const enc = new TextEncoder().encode(s);
-          if (enc.length > destMax) {
-            return TOOL_STATUS.ERROR;
-          }
-          ctx.writeBytes(destPtr, enc);
-          return enc.length;
-        } catch (e) {
-          console.error("[SpacekitVM] paymaster_budget error:", e);
-          return TOOL_STATUS.ERROR;
-        }
-      },
+      paymaster_set_policy: (): number => SKTCS_UNSUPPORTED_ASSET,
+      paymaster_sponsor_charge: (): number => SKTCS_UNSUPPORTED_ASSET,
+      paymaster_budget: (): number => SKTCS_UNSUPPORTED_ASSET,
     },
-
   };
+}
+
+/** Refusal code for anything that is not ASTRA (matches the compute node). */
+const SKTCS_UNSUPPORTED_ASSET = -22;
+
+/** `ASTRA`, `native`, or `spacekit:<network>:native`. */
+function isAstraAsset(asset: string): boolean {
+  const a = asset.trim();
+  return (
+    a.toUpperCase() === "ASTRA" ||
+    a.toLowerCase() === "native" ||
+    (a.startsWith("spacekit:") && a.endsWith(":native"))
+  );
 }
 
 export { HostContextImpl };

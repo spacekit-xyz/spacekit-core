@@ -9,13 +9,13 @@
 
 extern crate alloc;
 
-use alloc::{string::String, vec::Vec, format};
+use alloc::{vec::Vec, format};
 
 use spacekit_contract_sdk::{
-    emit_event_bytes, get_caller_did_string,
+    emit_event_bytes,
     growformer_brain_info, growformer_generation, growformer_host_status,
     growformer_load_brain_from_storage_key,
-    payments::payment_vault_charge,
+    collect_fee, TREASURY_ADDRESS, WEI_PER_MICRO_ASTRA,
     remote_storage::{remote_storage_get, remote_storage_put},
     tools::web_search,
     messaging::messaging_send,
@@ -52,11 +52,13 @@ const OP_BACKTEST_QUERY: u8 = 0x34;
 // -------------------------
 // Costs
 // -------------------------
-const COST_DATA: &str = "150";
-const COST_RISK: &str = "400";
-const COST_FACTOR: &str = "300";
-const COST_SENTIMENT: &str = "350";
-const COST_BACKTEST: &str = "600";
+// Fees in ASTRA wei (micro-ASTRA tiers), attached to the call and paid to
+// the network treasury.
+const COST_DATA: u128 = 150 * WEI_PER_MICRO_ASTRA;
+const COST_RISK: u128 = 400 * WEI_PER_MICRO_ASTRA;
+const COST_FACTOR: u128 = 300 * WEI_PER_MICRO_ASTRA;
+const COST_SENTIMENT: u128 = 350 * WEI_PER_MICRO_ASTRA;
+const COST_BACKTEST: u128 = 600 * WEI_PER_MICRO_ASTRA;
 
 // -------------------------
 // Limits
@@ -100,10 +102,6 @@ spacekit_contract!(FinancialAgent);
 // -------------------------
 // Helpers
 // -------------------------
-fn beneficiary() -> String {
-    get_caller_did_string().unwrap_or_else(|_| String::from("did:spacekit:anonymous"))
-}
-
 fn health_json() -> Vec<u8> {
     let gs = growformer_host_status();
     let brain_ok = growformer_load_brain_from_storage_key(BRAIN_KEY).is_ok();
@@ -139,7 +137,7 @@ fn handle_market_snapshot(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
 
-    payment_vault_charge(COST_DATA, beneficiary().as_str())?;
+    collect_fee(COST_DATA, &TREASURY_ADDRESS)?;
 
     let universe = core::str::from_utf8(&universe_bytes)
         .map_err(|_| ContractError::InvalidInput)?;
@@ -159,7 +157,7 @@ fn handle_risk_metrics(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
 
-    payment_vault_charge(COST_RISK, beneficiary().as_str())?;
+    collect_fee(COST_RISK, &TREASURY_ADDRESS)?;
 
     let pref = core::str::from_utf8(&portfolio_ref_bytes)
         .map_err(|_| ContractError::InvalidInput)?;
@@ -188,7 +186,7 @@ fn handle_factor_exposure(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
 
-    payment_vault_charge(COST_FACTOR, beneficiary().as_str())?;
+    collect_fee(COST_FACTOR, &TREASURY_ADDRESS)?;
 
     let pref = core::str::from_utf8(&portfolio_ref_bytes)
         .map_err(|_| ContractError::InvalidInput)?;
@@ -214,7 +212,7 @@ fn handle_sentiment_signal(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
 
-    payment_vault_charge(COST_SENTIMENT, beneficiary().as_str())?;
+    collect_fee(COST_SENTIMENT, &TREASURY_ADDRESS)?;
 
     let universe = core::str::from_utf8(&universe_bytes)
         .map_err(|_| ContractError::InvalidInput)?;
@@ -240,7 +238,7 @@ fn handle_backtest_query(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
 
-    payment_vault_charge(COST_BACKTEST, beneficiary().as_str())?;
+    collect_fee(COST_BACKTEST, &TREASURY_ADDRESS)?;
 
     let spec = core::str::from_utf8(&spec_bytes)
         .map_err(|_| ContractError::InvalidInput)?;

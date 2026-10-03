@@ -1,14 +1,15 @@
 /**
  * Intent Builder for SpaceKit Intent-Based Payments
  *
- * Composable helpers for building signed intents that include
- * contract execution, vault charges, and transfer actions.
+ * Composable helpers for building signed intents with contract execution and
+ * ASTRA transfer actions. ASTRA is SpaceKit's only currency: every amount is
+ * wei (18 decimals) as a decimal string, so no precision is lost.
  *
  * Usage:
  *   const intent = new IntentBuilder("did:alice", "spacekit:mainnet")
- *     .vaultCharge("2.00", "did:contract:xyz")
- *     .executeContract("did:contract:xyz", inputHex, { maxFeeUsdc: "3.00" })
- *     .maxNotionalUsd(5.0)
+ *     .executeContract("did:contract:xyz", inputHex, { valueWei: parseAstra("2") })
+ *     .transferAstra("did:bob", parseAstra("0.5"))
+ *     .maxValueWei(parseAstra("3"))
  *     .build();
  */
 
@@ -20,28 +21,25 @@ export interface ExecuteContractAction {
   type: "execute_contract";
   contract_id: string;
   input: string;
+  /** ASTRA wei attached as `msg_value` (decimal string). */
   value_astra?: string;
-  max_fee_usdc?: string;
+  /** Maximum fee in ASTRA wei (decimal string). */
   max_fee_astra?: string;
-}
-
-export interface VaultChargeAction {
-  type: "vault_charge";
-  amount_ausd: string;
-  beneficiary: string;
 }
 
 export interface TransferAction {
   type: "transfer";
   asset: string;
   to: string;
+  /** ASTRA wei (decimal string). */
   amount: string;
 }
 
-export type IntentAction = ExecuteContractAction | VaultChargeAction | TransferAction;
+export type IntentAction = ExecuteContractAction | TransferAction;
 
 export interface IntentConstraints {
-  max_notional_usd?: number;
+  /** Most ASTRA wei the intent may move (decimal string). */
+  max_value_wei?: string;
   [key: string]: unknown;
 }
 
@@ -64,14 +62,13 @@ export interface SignedIntent {
   sig_type: string;
 }
 
+/** Fees and value of an intent, all in ASTRA wei. */
 export interface FeeEstimate {
-  total_ausd: number;
-  total_astra: number;
+  total_wei: bigint;
   breakdown: {
     action_type: string;
     label: string;
-    amount_ausd: number;
-    amount_astra: number;
+    amount_wei: bigint;
   }[];
 }
 
@@ -89,6 +86,12 @@ export interface IntentSignerFn {
 
 export interface FeeEstimatorFn {
   (actions: IntentAction[]): Promise<FeeEstimate>;
+}
+
+function weiString(v: bigint | string): string {
+  const b = typeof v === "bigint" ? v : BigInt(v.trim());
+  if (b < 0n) throw new Error("ASTRA amounts cannot be negative");
+  return b.toString();
 }
 
 /* ─── Builder ───────────────────────────────────────────── */
@@ -114,24 +117,15 @@ export class IntentBuilder {
     return this;
   }
 
-  /** Add a vault charge action to deduct aUSD before execution. */
-  vaultCharge(amountAusd: string, beneficiary: string): this {
-    this.actions.push({
-      type: "vault_charge",
-      amount_ausd: amountAusd,
-      beneficiary,
-    });
-    return this;
-  }
-
   /** Add a contract execution action. */
   executeContract(
     contractId: string,
     inputHex: string,
     opts?: {
-      valueAstra?: string;
-      maxFeeUsdc?: string;
-      maxFeeAstra?: string;
+      /** ASTRA wei to attach. */
+      valueWei?: bigint | string;
+      /** Maximum fee in ASTRA wei. */
+      maxFeeWei?: bigint | string;
     },
   ): this {
     const action: ExecuteContractAction = {
@@ -139,27 +133,26 @@ export class IntentBuilder {
       contract_id: contractId,
       input: inputHex,
     };
-    if (opts?.valueAstra) action.value_astra = opts.valueAstra;
-    if (opts?.maxFeeUsdc) action.max_fee_usdc = opts.maxFeeUsdc;
-    if (opts?.maxFeeAstra) action.max_fee_astra = opts.maxFeeAstra;
+    if (opts?.valueWei !== undefined) action.value_astra = weiString(opts.valueWei);
+    if (opts?.maxFeeWei !== undefined) action.max_fee_astra = weiString(opts.maxFeeWei);
     this.actions.push(action);
     return this;
   }
 
-  /** Add a native ASTRA transfer action. */
-  transferAstra(to: string, amount: string): this {
+  /** Add a native ASTRA transfer action (`amountWei` in wei). */
+  transferAstra(to: string, amountWei: bigint | string): this {
     this.actions.push({
       type: "transfer",
       asset: "spacekit:mainnet:native",
       to,
-      amount,
+      amount: weiString(amountWei),
     });
     return this;
   }
 
-  /** Set the max notional USD constraint. */
-  maxNotionalUsd(value: number): this {
-    this.constraints.max_notional_usd = value;
+  /** Most ASTRA wei the intent may move (attached value plus transfers). */
+  maxValueWei(value: bigint | string): this {
+    this.constraints.max_value_wei = weiString(value);
     return this;
   }
 
@@ -221,106 +214,80 @@ export class IntentBuilder {
 
 /* ─── Fee Estimation ────────────────────────────────────── */
 
-const DEFAULT_USDC_TO_ASTRA_RATE = 1_000_000;
-const DEFAULT_NETWORK_FEE_BPS = 25;
+const DEFAULT_NETWORK_FEE_BPS = 25n;
 
 /**
- * Estimate fees for a set of intent actions.
- * Uses the same conversion logic as spacekit-payments FeeRouter.
+ * Estimate what an intent costs, in ASTRA wei: attached contract value plus
+ * the fee cap, and transfers plus the network fee (as spacekit-payments'
+ * FeeRouter computes it).
  */
 export function estimateIntentFees(
   actions: IntentAction[],
-  opts?: { usdcToAstraRate?: number; networkFeeBps?: number },
+  opts?: { networkFeeBps?: number },
 ): FeeEstimate {
-  const rate = opts?.usdcToAstraRate ?? DEFAULT_USDC_TO_ASTRA_RATE;
-  const feeBps = opts?.networkFeeBps ?? DEFAULT_NETWORK_FEE_BPS;
+  const feeBps = BigInt(opts?.networkFeeBps ?? Number(DEFAULT_NETWORK_FEE_BPS));
   const breakdown: FeeEstimate["breakdown"] = [];
-  let totalAusd = 0;
-  let totalAstra = 0;
+  let total = 0n;
 
   for (const action of actions) {
     switch (action.type) {
-      case "vault_charge": {
-        const amount = parseFloat(action.amount_ausd) || 0;
-        const fee = (amount * feeBps) / 10_000;
-        const netAstra = Math.floor((amount - fee) * rate);
-        breakdown.push({
-          action_type: "vault_charge",
-          label: `Charge ${action.amount_ausd} aUSD → ${action.beneficiary}`,
-          amount_ausd: amount,
-          amount_astra: netAstra,
-        });
-        totalAusd += amount;
-        totalAstra += netAstra;
-        break;
-      }
       case "execute_contract": {
-        const value = parseInt(action.value_astra ?? "0", 10) || 0;
-        const maxUsdc = parseFloat(action.max_fee_usdc ?? "0") || 0;
-        const maxAstra = parseInt(action.max_fee_astra ?? "0", 10) || 0;
+        const amount = BigInt(action.value_astra ?? "0") + BigInt(action.max_fee_astra ?? "0");
         breakdown.push({
           action_type: "execute_contract",
           label: `Execute ${action.contract_id}`,
-          amount_ausd: maxUsdc,
-          amount_astra: value + maxAstra,
+          amount_wei: amount,
         });
-        totalAusd += maxUsdc;
-        totalAstra += value + maxAstra;
+        total += amount;
         break;
       }
       case "transfer": {
-        const amount = parseInt(action.amount, 10) || 0;
-        const fee = Math.floor((amount * feeBps) / 10_000);
+        const amount = BigInt(action.amount);
+        const fee = (amount * feeBps) / 10_000n;
         breakdown.push({
           action_type: "transfer",
-          label: `Transfer ${action.amount} → ${action.to}`,
-          amount_ausd: 0,
-          amount_astra: amount + fee,
+          label: `Transfer ${action.amount} wei → ${action.to}`,
+          amount_wei: amount + fee,
         });
-        totalAstra += amount + fee;
+        total += amount + fee;
         break;
       }
     }
   }
 
-  return { total_ausd: totalAusd, total_astra: totalAstra, breakdown };
+  return { total_wei: total, breakdown };
 }
 
 /* ─── Convenience: build + estimate in one step ─────────── */
 
 /**
- * High-level helper: build an execute-contract intent with automatic vault
- * charge, fee estimation, and signing.
+ * High-level helper: build an execute-contract intent, estimate its cost in
+ * ASTRA, and sign it. The intent's `max_value_wei` is the attached value.
  */
 export async function buildExecuteContractIntent(opts: {
   actor: string;
   contractId: string;
   inputHex: string;
   chain?: string;
-  valueAstra?: string;
-  maxFeeUsdc?: string;
+  /** ASTRA wei to attach. */
+  valueWei?: bigint | string;
+  /** Maximum fee in ASTRA wei. */
+  maxFeeWei?: bigint | string;
   agent?: string;
   signer: IntentSignerFn;
-  usdcToAstraRate?: number;
 }): Promise<{ signed: SignedIntent; fees: FeeEstimate }> {
   const builder = new IntentBuilder(opts.actor, opts.chain);
 
   if (opts.agent) builder.delegateTo(opts.agent);
 
-  if (opts.maxFeeUsdc) {
-    builder.vaultCharge(opts.maxFeeUsdc, opts.contractId);
-    builder.maxNotionalUsd(parseFloat(opts.maxFeeUsdc));
-  }
-
   builder.executeContract(opts.contractId, opts.inputHex, {
-    valueAstra: opts.valueAstra,
-    maxFeeUsdc: opts.maxFeeUsdc,
+    valueWei: opts.valueWei,
+    maxFeeWei: opts.maxFeeWei,
   });
+  builder.maxValueWei(opts.valueWei ?? 0n);
 
   const intent = builder.build();
-  const fees = estimateIntentFees(intent.actions, {
-    usdcToAstraRate: opts.usdcToAstraRate,
-  });
+  const fees = estimateIntentFees(intent.actions);
   assertSignableExpiry(intent);
   const { signature, sig_type } = await opts.signer(await canonicalIntentPayload(intent));
   const signed: SignedIntent = { intent, signature, sig_type };

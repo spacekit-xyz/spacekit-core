@@ -28,7 +28,7 @@ Deploy with `spacekit contract deploy` and set `VITE_SPACEKIT_ANCHOR_CONTRACT_ID
 {"ok":true,"note_id":"abc","content_hash":"<64 hex>","timestamp":1700000000,"caller":"did:spacekit:…"}
 ```
 
-Charges vault tier **50** (atomic units) per anchor via `payment_vault_charge`.
+Each anchor requires a fee of **50 µASTRA** (0.00005 ASTRA) attached to the call; `collect_fee` forwards it to the network treasury (`0x…0004`).
 
 ## Client example (TypeScript)
 

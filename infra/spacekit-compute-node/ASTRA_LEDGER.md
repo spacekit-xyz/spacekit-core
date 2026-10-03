@@ -85,13 +85,15 @@ Nothing does on a consensus (PoA/PoS) network. The faucet, rollup settlement, Po
 | `POST /transaction` | Submit a signed transaction (payload `SPACEKIT-TX-v2`, see `transaction_signing_payload`). |
 | `POST /api/contracts/{address}/call` | Read-only call: raw call data in, raw return data out. Nothing is charged or kept. |
 | `POST /v1/transfer` | SPHINCS+ transfer. |
+| `GET /v1/tx/{hash}` | A transaction in a block: `from`, `to`, `value_wei`, `success`, `confirmations`. |
+| `POST /v1/payments/verify` | `{ tx_hash, pay_to, amount_wei }`: verifies an ASTRA payment once. |
 
-## Payments in USD (open question)
+## Payments
 
-`spacekit-payments` can turn USDC/aUSD receipts into ASTRA credits.
+ASTRA is the only currency. There are no USD-denominated balances, no stablecoin rails (x402/USDC, aUSD, the Ethereum DAI/USDC entitlement contract) and no exchange rates anywhere in the node, the SDKs or the browser runtime.
 
-- A credit now names its payer (`Credit::payer_did`): the treasury for USD payments, the sender for ASTRA payments.
-- An applier must apply a credit as a transfer on the chain, never as a mint.
-- No applier is wired up today: the node only logs credits.
-
-Whether USD-denominated balances (aUSD, `AusdVault`) should exist at all is a product decision. They are not ASTRA and are not on the chain.
+- **A payment is a chain transaction.** The payee checks it by hash: `GET /v1/tx/{hash}` or `POST /v1/payments/verify` (`spacekit_payments::PaymentVerifier`), which requires success, the right recipient, at least the price, and refuses a transaction it has already accepted. A service that grants something lasting must also store the hash with the grant.
+- **Contracts charge by attached value.** A paid call carries its price as value; the contract forwards it (`collect_fee` / `transfer_u128`). `payment_transfer` pays ASTRA from the executing contract's balance and refuses any other asset (`-22`); `payment_vault_charge` is always refused.
+- **Sponsorship** is the `spacekit-paymaster` contract, which holds the ASTRA sponsors deposit and pays permitted callers from it.
+- **Intents** (`/v1/execute`) carry ASTRA wei only and are validated, not executed: the reply lists the chain transactions the actor must sign.
+- **Validator stake** outside the PoA/PoS governance path (`/v1/consensus/register-validator`) is native ASTRA holdings, `stake_wei`, with a minimum of `SPACEKIT_MIN_VALIDATOR_STAKE_WEI` (default 10,000 ASTRA).

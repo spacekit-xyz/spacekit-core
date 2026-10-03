@@ -1343,7 +1343,7 @@ enum StorageCommands {
         #[arg(long, default_value = "public")]
         access: Option<String>,
 
-        /// Pricing model: free, or a price in aUSD (e.g. "10.00") for one-time purchase
+        /// Pricing model: free, or a price in ASTRA (e.g. "10.5") for one-time purchase
         #[arg(long, default_value = "free")]
         price: Option<String>,
 
@@ -1994,7 +1994,7 @@ enum SimulatorCommands {
         base_custom_chain_id: Option<u64>,
     },
 
-    /// Show funded testnet accounts (100M ASTRA + 100M aUSD each)
+    /// Show funded testnet accounts (ASTRA balances)
     Accounts,
 
     /// VPN operations
@@ -7317,17 +7317,28 @@ async fn handle_storage_deploy(
                     Vec::new()
                 });
 
+        // Prices are ASTRA, the only currency; stored as wei (decimal string).
         let pricing_obj = match price.unwrap_or("free") {
             "free" | "0" | "0.00" => serde_json::json!({
                 "model": "free",
-                "amount_cents": 0
+                "asset": "ASTRA",
+                "amount_wei": "0"
             }),
             amount => {
-                let dollars = amount.parse::<f64>().unwrap_or(0.0);
-                let cents = (dollars * 100.0).round() as u64;
+                let astra = amount
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        Box::new(CliError::Config(format!(
+                            "--price must be \"free\" or an amount of ASTRA, got {amount}"
+                        )))
+                    })?;
                 serde_json::json!({
                     "model": "one-time",
-                    "amount_cents": cents
+                    "asset": "ASTRA",
+                    "amount_wei": crate::content_monetization::astra_to_wei(astra).to_string()
                 })
             }
         };
@@ -10511,9 +10522,8 @@ async fn handle_storage_node(action: &NodeAction) -> Result<(), Box<dyn std::err
 //             let accounts = net.list_funded_accounts().await;
 //             println!("\n💰 {} pre-funded testnet accounts:", accounts.len().to_string().yellow());
 //             for acct in &accounts {
-//                 println!("   {} — {} ASTRA + {} aUSD",
+//                 println!("   {} — {} ASTRA",
 //                     acct.address.green(),
-//                     "100M".yellow(),
 //                     "100M".yellow()
 //                 );
 //             }
@@ -10542,12 +10552,11 @@ async fn handle_storage_node(action: &NodeAction) -> Result<(), Box<dyn std::err
 //                 .map_err(|e| Box::new(CliError::ComputeNode(e.to_string())))?;
 //             let accounts = net.list_funded_accounts().await;
 //             println!("💰 {} pre-funded testnet accounts:\n", accounts.len().to_string().yellow());
-//             println!("{:<44} {:>16} {:>16}", "Address".bold(), "ASTRA".bold(), "aUSD".bold());
-//             println!("{}", "─".repeat(78));
+//             println!("{:<44} {:>16}", "Address".bold(), "ASTRA".bold());
+//             println!("{}", "─".repeat(61));
 //             for acct in &accounts {
-//                 println!("{:<44} {:>13}M   {:>13}M",
+//                 println!("{:<44} {:>13}M",
 //                     acct.address.green(),
-//                     "100".yellow(),
 //                     "100".yellow()
 //                 );
 //             }
@@ -14872,7 +14881,8 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
                     "access": "public",
                     "pricing": {
                         "model": pricing,
-                        "amount_ausd": 0,
+                        "asset": "ASTRA",
+                        "amount_wei": "0",
                     },
                     "artifacts": uploaded_fact_ids.iter().map(|(fid, path)| {
                         serde_json::json!({

@@ -275,8 +275,8 @@ fn handle_list(data: &[u8]) -> Result<Vec<u8>, ContractError> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Wildcard `*` matches everything.  Pipe-separated scopes are checked
-/// individually.  E.g. scope `"vault_charge|transfer"` allows operations
-/// named `"vault_charge"` or `"transfer"`.
+/// individually.  E.g. scope `"transfer|contract_call"` allows operations
+/// named `"transfer"` or `"contract_call"`.
 fn scope_allows(scope: &str, operation: &str) -> bool {
     if scope == "*" {
         return true;

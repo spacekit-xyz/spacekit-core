@@ -1,4 +1,7 @@
-//! RouteKit agent — Growformer routing + vault + messaging + remote storage.
+//! RouteKit agent — Growformer routing + ASTRA fees + messaging + remote storage.
+//!
+//! Paid operations take their fee as ASTRA attached to the call (see `COST_*`,
+//! in wei); the whole attached value goes to the network treasury.
 //! Full wire format, opcodes, and build instructions: **README.md** in this crate root.
 //!
 //! Incremental spec implementation: local **COMPLETE**, search→reply **PIPELINE**, **SEARCH** legacy
@@ -16,7 +19,7 @@
 //! | SEARCH v1 | `0x03` then `1u8` | `[1][max_gen u16][q_len u16][query_utf8]` — search+local, then routed reply |
 //! | CONVERSE | `0x04` | `[hist_ref_len u16][hist_ref_utf8][msg_len u16][msg_utf8]` |
 //! | FRONTIER_SEND | `0x05` | `[recipient_len u16][recipient_utf8][payload_len u16][payload_bytes]` |
-//! | PING | `0x11` | (same as FRONTIER but only ping event; vault not charged here) |
+//! | PING | `0x11` | (same as FRONTIER but only ping event; no fee) |
 //! | BRAIN_INFO | `0x12` | (empty body after opcode) |
 //! | CONFIGURE | `0x20` | `[prefs_len u16][prefs_utf8]` → returns `[ref_len u16][ref_utf8]` |
 
@@ -29,9 +32,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use spacekit_contract_sdk::{
-    emit_event_bytes, get_caller_did_string, growformer_brain_info, growformer_generation,
+    emit_event_bytes, growformer_brain_info, growformer_generation,
     growformer_host_status, growformer_load_brain_from_storage_key, messaging::messaging_send,
-    payments::payment_vault_charge, remote_storage::remote_storage_get,
+    collect_fee, remote_storage::remote_storage_get, TREASURY_ADDRESS, WEI_PER_MICRO_ASTRA,
     remote_storage::remote_storage_put, spacekit_contract,     tools::web_search, ContractError, ContractErrorCode, SpacekitContract,
 };
 
@@ -58,11 +61,12 @@ const OP_BRAIN_INFO: u8 = 0x12;
 const OP_HEALTH: u8 = 0x10;
 const OP_CONFIGURE: u8 = 0x20;
 
-const COST_LOCAL: &str = "100";
-const COST_SEARCH: &str = "200";
-const COST_PIPE: &str = "300";
-const COST_SEARCH_AND_LOCAL: &str = "300";
-const COST_FRONTIER: &str = "5000";
+// Fees in ASTRA wei (micro-ASTRA tiers).
+const COST_LOCAL: u128 = 100 * WEI_PER_MICRO_ASTRA;
+const COST_SEARCH: u128 = 200 * WEI_PER_MICRO_ASTRA;
+const COST_PIPE: u128 = 300 * WEI_PER_MICRO_ASTRA;
+const COST_SEARCH_AND_LOCAL: u128 = 300 * WEI_PER_MICRO_ASTRA;
+const COST_FRONTIER: u128 = 5000 * WEI_PER_MICRO_ASTRA;
 
 const SEARCH_WIRE_V1: u8 = 1;
 const DEFAULT_SEARCH_MAX_JSON: usize = 64 * 1024;
@@ -97,10 +101,6 @@ impl SpacekitContract for RouteKitAgent {
 
 spacekit_contract!(RouteKitAgent);
 
-fn beneficiary() -> String {
-    get_caller_did_string().unwrap_or_else(|_| String::from("did:spacekit:anonymous"))
-}
-
 fn health_json() -> Vec<u8> {
     let gs = growformer_host_status();
     let brain_ok = growformer_load_brain_from_storage_key(ROUTER_BRAIN_KEY).is_ok();
@@ -117,7 +117,7 @@ fn handle_complete(body: &[u8]) -> Result<Vec<u8>, ContractError> {
     if prompt.is_empty() {
         return Err(ContractError::InvalidInput);
     }
-    payment_vault_charge(COST_LOCAL, beneficiary().as_str())?;
+    collect_fee(COST_LOCAL, &TREASURY_ADDRESS)?;
     growformer_load_brain_from_storage_key(ROUTER_BRAIN_KEY)?;
     let out = growformer_generation(prompt.as_str(), max_resp)?;
     emit_event_bytes("routekit.complete", &(out.len() as u32).to_le_bytes());
@@ -131,7 +131,7 @@ fn handle_pipeline(body: &[u8]) -> Result<Vec<u8>, ContractError> {
     if !rest.is_empty() || sq_bytes.is_empty() || uq_bytes.is_empty() {
         return Err(ContractError::InvalidInput);
     }
-    payment_vault_charge(COST_PIPE, beneficiary().as_str())?;
+    collect_fee(COST_PIPE, &TREASURY_ADDRESS)?;
     let sq = core::str::from_utf8(&sq_bytes).map_err(|_| ContractError::InvalidInput)?;
     let uq = core::str::from_utf8(&uq_bytes).map_err(|_| ContractError::InvalidInput)?;
     let hits = web_search(sq, 5, DEFAULT_SEARCH_MAX_JSON)?;
@@ -159,7 +159,7 @@ fn handle_search_legacy_raw(query_bytes: &[u8]) -> Result<Vec<u8>, ContractError
     if prompt.is_empty() {
         return Err(ContractError::InvalidInput);
     }
-    payment_vault_charge(COST_SEARCH, beneficiary().as_str())?;
+    collect_fee(COST_SEARCH, &TREASURY_ADDRESS)?;
     emit_event_bytes(
         "routekit.search.start",
         &(prompt.len() as u32).to_le_bytes(),
@@ -176,7 +176,7 @@ fn handle_search_v1(body: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::InvalidInput);
     }
     let query = core::str::from_utf8(&q_bytes).map_err(|_| ContractError::InvalidInput)?;
-    payment_vault_charge(COST_SEARCH_AND_LOCAL, beneficiary().as_str())?;
+    collect_fee(COST_SEARCH_AND_LOCAL, &TREASURY_ADDRESS)?;
     let hits = web_search(query, 5, DEFAULT_SEARCH_MAX_JSON)?;
     growformer_load_brain_from_storage_key(ROUTER_BRAIN_KEY)?;
     let enriched =
@@ -195,7 +195,7 @@ fn handle_converse(body: &[u8]) -> Result<Vec<u8>, ContractError> {
     let hist_ref = core::str::from_utf8(&hist_ref_bytes).map_err(|_| ContractError::InvalidInput)?;
     let msg = core::str::from_utf8(&msg_bytes).map_err(|_| ContractError::InvalidInput)?;
 
-    payment_vault_charge(COST_LOCAL, beneficiary().as_str())?;
+    collect_fee(COST_LOCAL, &TREASURY_ADDRESS)?;
 
     let mut transcript = String::new();
     if !hist_ref.is_empty() {
@@ -237,7 +237,7 @@ fn handle_frontier(body: &[u8]) -> Result<Vec<u8>, ContractError> {
     if !tail.is_empty() || recip_bytes.is_empty() || pld.is_empty() {
         return Err(ContractError::InvalidInput);
     }
-    payment_vault_charge(COST_FRONTIER, beneficiary().as_str())?;
+    collect_fee(COST_FRONTIER, &TREASURY_ADDRESS)?;
     let recipient =
         core::str::from_utf8(&recip_bytes).map_err(|_| ContractError::InvalidInput)?;
     messaging_send(recipient, &pld)?;

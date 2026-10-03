@@ -1,22 +1,27 @@
 //! SpaceKit Payments
 //!
-//! Unified payment layer supporting:
-//! - **x402**: HTTP-native paid APIs (USDC on Base via EIP-3009)
-//! - **aUSD vault**: On-chain deposit vault → per-call signed charges
-//! - **Native ASTRA**: In-VM fee/value transfers
+//! SpaceKit has one currency, ASTRA, held as native balances on the SpaceKit
+//! chain. This crate prices, verifies and routes payments in ASTRA only:
 //!
-//! All payment methods resolve to a `Credit` that can be applied to VM balances.
+//! - **Verification** (`verify`): a payment is a successful ASTRA transfer on
+//!   the chain, checked by transaction hash.
+//! - **Pay-per-request** (`middleware`, feature `warp-middleware`): `402`
+//!   with an ASTRA price, then `X-PAYMENT: <tx hash>`.
+//! - **Fee routing** (`fee_router`): payee share plus network fee, applied as
+//!   chain transfers.
+//! - **Intents** (`intent`): ASTRA transfers and contract value in intents.
+//!
+//! There are no USD-denominated balances, stablecoin rails or exchange rates.
 
-pub mod ausd;
 pub mod fee_router;
 pub mod intent;
 pub mod types;
-pub mod x402;
+pub mod verify;
 
 #[cfg(feature = "warp-middleware")]
 pub mod middleware;
 
-pub use ausd::AusdVault;
 pub use fee_router::FeeRouter;
 pub use intent::{IntentAction, IntentPaymentProcessor, SignedIntent};
 pub use types::*;
+pub use verify::{ChainLookup, ChainTransfer, PaymentVerifier};

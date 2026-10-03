@@ -21,8 +21,10 @@ export const SKTCS_ERROR = {
   MAX_EFFECTS_EXCEEDED: -17,
   RECIPIENT_BLOCKED: -18,
   BENEFICIARY_MISMATCH: -19,
-  VAULT_CHARGE_FAILED: -20,
+  PAYMENT_FAILED: -20,
   SIZE_LIMIT_EXCEEDED: -21,
+  /** The asset is not ASTRA (SpaceKit settles only in ASTRA). */
+  UNSUPPORTED_ASSET: -22,
 } as const;
 
 export type SktcsErrorCode = (typeof SKTCS_ERROR)[keyof typeof SKTCS_ERROR];
@@ -253,28 +255,6 @@ function parseRateLimit(str: string): { limit: number; windowMs: number } | null
  */
 export function recordEffect(toolName: string, state: ConstraintState): void {
   state.effectCounts.set(toolName, (state.effectCounts.get(toolName) ?? 0) + 1);
-}
-
-/* ─── Vault charging (pay-before-execute) ────────────────── */
-
-export async function chargeVault(
-  toolDef: ToolDef,
-  callerDid: string,
-  paymentAdapter: PaymentAdapter | undefined,
-): Promise<PolicyResult> {
-  const cost = toolDef.constraints.cost;
-  if (!cost || cost === "0") return PASS;
-
-  if (!paymentAdapter) {
-    return reject(SKTCS_ERROR.VAULT_CHARGE_FAILED, "no payment adapter configured for vault charge");
-  }
-
-  const ok = await paymentAdapter.vaultCharge(cost, callerDid);
-  if (!ok) {
-    return reject(SKTCS_ERROR.VAULT_CHARGE_FAILED, `vault charge of ${cost} failed for ${callerDid}`);
-  }
-
-  return PASS;
 }
 
 /* ─── Storage key prefix (DID scoping) ───────────────────── */

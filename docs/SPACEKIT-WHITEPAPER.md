@@ -53,7 +53,7 @@ SpaceKit is not only a chain. It is a **network of services** tied together by D
                     └─────────────────────┘
 ```
 
-**Settlement:** ASTRA balances and **AstraRewards** credits on L1; optional **x402** (USDC) and **SpaceKit Pay** rails convert verified receipts into VM credits without minting ASTRA ([`spacekit-payments`](spacekit-payments/)).
+**Settlement:** ASTRA, held as native balances on L1, is the only currency in spacekit-core. Payments are ASTRA transfers verified on chain by transaction hash ([`spacekit-payments`](../economics/spacekit-payments/)); operator rewards mint into native balances.
 
 **Content plane:** **FactPackage** and **AppPackage** artifacts live on the storage node (content-addressed graphs, PQ envelopes, deployment receipts). Contracts reference facts by hash; the host enforces policy before reads and writes.
 
@@ -104,19 +104,19 @@ Contracts interact with the outside world only through **host imports**. Nine mo
 | `spacekit_storage` | Contract-scoped KV |
 | `spacekit_contract` | Nested contract calls (max depth 8) |
 | `spacekit_messaging` | Operator-fulfilled messaging (no outbound HTTP from WASM) |
-| `spacekit_payments` | ASTRA transfers, vault charges |
+| `spacekit_payments` | ASTRA transfers (other assets refused) |
 | `spacekit_remote_storage` | Durable reads/writes on storage node |
 | `spacekit_session` | Delegated session keys for agents |
 | `spacekit_crypto` | Hashes, PQ verify hooks |
 
-**Extended imports** (same VM family, additional manifests): `sk_erc20`, `sk_erc721`, `spacekit_reputation`, `spacekit_fact`, `spacekit_tools` (effect-queue web search), `spacekit_paymaster`, compression helpers, and legacy LLM paths (deprecated). Application contracts declare only what they need; the VM rejects undeclared imports.
+**Extended imports** (same VM family, additional manifests): `sk_erc20`, `sk_erc721`, `spacekit_reputation`, `spacekit_fact`, `spacekit_tools` (effect-queue web search), compression helpers, and legacy LLM paths (deprecated). Application contracts declare only what they need; the VM rejects undeclared imports.
 
 ### 3.3 SKTCS (SpaceKit Tool-Call Spec)
 
 **SKTCS** replaces ad-hoc tool wiring with a **VM-internal manifest** (`tool-manifest.json` or WASM custom section `spacekit:tools`). Principles:
 
 1. **Contracts propose, the VM decides** — tool calls are effects; the host validates parameters and capability constraints.
-2. **Pay-before-execute** — vault charges settle before storage, network, or inference effects run.
+2. **Pay-before-execute** — a paid call carries its fee in ASTRA, checked before storage, network, or inference effects run.
 3. **Deterministic audit trail** — each fulfilled effect is traceable for verification (Verkle witnesses on L2).
 
 Spec: [`SPACEKIT-TOOL-CALL-SPEC.md`](SPACEKIT-TOOL-CALL-SPEC.md).
@@ -247,12 +247,10 @@ Agent contracts that need production inference on L1 should be validated against
 |-----------|--------------|---------|
 | **ASTRA** | Yes (capped) | Gas, staking, governance, operator rewards via SRA → AstraRewards |
 | **SpaceKit Pay** | No | Non-custodial stablecoin routing for AI/service settlement |
-| **x402** | No | HTTP 402 USDC on Base; facilitator verification → FeeRouter credits |
 
-Implementation: [`spacekit-payments`](spacekit-payments/) (`FeeRouter`, `AusdVault` for dev vault charges, x402 middleware). **Rails are not interchangeable** — each has distinct verification and treasury paths.
+Implementation: [`spacekit-payments`](../economics/spacekit-payments/) prices, verifies and routes payments in ASTRA only: a payment is an ASTRA transfer on the chain, checked by transaction hash (`PaymentVerifier`); sponsorship is the `spacekit-paymaster` contract, which holds deposited ASTRA. There are no USD-denominated balances (no aUSD, no vault charges) and no x402/USDC rail in spacekit-core.
 
-User-facing stablecoin charges may use vault semantics in dev; canonical public
-spec is v2 in
+Canonical public spec is v2 in
 [`../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md`](../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md)
 (no aUSD product).
 
@@ -424,7 +422,7 @@ Parameters (40/30/20/10, 200M year-1, 4-year halving, 350M treasury) are **calib
 
 ### 9.13 How users pay vs how operators earn
 
-- **Users** spend ASTRA (gas), x402 USDC, or Pay-routed stablecoins for services.
+- **Users** spend ASTRA for gas and for services.
 - **Operators earn** newly emitted ASTRA only through **measured service** in the four categories — not through passive holding. Validators **stake** for Sybil resistance and slashing exposure; stake does **not** pay yield by itself.
 
 ---
@@ -489,7 +487,7 @@ The **testnet is deployed** and exercised by operators and internal dApps. **Mai
 - VM parity (L1 vs L2) for production agent contracts
 - DID registration, resolve, and registry contract completion
 - Storage ACL, federation handoff, and MCP tool authorization
-- Payments FeeRouter, x402 verification, and treasury configuration
+- Payments: on-chain ASTRA payment verification, FeeRouter, paymaster contract, and treasury configuration
 - Supply cap enforcement in AstraRewards + SRA accounting
 
 No HIPAA, SOC 2, or financial regulatory certification is implied by this software.

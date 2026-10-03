@@ -14,7 +14,6 @@ intent = [
     "dep:sha3",
     "dep:spacekit-primitives",
 ]
-vault = ["intent", "dep:alloy"]
 
 [dependencies]
 axum = { version = "0.7", features = ["json", "macros", "tokio"] }
@@ -40,14 +39,6 @@ hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 sha3 = { version = "0.10", optional = true }
 spacekit-primitives = { path = "../../foundation/spacekit-primitives", default-features = false, features = ["secrets-core"], optional = true }
-alloy = { version = "1.6", default-features = false, optional = true, features = [
-    "provider-http",
-    "signer-local",
-    "contract",
-    "rpc-types",
-    "network",
-    "reqwest",
-] }
 
 [dev-dependencies]
 http-body-util = "0.1"

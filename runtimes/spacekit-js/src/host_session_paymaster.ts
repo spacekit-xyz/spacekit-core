@@ -1,20 +1,12 @@
 /**
- * In-process session keys + paymaster state for WASM imports
- * `spacekit_session` / `spacekit_paymaster` (see `spacekit-contract-sdk` `agent_host.rs`).
+ * In-process session keys for the WASM import `spacekit_session` (see
+ * `spacekit-contract-sdk` `agent_host.rs`).
+ *
+ * Sponsored payments are not here: they are the `spacekit-paymaster`
+ * contract, which holds native ASTRA on the chain.
  */
 
-const MAX_POLICY_JSON_BYTES = 32_768;
 const MAX_SCOPE_LEN = 512;
-
-export type PaymasterPolicyJson = {
-  allowed_dids?: string[];
-  allowed_ops?: string[];
-  per_call_max?: string;
-  daily_max?: string;
-  expires_at?: number;
-  /** Initial sponsor budget (decimal string, same convention as vault_charge amounts). */
-  budget?: string;
-};
 
 type SessionRow = {
   ownerDid: string;
@@ -23,18 +15,6 @@ type SessionRow = {
   expiresAt: number;
   revoked: boolean;
 };
-
-function utcDayKey(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function parsePositiveIntString(s: string): bigint {
-  const t = s.trim();
-  if (!/^\d+$/.test(t)) {
-    throw new Error("invalid_int_string");
-  }
-  return BigInt(t);
-}
 
 export function scopeAllowsOperation(scopeRaw: string, operation: string): boolean {
   const parts = scopeRaw
@@ -122,114 +102,5 @@ export class SessionHostState {
       }
     }
     return 0;
-  }
-}
-
-type SponsorLedger = {
-  policy: PaymasterPolicyJson;
-  budget: bigint;
-  dailySpent: bigint;
-  dailyKey: string;
-};
-
-export class PaymasterHostState {
-  private ledgers = new Map<string, SponsorLedger>();
-
-  setPolicy(sponsorDid: string, jsonUtf8: string): void {
-    if (jsonUtf8.length > MAX_POLICY_JSON_BYTES) {
-      throw new Error("policy_too_large");
-    }
-    const parsed = JSON.parse(jsonUtf8) as PaymasterPolicyJson;
-    const existing = this.ledgers.get(sponsorDid);
-    let nextBudget = existing?.budget ?? 0n;
-    if (parsed.budget !== undefined && parsed.budget !== null) {
-      nextBudget = parsePositiveIntString(String(parsed.budget));
-    }
-    const day = utcDayKey();
-    const dailySpent =
-      existing && existing.dailyKey === day ? existing.dailySpent : 0n;
-    this.ledgers.set(sponsorDid, {
-      policy: parsed,
-      budget: nextBudget,
-      dailySpent,
-      dailyKey: day,
-    });
-  }
-
-  getBudgetString(sponsorDid: string): string {
-    const L = this.ledgers.get(sponsorDid);
-    if (!L) {
-      return "0";
-    }
-    this.rollDaily(L);
-    return L.budget.toString();
-  }
-
-  private rollDaily(L: SponsorLedger): void {
-    const d = utcDayKey();
-    if (L.dailyKey !== d) {
-      L.dailyKey = d;
-      L.dailySpent = 0n;
-    }
-  }
-
-  /**
-   * Validates sponsor policy + budget, decrements in-memory budget, returns true if allowed.
-   * Caller should enqueue network flush separately.
-   */
-  trySponsorCharge(
-    callerDid: string,
-    sponsorDid: string,
-    amountStr: string,
-    operation: string,
-  ): boolean {
-    const L = this.ledgers.get(sponsorDid);
-    if (!L) {
-      return false;
-    }
-    this.rollDaily(L);
-
-    const pol = L.policy;
-    if (typeof pol.expires_at === "number" && pol.expires_at < Math.floor(Date.now() / 1000)) {
-      return false;
-    }
-    const allowedDids = pol.allowed_dids ?? [];
-    if (allowedDids.length === 0) {
-      return false;
-    }
-    if (!allowedDids.some((pat) => didMatchesPattern(callerDid, pat))) {
-      return false;
-    }
-    const allowedOps = pol.allowed_ops ?? [];
-    if (allowedOps.length === 0) {
-      return false;
-    }
-    if (!allowedOps.includes(operation)) {
-      return false;
-    }
-
-    const amount = parsePositiveIntString(amountStr);
-    if (amount <= 0n) {
-      return false;
-    }
-    if (pol.per_call_max) {
-      const max = parsePositiveIntString(pol.per_call_max);
-      if (amount > max) {
-        return false;
-      }
-    }
-    if (pol.daily_max) {
-      const dm = parsePositiveIntString(pol.daily_max);
-      if (L.dailySpent + amount > dm) {
-        return false;
-      }
-    }
-    if (amount > L.budget) {
-      return false;
-    }
-
-    L.budget -= amount;
-    L.dailySpent += amount;
-    return true;
   }
 }

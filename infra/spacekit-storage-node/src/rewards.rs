@@ -88,9 +88,6 @@ pub struct RewardRecord {
     pub timestamp: DateTime<Utc>,
     pub amount_astra: f64,
     pub amount_wei: u128,
-    /// aUSD fee income earned from user-paid storage operations this period.
-    #[serde(default)]
-    pub amount_ausd: f64,
     pub storage_gb: f64,
     pub bonus_multipliers: BonusMultipliers,
     pub node_did: String,
@@ -327,19 +324,10 @@ impl StorageRewardCalculator {
         // Create reward record
         let stats = self.storage_node.get_stats().await?;
 
-        // aUSD fee income: operators earn a per-GB-month aUSD fee from users.
-        // The base rate is 0.01 aUSD/GB/day — configurable via environment.
-        let ausd_rate: f64 = std::env::var("SPACEKIT_AUSD_PER_GB_DAY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.01);
-        let amount_ausd = calculation.storage_gb * ausd_rate;
-
         let mut record = RewardRecord {
             timestamp: Utc::now(),
             amount_astra: calculation.final_reward,
             amount_wei: calculation.reward_wei,
-            amount_ausd,
             storage_gb: calculation.storage_gb,
             bonus_multipliers: calculation.bonus_breakdown.clone(),
             node_did: stats.node_did.clone(),
@@ -362,7 +350,6 @@ impl StorageRewardCalculator {
                 "node_did": &record.node_did,
                 "amount_astra": record.amount_astra,
                 "amount_wei": record.amount_wei,
-                "amount_ausd": record.amount_ausd,
                 "storage_gb": record.storage_gb,
                 "bonus_multipliers": record.bonus_multipliers,
                 "period_end": Utc::now().to_rfc3339(),
@@ -385,8 +372,8 @@ impl StorageRewardCalculator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("pending");
                     info!(
-                        "VPoS storage proof accepted — tx: {}, reward: {} ASTRA + {} aUSD",
-                        tx_hash, record.amount_astra, record.amount_ausd
+                        "VPoS storage proof accepted — tx: {}, reward: {} ASTRA",
+                        tx_hash, record.amount_astra
                     );
                     record.settlement_tx = tx_hash.to_string();
                 }

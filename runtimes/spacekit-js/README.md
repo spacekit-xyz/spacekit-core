@@ -17,7 +17,7 @@ This provides the import modules expected by the contracts under `contracts/`:
 - `spacekit_tools` — web search (effect queue pattern)
 - `spacekit_messaging` — inter-agent messaging via SpaceKit Messaging Node
 - `spacekit_remote_storage` — persistent storage on SpaceTime Storage Node
-- `spacekit_payments` — ASTRA transfers and aUSD vault charges
+- `spacekit_payments` — ASTRA transfers (ASTRA is the only currency)
 - `spacekit_llm` — (deprecated) LLM inference
 - `spacekit_microgpt` — (deprecated) Micro-GPT forward
 
@@ -404,7 +404,7 @@ WASM smart contracts (agents) have access to tools via host import modules. Tool
 | `spacekit_tools` | `web_search` | Effect queue → messaging `tool-request` | Search intents to an operator DID (RouteKit-style) |
 | `spacekit_messaging` | `messaging_send` | Fire-and-forget | Inter-agent envelopes via Messaging Node |
 | `spacekit_remote_storage` | `remote_storage_put`, `remote_storage_get` | Effect queue | Persistent state on SpaceTime Storage Node |
-| `spacekit_payments` | `payment_transfer`, `payment_vault_charge` | Fire-and-forget | ASTRA transfers, aUSD vault charges |
+| `spacekit_payments` | `payment_transfer` | Fire-and-forget | ASTRA transfers, settled on chain by the `PaymentAdapter`; other assets are refused (`-22`). `payment_vault_charge` is removed and always refused. |
 | `spacekit_agent` | `agent_growformer_*` | Synchronous | Local Growformer brain inference |
 
 ### Messaging Node architecture

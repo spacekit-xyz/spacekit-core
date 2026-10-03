@@ -251,18 +251,8 @@ pub mod ml_operations;
 // Pricing and economics
 pub mod pricing;
 
-// Exchange rate oracle for aUSD marketplace stablecoin
-pub mod exchange_rate;
-pub use exchange_rate::ExchangeRateOracle;
-
 // Verkle state root anchoring to EVM
 pub mod state_anchor;
-
-// On-chain entitlement reader — reads the Ethereum DAI/USDC entitlement
-// contract. Replaces the former in-memory aUSD vault; the node has no
-// authority to create balance locally.
-pub mod entitlements;
-pub use entitlements::{EntitlementConfig, EntitlementError, EntitlementReader, EntitlementView};
 
 // Canonical intent signing — the actor's signature must cover the whole intent
 pub mod intent_auth;
@@ -5355,7 +5345,6 @@ mod tests {
             crate::layerzero_bridge::TokenBridgeMapping {
                 astra_token: "0xASTRA_ARB_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_ARB_ADDRESS".to_string()),
-                usdc_token: "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
                 supported_tokens: std::collections::HashMap::new(),
             },
         );
