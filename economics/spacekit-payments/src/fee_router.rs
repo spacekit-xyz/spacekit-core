@@ -9,8 +9,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
-/// Callback for applying a credit to the VM's balance state.
-/// Implementations should debit/credit the appropriate storage keys.
+/// Callback for applying a credit to the chain.
+///
+/// ASTRA exists only as native balances on the chain. An implementation must
+/// apply a credit as a **transfer** of `amount_astra` from `payer_did` to
+/// `beneficiary_did` (a chain transaction), and fail if the payer cannot
+/// cover it. It must never mint.
 pub trait CreditApplier: Send + Sync {
     fn apply_credit(&self, credit: &Credit) -> Result<()>;
 }
@@ -56,6 +60,7 @@ impl FeeRouter {
 
         // Credit the beneficiary
         let credit = Credit {
+            payer_did: self.config.treasury_did.clone(),
             beneficiary_did: beneficiary_did.to_string(),
             amount_astra: astra_credit,
             source: receipt.asset,
@@ -65,7 +70,9 @@ impl FeeRouter {
 
         // Credit the treasury with the network fee
         if astra_fee > 0 {
+            // The USD fee is kept by the treasury: no ASTRA moves for it.
             let treasury_credit = Credit {
+                payer_did: self.config.treasury_did.clone(),
                 beneficiary_did: self.config.treasury_did.clone(),
                 amount_astra: astra_fee,
                 source: receipt.asset,
@@ -112,6 +119,7 @@ impl FeeRouter {
         let net = amount_astra - fee;
 
         let credit = Credit {
+            payer_did: from_did.to_string(),
             beneficiary_did: to_did.to_string(),
             amount_astra: net,
             source: PaymentAsset::ASTRA,
@@ -127,6 +135,7 @@ impl FeeRouter {
 
         if fee > 0 {
             let treasury_credit = Credit {
+                payer_did: from_did.to_string(),
                 beneficiary_did: self.config.treasury_did.clone(),
                 amount_astra: fee,
                 source: PaymentAsset::ASTRA,

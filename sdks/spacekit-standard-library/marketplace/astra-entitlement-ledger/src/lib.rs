@@ -29,7 +29,11 @@ extern "C" {
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn get_caller_did(out_ptr: *mut u8, max_len: usize) -> i32;
-    fn msg_value() -> i64;
+    /// Value attached to this call, native ASTRA wei, 16 bytes LE.
+    fn msg_value_u128(out_ptr: *mut u8) -> i32;
+    /// Pay from this contract's own balance. 0 = ok.
+    fn transfer_u128(to_ptr: *const u8, amount_ptr: *const u8) -> i32;
+    /// The block's timestamp (Unix seconds).
     fn get_timestamp() -> i64;
 }
 
@@ -50,6 +54,10 @@ const OP_GET_LISTING: u8       = 0x05;
 const OP_GET_ENTITLEMENT: u8   = 0x06;
 /// Publisher-only grant (owner approve) — no payment required.
 const OP_GRANT: u8             = 0x07;
+/// VERIFY bound to an expected listing (use this, not OP_VERIFY).
+const OP_VERIFY_LISTING: u8    = 0x08;
+/// Extend a subscription entitlement by one period (pays the price).
+const OP_RENEW: u8             = 0x09;
 
 /// Pricing types matching `AppPricing` variants.
 const PRICING_ONE_TIME: u8     = 1;
@@ -62,6 +70,7 @@ const STATUS_WRONG_BUYER: u8   = 2;
 const STATUS_WRONG_FILE: u8    = 3;
 const STATUS_REVOKED: u8       = 4;
 const STATUS_WRONG_PK: u8      = 5;
+const STATUS_WRONG_LISTING: u8 = 6;
 
 /// Internal entitlement record status byte.
 const ENT_ACTIVE: u8           = 1;
@@ -78,20 +87,29 @@ const ENT_RECORD_MAX: usize    = 1024;
 
 /// ABI:
 ///
+/// Amounts are native ASTRA in wei (u128, 16 bytes LE). Payments go straight
+/// to the publisher's address (the address in their `did:spacekit:<hex>`);
+/// the contract never holds funds. Times are the block's timestamp.
+///
 /// OP_CREATE_LISTING (0x01):
-///   Input:  [op][listing_id:string][file_id:string][price:u64le][token:string][pricing_type:u8][period:u64le]
+///   Input:  [op][listing_id:string][file_id:string][price:u128le][token:string][pricing_type:u8][period:u64le]
 ///   Output: [1]
-///   Only the caller DID becomes the publisher.
+///   Only the caller DID becomes the publisher. A publisher may update price
+///   and terms of their own listing, but not its file_id. No value accepted.
 ///
 /// OP_PURCHASE (0x02):
 ///   Input:  [op][listing_id:string][buyer_pk_hash:32 bytes]
 ///   Output: [1][entitlement_id:32 bytes]
-///   Requires msg_value() >= listing price. Emits "entitlement:granted".
+///   Requires value >= listing price; the whole value is paid to the
+///   publisher. Emits "entitlement:granted".
 ///   `buyer_pk_hash` = SHA-256(buyer Kyber public key raw bytes); must be non-zero.
 ///
 /// OP_VERIFY (0x03):
 ///   Input:  [op][entitlement_id:32 bytes][buyer_did:string][file_id:string][buyer_pk_hash:32 bytes]
 ///   Output: [1][status:u8]  (1=valid, 0=expired, 2=wrong_buyer, 3=wrong_file, 4=revoked, 5=wrong_pk)
+///   Legacy: anyone can create a listing for any file_id, so a check by
+///   file_id alone can be satisfied by a listing the content owner never
+///   made. Use OP_VERIFY_LISTING.
 ///
 /// OP_REVOKE (0x04):
 ///   Input:  [op][entitlement_id:32 bytes]
@@ -111,6 +129,21 @@ const ENT_RECORD_MAX: usize    = 1024;
 ///   Output: [1][entitlement_id:32 bytes]
 ///   Only the listing publisher may grant. No payment. Emits "entitlement:granted".
 ///   Expiry follows the listing pricing type (one-time = never; subscription = now+period).
+///
+/// OP_VERIFY_LISTING (0x08):
+///   Input:  [op][entitlement_id:32][buyer_did:string][listing_id:string][buyer_pk_hash:32]
+///   Output: [1][status:u8]  (as OP_VERIFY, plus 6=wrong_listing)
+///   The caller names the listing it trusts (e.g. the one a channel or file
+///   was published with) and checks the publisher via OP_GET_LISTING. An
+///   all-zero buyer_pk_hash skips the key check (for callers that
+///   authenticate the buyer's DID and deliver nothing to a key).
+///
+/// OP_RENEW (0x09):
+///   Input:  [op][entitlement_id:32]
+///   Output: [1][expires_at:u64le]
+///   Subscription listings only. Requires value >= price (paid to the
+///   publisher). Extends from max(now, expires_at) by one period; the
+///   entitlement id stays the same.
 struct AstraEntitlementLedger;
 
 impl SpacekitContract for AstraEntitlementLedger {
@@ -125,6 +158,11 @@ spacekit_contract!(AstraEntitlementLedger);
 
 fn dispatch(input: &[u8]) -> Result<Vec<u8>, ContractError> {
     if input.is_empty() { return Err(ContractError::InvalidInput); }
+    // Only purchases and renewals take payment; value sent with anything
+    // else would be stranded in the contract, so refuse it.
+    if input[0] != OP_PURCHASE && input[0] != OP_RENEW && attached_value() != 0 {
+        return Err(ContractError::InvalidInput);
+    }
     match input[0] {
         OP_CREATE_LISTING  => handle_create_listing(&input[1..]),
         OP_PURCHASE        => handle_purchase(&input[1..]),
@@ -133,6 +171,8 @@ fn dispatch(input: &[u8]) -> Result<Vec<u8>, ContractError> {
         OP_GET_LISTING     => handle_get_listing(&input[1..]),
         OP_GET_ENTITLEMENT => handle_get_entitlement(&input[1..]),
         OP_GRANT           => handle_grant(&input[1..]),
+        OP_VERIFY_LISTING  => handle_verify_listing(&input[1..]),
+        OP_RENEW           => handle_renew(&input[1..]),
         _ => Err(ContractError::InvalidInput),
     }
 }
@@ -144,7 +184,7 @@ fn dispatch(input: &[u8]) -> Result<Vec<u8>, ContractError> {
 struct Listing {
     publisher_did: String,
     file_id: String,
-    price: u64,
+    price: u128,
     token: String,
     pricing_type: u8,
     period: u64,
@@ -155,7 +195,7 @@ fn encode_listing(l: &Listing) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     write_string(&mut out, &l.publisher_did);
     write_string(&mut out, &l.file_id);
-    out.extend_from_slice(&l.price.to_le_bytes());
+    out.extend_from_slice(&l.price.to_le_bytes()); // 16 bytes
     write_string(&mut out, &l.token);
     out.push(l.pricing_type);
     out.extend_from_slice(&l.period.to_le_bytes());
@@ -167,7 +207,7 @@ fn decode_listing(data: &[u8]) -> Result<Listing, ContractError> {
     let mut pos = 0usize;
     let publisher_did = read_string(data, &mut pos)?;
     let file_id = read_string(data, &mut pos)?;
-    let price = read_u64(data, &mut pos)?;
+    let price = read_u128(data, &mut pos)?;
     let token = read_string(data, &mut pos)?;
     if pos >= data.len() { return Err(ContractError::InvalidInput); }
     let pricing_type = data[pos]; pos += 1;
@@ -226,19 +266,34 @@ fn handle_create_listing(data: &[u8]) -> Result<Vec<u8>, ContractError> {
     let mut pos = 0usize;
     let listing_id  = read_string(data, &mut pos)?;
     let file_id     = read_string(data, &mut pos)?;
-    let price       = read_u64(data, &mut pos)?;
+    let price       = read_u128(data, &mut pos)?;
     let token       = read_string(data, &mut pos)?;
     if pos >= data.len() { return Err(ContractError::InvalidInput); }
     let pricing_type = data[pos]; pos += 1;
     let period      = read_u64(data, &mut pos)?;
+    if listing_id.is_empty() || file_id.is_empty() {
+        return Err(ContractError::InvalidInput);
+    }
+    if pricing_type != PRICING_ONE_TIME && pricing_type != PRICING_SUBSCRIPTION {
+        return Err(ContractError::InvalidInput);
+    }
+    if pricing_type == PRICING_SUBSCRIPTION && period == 0 {
+        return Err(ContractError::InvalidInput);
+    }
 
     let caller = get_caller()?;
+    // Payments go to this address, so the publisher must have one.
+    publisher_address(&caller)?;
     let key = listing_storage_key(&listing_id);
 
-    // Prevent overwriting someone else's listing
+    // Only the publisher may update a listing, and never to another file:
+    // entitlements already sold were sold for that file.
     if let Ok(existing) = load_listing(&listing_id) {
         if existing.publisher_did != caller {
             return Err(ContractError::Unauthorized);
+        }
+        if existing.file_id != file_id {
+            return Err(ContractError::InvalidInput);
         }
     }
 
@@ -268,21 +323,21 @@ fn handle_purchase(data: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::Failed);
     }
 
-    let paid = unsafe { msg_value() } as u64;
+    let paid = attached_value();
     if paid < listing.price {
         return Err(ContractError::InsufficientPayment);
     }
+    pay_publisher(&listing, paid)?;
 
     let buyer_did = get_caller()?;
-    let now = unsafe { get_timestamp() } as u64;
+    let now = block_time();
 
     let expires_at = match listing.pricing_type {
-        PRICING_SUBSCRIPTION if listing.period > 0 => now + listing.period,
+        PRICING_SUBSCRIPTION if listing.period > 0 => now.saturating_add(listing.period),
         _ => u64::MAX, // one-time: never expires
     };
 
-    // entitlement_id = SHA256(buyer_did ++ listing_id ++ timestamp_le)
-    let entitlement_id = derive_entitlement_id(&buyer_did, &listing_id, now);
+    let entitlement_id = derive_entitlement_id(&buyer_did, &listing_id, now)?;
 
     let ent = Entitlement {
         buyer_did: buyer_did.clone(),
@@ -319,34 +374,81 @@ fn handle_verify(data: &[u8]) -> Result<Vec<u8>, ContractError> {
     } else {
         [0u8; 32]
     };
-
     let ent = load_entitlement(&entitlement_id)?;
-
-    if ent.status == ENT_REVOKED {
-        return Ok(vec![1u8, STATUS_REVOKED]);
-    }
-    if ent.buyer_did != buyer_did {
-        return Ok(vec![1u8, STATUS_WRONG_BUYER]);
-    }
-
-    // Resolve the listing to check file_id match
     let listing = load_listing(&ent.listing_id)?;
     if listing.file_id != file_id {
-        return Ok(vec![1u8, STATUS_WRONG_FILE]);
+        return Ok(check_status(&ent, &buyer_did, &buyer_pk_hash).map_or_else(
+            |s| vec![1u8, s],
+            |_| vec![1u8, STATUS_WRONG_FILE],
+        ));
     }
+    Ok(vec![1u8, check_status(&ent, &buyer_did, &buyer_pk_hash).unwrap_or_else(|s| s)])
+}
 
-    let now = unsafe { get_timestamp() } as u64;
+fn handle_verify_listing(data: &[u8]) -> Result<Vec<u8>, ContractError> {
+    let mut pos = 0usize;
+    let entitlement_id = read_bytes32(data, &mut pos)?;
+    let buyer_did = read_string(data, &mut pos)?;
+    let listing_id = read_string(data, &mut pos)?;
+    let buyer_pk_hash = read_bytes32(data, &mut pos)?;
+    let ent = load_entitlement(&entitlement_id)?;
+    if ent.listing_id != listing_id {
+        return Ok(vec![1u8, STATUS_WRONG_LISTING]);
+    }
+    // An all-zero key hash skips the key check: callers that authenticate the
+    // buyer's DID themselves (and deliver nothing encrypted to a key) may not
+    // know the buyer's key.
+    if buyer_pk_hash == [0u8; 32] {
+        return Ok(vec![1u8, check_status(&ent, &buyer_did, &ent.buyer_pk_hash).unwrap_or_else(|s| s)]);
+    }
+    Ok(vec![1u8, check_status(&ent, &buyer_did, &buyer_pk_hash).unwrap_or_else(|s| s)])
+}
+
+/// Ok(STATUS_VALID) or Err(the failing status), in a fixed order: revoked,
+/// wrong buyer, expired, wrong key.
+fn check_status(ent: &Entitlement, buyer_did: &str, buyer_pk_hash: &[u8; 32]) -> Result<u8, u8> {
+    if ent.status == ENT_REVOKED {
+        return Err(STATUS_REVOKED);
+    }
+    if ent.buyer_did != buyer_did {
+        return Err(STATUS_WRONG_BUYER);
+    }
+    let now = block_time();
     if ent.expires_at != u64::MAX && now > ent.expires_at {
-        return Ok(vec![1u8, STATUS_EXPIRED]);
+        return Err(STATUS_EXPIRED);
     }
-
-    if ent.buyer_pk_hash != [0u8; 32] {
-        if buyer_pk_hash == [0u8; 32] || buyer_pk_hash != ent.buyer_pk_hash {
-            return Ok(vec![1u8, STATUS_WRONG_PK]);
-        }
+    if ent.buyer_pk_hash != [0u8; 32]
+        && (*buyer_pk_hash == [0u8; 32] || *buyer_pk_hash != ent.buyer_pk_hash)
+    {
+        return Err(STATUS_WRONG_PK);
     }
+    Ok(STATUS_VALID)
+}
 
-    Ok(vec![1u8, STATUS_VALID])
+fn handle_renew(data: &[u8]) -> Result<Vec<u8>, ContractError> {
+    let mut pos = 0usize;
+    let entitlement_id = read_bytes32(data, &mut pos)?;
+    let mut ent = load_entitlement(&entitlement_id)?;
+    if ent.status == ENT_REVOKED {
+        return Err(ContractError::Failed);
+    }
+    let listing = load_listing(&ent.listing_id)?;
+    if listing.active == 0 || listing.pricing_type != PRICING_SUBSCRIPTION || listing.period == 0 {
+        return Err(ContractError::Failed);
+    }
+    let paid = attached_value();
+    if paid < listing.price {
+        return Err(ContractError::InsufficientPayment);
+    }
+    pay_publisher(&listing, paid)?;
+    let now = block_time();
+    ent.expires_at = ent.expires_at.max(now).saturating_add(listing.period);
+    host_storage_save(&entitlement_storage_key(&entitlement_id), &encode_entitlement(&ent))?;
+    spacekit_contract_sdk::emit_event_bytes("entitlement:renewed", &entitlement_id);
+    let mut out = Vec::with_capacity(9);
+    out.push(1u8);
+    out.extend_from_slice(&ent.expires_at.to_le_bytes());
+    Ok(out)
 }
 
 fn handle_revoke(data: &[u8]) -> Result<Vec<u8>, ContractError> {
@@ -413,13 +515,13 @@ fn handle_grant(data: &[u8]) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::Unauthorized);
     }
 
-    let now = unsafe { get_timestamp() } as u64;
+    let now = block_time();
     let expires_at = match listing.pricing_type {
-        PRICING_SUBSCRIPTION if listing.period > 0 => now + listing.period,
+        PRICING_SUBSCRIPTION if listing.period > 0 => now.saturating_add(listing.period),
         _ => u64::MAX,
     };
 
-    let entitlement_id = derive_entitlement_id(&recipient_did, &listing_id, now);
+    let entitlement_id = derive_entitlement_id(&recipient_did, &listing_id, now)?;
 
     let ent = Entitlement {
         buyer_did: recipient_did.clone(),
@@ -457,13 +559,78 @@ fn get_caller() -> Result<String, ContractError> {
         .map_err(|_| ContractError::InvalidInput)
 }
 
-fn derive_entitlement_id(buyer_did: &str, listing_id: &str, timestamp: u64) -> [u8; 32] {
-    let ts_bytes = timestamp.to_le_bytes();
-    let mut input = Vec::with_capacity(buyer_did.len() + listing_id.len() + 8);
+/// SHA256(domain ++ buyer ++ 0 ++ listing ++ 0 ++ time ++ seq). `seq` counts
+/// this buyer's entitlements, so two in the same block get distinct ids.
+fn derive_entitlement_id(buyer_did: &str, listing_id: &str, timestamp: u64) -> Result<[u8; 32], ContractError> {
+    let mut seq_key = String::from("seq:");
+    seq_key.push_str(buyer_did);
+    let seq = host_storage_load_raw(&seq_key, 8)
+        .ok()
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    host_storage_save(&seq_key, &(seq + 1).to_le_bytes())?;
+    let mut input = Vec::with_capacity(32 + buyer_did.len() + listing_id.len() + 18);
+    input.extend_from_slice(b"SPACEKIT-ENTITLEMENT-v2");
     input.extend_from_slice(buyer_did.as_bytes());
+    input.push(0);
     input.extend_from_slice(listing_id.as_bytes());
-    input.extend_from_slice(&ts_bytes);
-    host_sha256(&input)
+    input.push(0);
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    input.extend_from_slice(&seq.to_le_bytes());
+    Ok(host_sha256(&input))
+}
+
+fn attached_value() -> u128 {
+    let mut out = [0u8; 16];
+    if unsafe { msg_value_u128(out.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    u128::from_le_bytes(out)
+}
+
+fn block_time() -> u64 {
+    let t = unsafe { get_timestamp() };
+    if t < 0 { 0 } else { t as u64 }
+}
+
+/// The 20-byte address in `did:spacekit:<40 hex>`.
+fn publisher_address(did: &str) -> Result<[u8; 20], ContractError> {
+    let hex = did.strip_prefix("did:spacekit:").ok_or(ContractError::InvalidInput)?;
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() != 40 {
+        return Err(ContractError::InvalidInput);
+    }
+    let mut out = [0u8; 20];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_val(chunk[0]).ok_or(ContractError::InvalidInput)?;
+        let lo = hex_val(chunk[1]).ok_or(ContractError::InvalidInput)?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Forward the whole payment to the publisher. The value arrived in this
+/// contract's balance with the call; nothing stays behind.
+fn pay_publisher(listing: &Listing, amount: u128) -> Result<(), ContractError> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let to = publisher_address(&listing.publisher_did)?;
+    let amount_bytes = amount.to_le_bytes();
+    if unsafe { transfer_u128(to.as_ptr(), amount_bytes.as_ptr()) } != 0 {
+        return Err(ContractError::Failed);
+    }
+    Ok(())
 }
 
 fn listing_storage_key(listing_id: &str) -> String {
@@ -530,6 +697,14 @@ fn read_u64(input: &[u8], pos: &mut usize) -> Result<u64, ContractError> {
     b.copy_from_slice(&input[*pos..*pos + 8]);
     *pos += 8;
     Ok(u64::from_le_bytes(b))
+}
+
+fn read_u128(input: &[u8], pos: &mut usize) -> Result<u128, ContractError> {
+    if *pos + 16 > input.len() { return Err(ContractError::InvalidInput); }
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&input[*pos..*pos + 16]);
+    *pos += 16;
+    Ok(u128::from_le_bytes(b))
 }
 
 fn read_string(input: &[u8], pos: &mut usize) -> Result<String, ContractError> {

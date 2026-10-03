@@ -406,6 +406,9 @@ export function createJsonRpcHandler(vm: SpacekitVm) {
           if (!did) {
             return err(id, -32602, "Missing did");
           }
+          if (vm.currency === "chain") {
+            return err(id, -32601, "ASTRA balances live on the chain: query the compute node (/v1/balance)");
+          }
           const key = `astra:erc20:balance:${did}`;
           const keyHex = Buffer.from(key, "utf8").toString("hex");
           const value = vm.getStorageValue(keyHex);

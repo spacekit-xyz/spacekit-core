@@ -40,6 +40,12 @@ import {
 } from "./genesis.js";
 import { IndexedDbBlockStore, type BlockStoreOptions } from "./blockstore.js";
 import {
+  guardLocalCurrency,
+  isLocalCurrencyKey,
+  LocalCurrencyError,
+  NoLocalCurrencyTokenAdapter,
+} from "../chain/currency_guard.js";
+import {
   createSignatureVerifier,
   verifyTransactionSignature,
   type SignatureVerifier,
@@ -202,6 +208,18 @@ const DEFAULT_METERING_COST_TABLE: MeteringCostTable = {
 };
 
 export interface SpacekitVmOptions extends HostOptions {
+  /**
+   * Where ASTRA lives.
+   *
+   * - `"chain"` (default): only on the SpaceKit chain. The VM keeps no
+   *   balances, mints nothing at genesis, charges no local fees and refuses
+   *   transactions that carry value; value moves with `ChainClient`. Local
+   *   execution is for contract state only.
+   * - `"local-dev"`: a self-contained local ledger (genesis treasury, local
+   *   fees and value transfers) for offline development and tests. Never use
+   *   it for anything users pay with.
+   */
+  currency?: "chain" | "local-dev";
   storage?: StorageAdapter;
   maxBlocksInMemory?: number;
   chainId?: string;
@@ -394,6 +412,8 @@ export class SpacekitVm {
   private signatureVerifier: SignatureVerifier;
   private requireSignature: boolean;
   devMode: boolean;
+  /** Where ASTRA lives (see `SpacekitVmOptions.currency`). */
+  readonly currency: "chain" | "local-dev";
   private enableWasmMetering: boolean;
   private meteringCostTable?: MeteringCostTable;
   private internalCallDepth = 0;
@@ -406,7 +426,8 @@ export class SpacekitVm {
 
   constructor(options: SpacekitVmOptions = {}) {
     this.maxBlocksInMemory = options.maxBlocksInMemory ?? 100;
-    const { storage, blockStore, ...hostOptions } = options;
+    this.currency = options.currency ?? "chain";
+    const { storage, blockStore, currency: _currency, ...hostOptions } = options;
     const registryAdapter = getActiveLlmAdapter();
 
     // Wrap storage in VerkleStateManager for persistent tree + access tracking
@@ -419,9 +440,16 @@ export class SpacekitVm {
       }
     }
 
+    if (effectiveStorage && this.currency === "chain") {
+      effectiveStorage = guardLocalCurrency(effectiveStorage);
+    }
+
     this.hostOptions = {
       ...hostOptions,
       storage: effectiveStorage,
+      // No local token ledger in chain mode: contracts see no balance and
+      // cannot move value locally.
+      token: hostOptions.token ?? (this.currency === "chain" ? new NoLocalCurrencyTokenAdapter() : undefined),
       llm: hostOptions.llm ?? registryAdapter ?? undefined,
       contractCall: (
         contractId: string,
@@ -446,7 +474,7 @@ export class SpacekitVm {
     // Initialize DID resolver if storage is available
     if (storage) {
       this.didResolver = createDidResolver(storage);
-      this.initializeGenesis(storage);
+      this.initializeGenesis(storage, this.currency === "local-dev");
     }
 
     // Initialize block store if enabled
@@ -557,13 +585,16 @@ export class SpacekitVm {
   /**
    * Initialize genesis state: seed treasury and register initial DIDs.
    */
-  private initializeGenesis(storage: StorageAdapter): void {
+  private initializeGenesis(storage: StorageAdapter, seedLocalCurrency: boolean): void {
     const config = this.genesisConfig;
     
-    // Seed treasury with initial supply
+    // Seed the local treasury (local-dev only: in chain mode ASTRA exists
+    // only on the chain).
     const treasuryKey = `native:astra:balance:${config.treasuryDid}`;
-    const existing = storage.get(new TextEncoder().encode(treasuryKey));
-    if (!existing || existing.length === 0) {
+    const existing = seedLocalCurrency ? storage.get(new TextEncoder().encode(treasuryKey)) : undefined;
+    if (!seedLocalCurrency) {
+      this.currentSupply = 0n;
+    } else if (!existing || existing.length === 0) {
       const amount = config.nativeCurrency.initialTreasurySupply;
       const buffer = new ArrayBuffer(8);
       new DataView(buffer).setBigUint64(0, amount, true);
@@ -897,6 +928,11 @@ export class SpacekitVm {
     value: bigint = 0n,
     txId?: string
   ): Promise<Receipt> {
+    if (value > 0n && this.currency === "chain") {
+      throw new LocalCurrencyError(
+        "value is paid on the chain: submit this call with ChainClient, not the local VM",
+      );
+    }
     const contract = this.getContract(contractId);
     contract.setCaller(callerDid);
     contract.context.msgValue = value;
@@ -998,8 +1034,17 @@ export class SpacekitVm {
       throw new Error(`Gas limit exceeded: ${gasEstimate} > ${this.gasPolicy.gasLimit}`);
     }
 
-    this.chargeFeeOrThrow(callerDid, input.length);
-    this.transferValueOrThrow(callerDid, contractId, value);
+    if (this.currency === "chain") {
+      // Fees and value are chain matters; a local transaction moves neither.
+      if (value > 0n) {
+        throw new LocalCurrencyError(
+          "value is paid on the chain: submit this call with ChainClient, not the local VM",
+        );
+      }
+    } else {
+      this.chargeFeeOrThrow(callerDid, input.length);
+      this.transferValueOrThrow(callerDid, contractId, value);
+    }
     
     // Increment nonce after successful submission
     this.nonceByDid.set(callerDid, nonce + 1);
@@ -1759,7 +1804,11 @@ export class SpacekitVm {
       if (entry.valueHex.startsWith("h256:")) {
         continue;
       }
-      storage.set(hexToBytes(entry.keyHex), hexToBytes(entry.valueHex));
+      const key = hexToBytes(entry.keyHex);
+      if (this.currency === "chain" && isLocalCurrencyKey(key)) {
+        continue;
+      }
+      storage.set(key, hexToBytes(entry.valueHex));
     }
   }
 
@@ -1772,7 +1821,11 @@ export class SpacekitVm {
       if (entry.valueHex.startsWith("h256:")) {
         continue;
       }
-      storage.set(hexToBytes(entry.keyHex), hexToBytes(entry.valueHex));
+      const key = hexToBytes(entry.keyHex);
+      if (this.currency === "chain" && isLocalCurrencyKey(key)) {
+        continue;
+      }
+      storage.set(key, hexToBytes(entry.valueHex));
     }
   }
 

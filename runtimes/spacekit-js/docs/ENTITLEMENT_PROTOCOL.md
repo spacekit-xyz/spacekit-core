@@ -35,13 +35,26 @@ Deployed at `spacekit-standard-library/marketplace/astra-entitlement-ledger`.
 
 | Op | Code | Input | Output |
 |----|------|-------|--------|
-| `CREATE_LISTING` | `0x01` | `[op][listing_id:str][file_id:str][price:u64le][token:str][pricing_type:u8][period:u64le]` | `[1]` |
+| `CREATE_LISTING` | `0x01` | `[op][listing_id:str][file_id:str][price:u128le][token:str][pricing_type:u8][period:u64le]` | `[1]` |
 | `PURCHASE` | `0x02` | `[op][listing_id:str][buyer_pk_hash:32]` (+ `msg_value >= price`) | `[1][entitlement_id:32]` |
 | `VERIFY` | `0x03` | `[op][entitlement_id:32][buyer_did:str][file_id:str][buyer_pk_hash:32]` | `[1][status:u8]` |
 | `REVOKE` | `0x04` | `[op][entitlement_id:32]` | `[1]` |
 | `GET_LISTING` | `0x05` | `[op][listing_id:str]` | `[1][listing_record]` |
 | `GET_ENTITLEMENT` | `0x06` | `[op][entitlement_id:32]` | `[1][entitlement_record]` |
 | `GRANT` | `0x07` | `[op][listing_id:str][recipient_did:str][buyer_pk_hash:32]` | `[1][entitlement_id:32]` |
+| `VERIFY_LISTING` | `0x08` | `[op][entitlement_id:32][buyer_did:str][listing_id:str][buyer_pk_hash:32]` | `[1][status:u8]` |
+| `RENEW` | `0x09` | `[op][entitlement_id:32]` (+ value `>= price`) | `[1][expires_at:u64le]` |
+
+Amounts are native ASTRA in wei (u128). The ledger runs on the chain:
+
+- **Payments.** The whole payment is forwarded to the publisher's address (the address in their `did:spacekit:<hex>`), and the contract keeps nothing.
+- **Value.** Value attached to any operation other than `PURCHASE` or `RENEW` is refused.
+- **Time.** Expiry uses the block's timestamp.
+- **Entitlement ids.** These include a per-buyer sequence number, so two purchases in one block get distinct ids.
+
+**Checking an entitlement.** Use `VERIFY_LISTING` with the listing you trust, and check that listing's publisher with `GET_LISTING`. Anyone can create a listing under any unused id or for any file id, so `VERIFY` (by file id) alone can be satisfied by a listing the content owner never made. An all-zero `buyer_pk_hash` in `VERIFY_LISTING` skips the key check (for callers that authenticate the buyer's DID themselves).
+
+Status `6` = wrong listing.
 
 String encoding: `[len:u16le][utf8_bytes]`.
 

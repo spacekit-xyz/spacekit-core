@@ -92,6 +92,10 @@ impl PaymentReceipt {
 /// A verified credit ready to be applied to a VM balance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credit {
+    /// Whose ASTRA pays for this credit. ASTRA is never created by a
+    /// payment: for an ASTRA payment this is the payer; for a USD (USDC/aUSD)
+    /// payment it is the treasury, which sells ASTRA for the USD received.
+    pub payer_did: String,
     /// DID or address that should receive the credit in the VM.
     pub beneficiary_did: String,
     /// Amount in the smallest unit of the VM token (ASTRA wei).

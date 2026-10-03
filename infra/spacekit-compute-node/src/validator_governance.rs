@@ -355,6 +355,17 @@ pub struct PoaGenesis {
     /// Days authorities keep producing unstaked after the lift (default 30).
     #[serde(default)]
     pub pos_grace_days: Option<u64>,
+    /// Treasury multisig (signers and threshold), written into the treasury
+    /// contract's storage at genesis.
+    #[serde(default)]
+    pub treasury: Option<TreasuryGenesis>,
+}
+
+/// M-of-N signers of the treasury contract (`0x…0004`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreasuryGenesis {
+    pub threshold: u64,
+    pub signer_dids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,6 +967,7 @@ pub struct ValidatorGovernance {
     /// Initial state from the PoA genesis file (installed at height 0).
     genesis: Option<GovernanceState>,
     staking_params: crate::staking::StakingParams,
+    treasury_genesis: Option<TreasuryGenesis>,
     vm: std::sync::OnceLock<Arc<crate::spacekitvm::SwtchvmNode>>,
     coordinator: Arc<ConsensusCoordinator>,
     /// DIDs this node registered with the coordinator.
@@ -985,6 +997,7 @@ impl ValidatorGovernance {
         genesis_path: Option<&Path>,
         coordinator: Arc<ConsensusCoordinator>,
     ) -> Result<Self> {
+        let mut treasury_genesis = None;
         let (genesis, staking_params) = match genesis_path {
             Some(path) => {
                 let raw = std::fs::read_to_string(path)
@@ -999,6 +1012,12 @@ impl ValidatorGovernance {
                     );
                 }
                 let staking = genesis.staking.clone().unwrap_or_default();
+                if let Some(t) = &genesis.treasury {
+                    if t.threshold == 0 || t.threshold as usize > t.signer_dids.len() {
+                        bail!("treasury threshold must be between 1 and the number of signers");
+                    }
+                    treasury_genesis = Some(t.clone());
+                }
                 // Genesis timestamps are fixed (0) so every node installs
                 // byte-identical state.
                 let state = GovernanceState::from_genesis(&genesis, 0)?;
@@ -1015,6 +1034,7 @@ impl ValidatorGovernance {
             network: network.to_string(),
             genesis,
             staking_params,
+            treasury_genesis,
             vm: std::sync::OnceLock::new(),
             coordinator,
             registered: tokio::sync::Mutex::new(Default::default()),
@@ -1024,8 +1044,12 @@ impl ValidatorGovernance {
     /// Connect to the chain; installs the genesis state at height 0.
     pub async fn attach_vm(&self, vm: Arc<crate::spacekitvm::SwtchvmNode>) -> Result<()> {
         if let Some(genesis) = &self.genesis {
-            vm.init_consensus_genesis(genesis.clone(), self.staking_params.clone())
-                .await?;
+            vm.init_consensus_genesis(
+                genesis.clone(),
+                self.staking_params.clone(),
+                self.treasury_genesis.clone(),
+            )
+            .await?;
         }
         let _ = self.vm.set(vm);
         Ok(())
@@ -1135,6 +1159,15 @@ impl ValidatorGovernance {
     /// Check a stake message and queue it for the next block.
     pub async fn submit_stake(&self, stake: crate::staking::SignedStake) -> Result<String, String> {
         self.queue(crate::chain_consensus::ConsensusMessage::Stake { stake })
+            .await
+    }
+
+    /// Check a SPHINCS+-signed native transfer and queue it for the next block.
+    pub async fn submit_transfer(
+        &self,
+        transfer: crate::chain_consensus::SignedTransfer,
+    ) -> Result<String, String> {
+        self.queue(crate::chain_consensus::ConsensusMessage::Transfer { transfer })
             .await
     }
 
@@ -1459,6 +1492,26 @@ pub mod http {
                 Ok::<_, warp::Rejection>(reply)
             });
 
+        // POST /v1/transfer  { body_json, signature_hex } — native ASTRA from
+        // the address of a SPHINCS+ DID (see chain_consensus::TransferBody).
+        let transfer_route = warp::path!("v1" / "transfer")
+            .and(warp::post())
+            .and(warp::body::content_length_limit(MAX_BODY_BYTES))
+            .and(warp::body::json::<crate::chain_consensus::SignedTransfer>())
+            .and(with_gov.clone())
+            .and_then(
+                |transfer: crate::chain_consensus::SignedTransfer, gov: Arc<ValidatorGovernance>| async move {
+                    let reply = match gov.submit_transfer(transfer).await {
+                        Ok(tx) => json_status(
+                            serde_json::json!({ "status": "queued", "tx_hash": tx }),
+                            StatusCode::ACCEPTED,
+                        ),
+                        Err(e) => json_status(serde_json::json!({ "error": e }), StatusCode::BAD_REQUEST),
+                    };
+                    Ok::<_, warp::Rejection>(reply)
+                },
+            );
+
         // GET /v1/governance/export — every signed proposal and vote, so a
         // relay or a lagging node can replay them.
         let export_route = warp::path!("v1" / "governance" / "export")
@@ -1506,6 +1559,8 @@ pub mod http {
             .unify()
             .or(stake_route)
             .unify()
+            .or(transfer_route)
+            .unify()
             .boxed()
     }
 }
@@ -1547,6 +1602,7 @@ mod tests {
                 block_production: None,
                 staking: None,
                 pos_grace_days: None,
+                treasury: None,
                 authorities: ops
                     .iter()
                     .map(|o| GenesisAuthority {
@@ -1776,6 +1832,7 @@ mod tests {
             block_production: None,
             staking: None,
             pos_grace_days: None,
+            treasury: None,
             authorities: vec![GenesisAuthority {
                 did: "did:spacekit:testnet:0000".into(),
                 sphincs_pk_hex: hex::encode(&o.pk),

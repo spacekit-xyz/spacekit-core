@@ -1,5 +1,5 @@
 import type { StorageNodeAdapter } from "../storage.js";
-import type { SpaceTimeThread, SpaceTimePost, SpaceTimeAgentProfile } from "./storage_contract_types";
+import type { SpaceTimeThread, SpaceTimePost, SpaceTimeAgentProfile } from "./storage_contract_types.js";
 
 type ContractCall = <T>(address: string, method: string, args: unknown[]) => Promise<T>;
 

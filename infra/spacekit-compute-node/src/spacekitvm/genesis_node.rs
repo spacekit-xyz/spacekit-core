@@ -138,7 +138,8 @@ pub struct NetworkConstants {
 pub mod system_contracts {
     pub const FAUCET: &str = "0x0000000000000000000000000000000000000001";
     pub const DID_REGISTRY: &str = "0x0000000000000000000000000000000000000002";
-    /// AstraRewards SKCL contract (SRA CREDIT target).
+    /// Rewards system address (SRA CREDIT target). Executed natively by the
+    /// node (`native_rewards`); holds no code and no balance.
     pub const ASTRA_REWARDS: &str = "0x0000000000000000000000000000000000000003";
     /// Treasury SKCL contract (M-of-N governed pool). This address also acts as
     /// the native custodian of the pool: the host bridge moves disbursed funds
@@ -153,30 +154,6 @@ fn load_did_registry_wasm() -> Option<Vec<u8>> {
         "spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_did_registry.wasm",
         "../spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_did_registry.wasm",
     ], "DID registry")
-}
-
-fn load_astra_rewards_wasm() -> Option<Vec<u8>> {
-    // Explicit path wins (devnets and CI point this at a fresh build).
-    if let Ok(path) = std::env::var("SPACEKIT_ASTRA_REWARDS_WASM") {
-        if !path.trim().is_empty() {
-            match std::fs::read(path.trim()) {
-                Ok(bytes) => {
-                    tracing::info!("Loaded AstraRewards WASM from {} ({} bytes)", path.trim(), bytes.len());
-                    return Some(bytes);
-                }
-                Err(e) => tracing::warn!("SPACEKIT_ASTRA_REWARDS_WASM={}: {e}", path.trim()),
-            }
-        }
-    }
-    load_system_wasm(
-        &[
-            "spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
-            "../spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
-            "sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
-            "../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_rewards.wasm",
-        ],
-        "AstraRewards",
-    )
 }
 
 fn load_treasury_wasm() -> Option<Vec<u8>> {
@@ -196,11 +173,8 @@ pub fn install_system_contracts(state: &mut crate::spacekitvm::swtchvm_node::Swt
         system_contracts::DID_REGISTRY,
         load_did_registry_wasm(),
     );
-    install_contract_if_missing(
-        state,
-        system_contracts::ASTRA_REWARDS,
-        load_astra_rewards_wasm(),
-    );
+    // 0x…0003 (rewards) has no contract code: the node executes reward
+    // system calls itself and mints into native balances (`native_rewards`).
     install_contract_if_missing(state, system_contracts::TREASURY, load_treasury_wasm());
 }
 
@@ -259,13 +233,13 @@ impl Default for GenesisConfig {
             },
         );
 
-        // AstraRewards — per-DID balances; SRA submits CREDIT here
+        // Rewards system address: executed natively, no code, no balance.
         alloc.insert(
             system_contracts::ASTRA_REWARDS.to_string(),
             GenesisAccount {
                 balance: 0,
                 nonce: 0,
-                code: load_astra_rewards_wasm(),
+                code: None,
                 storage: None,
                 account_type: AccountType::System,
             },

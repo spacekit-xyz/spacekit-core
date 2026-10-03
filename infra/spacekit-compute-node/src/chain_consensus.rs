@@ -46,6 +46,96 @@ pub enum ConsensusMessage {
     GovernanceProposal { proposal: SignedProposal },
     GovernanceVote { vote: SignedVote },
     Stake { stake: SignedStake },
+    /// Native ASTRA transfer from the address of a SPHINCS+ DID (whose
+    /// address has no k256 key to sign ordinary transactions with).
+    Transfer { transfer: SignedTransfer },
+}
+
+/// A SPHINCS+-signed native transfer. `body_json` is a [`TransferBody`];
+/// the signature covers `SPACEKIT-PQ-TRANSFER-v1\n{body_json}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedTransfer {
+    pub body_json: String,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferBody {
+    pub version: u32,
+    pub network: String,
+    pub did: String,
+    pub sphincs_pk_hex: String,
+    /// Recipient address, `0x` + 40 hex.
+    pub to: String,
+    pub amount_wei: String,
+    /// Must equal the sending address's account nonce.
+    pub nonce: u64,
+}
+
+pub const TRANSFER_DOMAIN: &str = "SPACEKIT-PQ-TRANSFER-v1";
+/// Burned per SPHINCS+ transfer (consensus transactions pay no gas, so this
+/// is what keeps them from being free): 0.001 ASTRA.
+pub const PQ_TRANSFER_FEE_WEI: u128 = 1_000_000_000_000_000;
+
+pub fn transfer_signing_payload(body_json: &str) -> Vec<u8> {
+    format!("{TRANSFER_DOMAIN}\n{body_json}").into_bytes()
+}
+
+/// Check a transfer against the state: `(from, to, amount)`.
+fn check_transfer(
+    state: &SwtchvmState,
+    network: &str,
+    t: &SignedTransfer,
+) -> Result<(SwtchvmAddress, SwtchvmAddress, u128), String> {
+    let body: TransferBody = serde_json::from_str(&t.body_json)
+        .map_err(|e| format!("body_json is not a transfer: {e}"))?;
+    if body.version != 1 {
+        return Err(format!("unsupported transfer version {}", body.version));
+    }
+    if body.network != network {
+        return Err(format!("transfer is for network {:?}, this chain is {network:?}", body.network));
+    }
+    let pk = hex::decode(body.sphincs_pk_hex.trim()).map_err(|_| "sphincs_pk_hex is not hex")?;
+    if !crate::validator_governance::did_matches_key(&body.did, &pk) {
+        return Err(format!("{} is not derived from sphincs_pk_hex", body.did));
+    }
+    let signature = hex::decode(t.signature_hex.trim()).map_err(|_| "signature_hex is not hex")?;
+    if !sphincs_verify(&pk, &transfer_signing_payload(&t.body_json), &signature) {
+        return Err("bad SPHINCS+ signature".into());
+    }
+    let from = crate::native_rewards::did_address(&body.did).ok_or("DID has no address")?;
+    let to_hex = body.to.trim().strip_prefix("0x").unwrap_or(body.to.trim());
+    if to_hex.len() != 40 || !to_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("to must be a 20-byte hex address".into());
+    }
+    let to = SwtchvmAddress::from_hex(to_hex).map_err(|e| e.to_string())?;
+    let amount: u128 = body.amount_wei.trim().parse().map_err(|_| "amount_wei is not a whole number")?;
+    if amount == 0 {
+        return Err("amount_wei must be positive".into());
+    }
+    let (nonce, balance) = state.get_account(&from).map(|a| (a.nonce, a.balance)).unwrap_or((0, 0));
+    if body.nonce != nonce {
+        return Err(format!("nonce {} expected, got {}", nonce, body.nonce));
+    }
+    let required = amount.checked_add(PQ_TRANSFER_FEE_WEI).ok_or("amount too large")?;
+    if balance < required {
+        return Err(format!("balance {balance} wei is below {required} wei (amount plus fee)"));
+    }
+    Ok((from, to, amount))
+}
+
+fn apply_transfer(state: &mut SwtchvmState, network: &str, t: &SignedTransfer) -> Result<String, String> {
+    let (from, to, amount) = check_transfer(state, network, t)?;
+    let sender = state.get_account_mut(&from);
+    sender.nonce += 1;
+    sender.balance -= amount + PQ_TRANSFER_FEE_WEI;
+    let recipient = state.get_account_mut(&to);
+    recipient.balance = recipient.balance.saturating_add(amount);
+    Ok(format!(
+        "transfer {amount} wei 0x{} -> 0x{}",
+        hex::encode(from.as_bytes()),
+        hex::encode(to.as_bytes())
+    ))
 }
 
 impl ConsensusMessage {
@@ -136,26 +226,38 @@ pub fn init_genesis(state: &mut SwtchvmState, governance: GovernanceState, staki
     );
 }
 
-/// What a DID holds in AstraRewards: spendable plus locked-but-unreleased.
+/// Write the treasury multisig into the treasury contract's storage (the
+/// keys `spacekit-treasury` reads). Genesis only; signers are DID hashes as
+/// the contract SDK computes them.
+pub fn init_treasury(state: &mut SwtchvmState, t: &crate::validator_governance::TreasuryGenesis) {
+    let treasury = crate::native_rewards::treasury_address();
+    if state.kv_get(&treasury, b"treasury.initialized").is_some() {
+        return;
+    }
+    for (i, did) in t.signer_dids.iter().enumerate() {
+        let hash = spacekit_service_rewards::hash_did_bytes(did.trim().as_bytes());
+        state.kv_insert(treasury, format!("treasury.signer.{i}").into_bytes(), hash.to_vec());
+        state.kv_insert(
+            treasury,
+            format!("treasury.is_signer.{}", hex::encode(hash)).into_bytes(),
+            vec![1],
+        );
+    }
+    state.kv_insert(treasury, b"treasury.threshold".to_vec(), t.threshold.to_le_bytes().to_vec());
+    state.kv_insert(
+        treasury,
+        b"treasury.signer_count".to_vec(),
+        (t.signer_dids.len() as u64).to_le_bytes().to_vec(),
+    );
+    state.kv_insert(treasury, b"treasury.initialized".to_vec(), vec![1]);
+}
+
+/// What a DID holds: the native balance of the address in its DID plus any
+/// locked, unreleased rewards. DIDs without an address hold nothing.
 pub fn astra_holdings_wei(state: &SwtchvmState, did: &str) -> u128 {
-    let Ok(contract) = SwtchvmAddress::from_hex(
-        crate::spacekitvm::genesis_node::system_contracts::ASTRA_REWARDS,
-    ) else {
-        return 0;
-    };
-    let hash = hex::encode(spacekit_service_rewards::hash_did_bytes(did.as_bytes()));
-    let read = |prefix: &str| -> u128 {
-        state
-            .kv_get(&contract, format!("{prefix}{hash}").as_bytes())
-            .and_then(|v| v.get(..16))
-            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-            .map(u128::from_le_bytes)
-            .unwrap_or(0)
-    };
-    let balance = read("astra_rewards.balance.");
-    let locked = read("astra_rewards.locked.");
-    let released = read("astra_rewards.released.");
-    balance.saturating_add(locked.saturating_sub(released))
+    crate::native_rewards::did_address(did)
+        .map(|a| crate::native_rewards::holdings_wei(state, &a))
+        .unwrap_or(0)
 }
 
 /// Stake-weighted electorate: active validators by effective stake (whole
@@ -189,6 +291,7 @@ pub fn stake_electorate(state: &SwtchvmState, cs: &ConsensusState, now: u64) -> 
 /// Deterministic transitions at the start of every block: expire proposals,
 /// release matured unbonding, refresh the stake electorate after the lift.
 pub fn begin_block(state: &mut SwtchvmState, now: u64) {
+    crate::native_rewards::release_vested(state, now);
     let Some(mut cs) = load(state) else { return };
     cs.governance.expire(now as i64);
     cs.staking.mature(now);
@@ -202,12 +305,19 @@ pub fn begin_block(state: &mut SwtchvmState, now: u64) {
 /// admission). The block that includes it applies it again for real.
 pub fn validate(state: &SwtchvmState, msg: &ConsensusMessage, now: u64) -> Result<(), String> {
     let mut scratch = load(state).ok_or("this chain has no proof-of-authority genesis")?;
+    if let ConsensusMessage::Transfer { transfer } = msg {
+        return check_transfer(state, &scratch.governance.network, transfer).map(|_| ());
+    }
     apply_to(state, &mut scratch, msg, now).map(|_| ())
 }
 
 /// Apply a message in a block. On error nothing changes.
 pub fn apply(state: &mut SwtchvmState, msg: &ConsensusMessage, now: u64) -> Result<String, String> {
     let mut cs = load(state).ok_or("this chain has no proof-of-authority genesis")?;
+    if let ConsensusMessage::Transfer { transfer } = msg {
+        let network = cs.governance.network.clone();
+        return apply_transfer(state, &network, transfer);
+    }
     let summary = apply_to(state, &mut cs, msg, now)?;
     // The lift can change the electorate right away.
     if cs.governance.mode == ConsensusMode::ProofOfStake {
@@ -255,6 +365,7 @@ fn apply_to(
                 }
             }
         }
+        ConsensusMessage::Transfer { .. } => Err("transfers are applied directly".into()),
         ConsensusMessage::Stake { stake } => {
             let network = cs.governance.network.clone();
             cs.staking.apply(
@@ -527,15 +638,74 @@ mod tests {
     }
 
     fn give_astra(state: &mut SwtchvmState, did: &str, astra: u128) {
-        let contract =
-            SwtchvmAddress::from_hex(crate::spacekitvm::genesis_node::system_contracts::ASTRA_REWARDS)
-                .unwrap();
-        let hash = hex::encode(spacekit_service_rewards::hash_did_bytes(did.as_bytes()));
-        state.kv_insert(
-            contract,
-            format!("astra_rewards.locked.{hash}").into_bytes(),
-            (astra * WEI_PER_ASTRA).to_le_bytes().to_vec(),
+        let address = crate::native_rewards::did_address(did).unwrap();
+        // Sets (not adds) what the DID holds.
+        state.get_account_mut(&address).balance = astra * WEI_PER_ASTRA;
+    }
+
+    fn transfer(k: &Key, to: &str, amount_astra: u128, nonce: u64) -> ConsensusMessage {
+        let body_json = serde_json::json!({
+            "version": 1, "network": "testnet", "did": k.did,
+            "sphincs_pk_hex": hex::encode(&k.pk), "to": to,
+            "amount_wei": (amount_astra * WEI_PER_ASTRA).to_string(), "nonce": nonce,
+        })
+        .to_string();
+        let signature_hex = sign(k, &transfer_signing_payload(&body_json));
+        ConsensusMessage::Transfer {
+            transfer: SignedTransfer { body_json, signature_hex },
+        }
+    }
+
+    /// A SPHINCS+ DID spends from its address with a signed transfer: nonce
+    /// and fee apply, a replay or someone else's signature is refused.
+    #[test]
+    fn sphincs_dids_spend_native_balance() {
+        let holder = key();
+        let other = key();
+        let genesis = crate::validator_governance::PoaGenesis {
+            network: "testnet".into(),
+            min_validators_to_lift: Some(1),
+            authorities: vec![crate::validator_governance::GenesisAuthority {
+                did: holder.did.clone(),
+                sphincs_pk_hex: hex::encode(&holder.pk),
+                name: None,
+            }],
+            block_production: None,
+            staking: None,
+            pos_grace_days: None,
+            treasury: None,
+        };
+        let mut state = SwtchvmState::new();
+        init_genesis(
+            &mut state,
+            GovernanceState::from_genesis(&genesis, 0).unwrap(),
+            StakingParams::default(),
         );
+        give_astra(&mut state, &holder.did, 10);
+        let from = crate::native_rewards::did_address(&holder.did).unwrap();
+        let to = "0x00000000000000000000000000000000000000aa";
+        let to_addr = SwtchvmAddress::from_hex(to).unwrap();
+        let supply = state.total_supply();
+
+        let msg = transfer(&holder, to, 3, 0);
+        validate(&state, &msg, 1).unwrap();
+        apply(&mut state, &msg, 1).unwrap();
+        assert_eq!(state.get_account(&to_addr).unwrap().balance, 3 * WEI_PER_ASTRA);
+        assert_eq!(
+            state.get_account(&from).unwrap().balance,
+            7 * WEI_PER_ASTRA - PQ_TRANSFER_FEE_WEI
+        );
+        assert_eq!(state.total_supply(), supply - PQ_TRANSFER_FEE_WEI, "only the fee is burned");
+
+        assert!(apply(&mut state, &msg, 1).is_err(), "replay");
+        assert!(apply(&mut state, &transfer(&holder, to, 100, 1), 1).is_err(), "more than held");
+        // Someone else's key cannot spend the holder's address.
+        let mut forged = transfer(&other, to, 1, 1);
+        if let ConsensusMessage::Transfer { transfer } = &mut forged {
+            transfer.body_json = transfer.body_json.replace(&other.did, &holder.did);
+        }
+        assert!(apply(&mut state, &forged, 1).is_err());
+        apply(&mut state, &transfer(&holder, to, 1, 1), 1).unwrap();
     }
 
     /// PoA governance on chain, staking from locked earnings, the lift, the
@@ -558,6 +728,7 @@ mod tests {
                 unbonding_secs: 100,
             }),
             pos_grace_days: Some(0),
+            treasury: None,
         };
         let gov = GovernanceState::from_genesis(&genesis, 0).unwrap();
         let mut state = SwtchvmState::new();
@@ -649,6 +820,7 @@ mod tests {
             block_production: None,
             staking: None,
             pos_grace_days: None,
+            treasury: None,
         };
         let mut state = SwtchvmState::new();
         init_genesis(&mut state, GovernanceState::from_genesis(&genesis, 0).unwrap(), StakingParams::default());

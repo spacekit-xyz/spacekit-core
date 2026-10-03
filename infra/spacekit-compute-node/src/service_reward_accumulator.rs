@@ -32,8 +32,6 @@ use crate::spacekitvm::{
 /// counted against the block gas limit.
 pub const SYSTEM_TX_GAS_LIMIT: u128 = 1_000_000;
 
-const KEY_INITIALIZED: &[u8] = b"astra_rewards.is_initialized";
-const KEY_PHASE: &[u8] = b"astra_rewards.phase";
 
 /// Configuration for SRA block hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,71 +326,48 @@ impl SraHost {
                 parse_address(&self.config.sra_admin_address),
             ) {
                 (Ok(contract), Ok(admin)) => {
-                    let deployed = world
-                        .get_account(&contract)
-                        .is_some_and(|a| a.code.is_some());
-                    if deployed {
-                        let initialized = world
-                            .contract_kv
-                            .contains_key(&(contract, KEY_INITIALIZED.to_vec()));
-                        let phase_is_poa = if initialized {
-                            world
-                                .contract_kv
-                                .get(&(contract, KEY_PHASE.to_vec()))
-                                .and_then(|v| v.first().copied())
-                                == Some(0)
-                        } else {
-                            // INIT starts the contract in proof of authority.
-                            true
-                        };
-                        let mut payloads = Vec::new();
-                        if !initialized && (!credits.is_empty() || !policy.proof_of_authority) {
-                            payloads.push(encode_init(treasury_did_hash()));
-                        }
-                        let will_be_initialized = initialized || !payloads.is_empty();
-                        if will_be_initialized && !policy.proof_of_authority && phase_is_poa {
-                            payloads.push(encode_end_poa());
-                        }
-                        for (c, locked) in &credits {
-                            if c.amount_wei == 0 {
-                                continue;
-                            }
-                            payloads.push(if *locked {
-                                encode_credit_locked(
-                                    c.recipient_did_hash,
-                                    c.amount_wei,
-                                    c.log_event_hash,
-                                )
-                            } else {
-                                encode_credit(c.recipient_did_hash, c.amount_wei, c.log_event_hash)
-                            });
-                        }
-                        let base_nonce = world.get_account(&admin).map(|a| a.nonce).unwrap_or(0);
-                        system_txs = payloads
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, data)| SwtchvmTransaction {
-                                from: admin,
-                                to: Some(contract),
-                                data,
-                                gas_limit: SYSTEM_TX_GAS_LIMIT,
-                                gas_price: 0,
-                                value: 0,
-                                nonce: base_nonce + i as u64,
-                                signature: TransactionSignature {
-                                    v: 0,
-                                    r: [0u8; 32],
-                                    s: [0u8; 32],
-                                },
-                            })
-                            .collect();
-                    } else if !credits.is_empty() {
-                        tracing::warn!(
-                            block_number,
-                            contract = %self.config.astra_rewards_contract,
-                            "AstraRewards is not deployed; settled credits are recorded but not applied"
-                        );
+                    // Rewards are executed natively (`native_rewards`) and
+                    // mint into native balances; its state is in chain state.
+                    let initialized = crate::native_rewards::is_initialized(world);
+                    let phase_is_poa =
+                        crate::native_rewards::phase(world) == crate::native_rewards::PHASE_POA;
+                    let mut payloads = Vec::new();
+                    if !initialized && (!credits.is_empty() || !policy.proof_of_authority) {
+                        payloads.push(encode_init(treasury_did_hash()));
                     }
+                    let will_be_initialized = initialized || !payloads.is_empty();
+                    if will_be_initialized && !policy.proof_of_authority && phase_is_poa {
+                        payloads.push(encode_end_poa());
+                    }
+                    for (c, locked) in &credits {
+                        if c.amount_wei == 0 {
+                            continue;
+                        }
+                        payloads.push(if *locked {
+                            encode_credit_locked(c.recipient_did_hash, c.amount_wei, c.log_event_hash)
+                        } else {
+                            encode_credit(c.recipient_did_hash, c.amount_wei, c.log_event_hash)
+                        });
+                    }
+                    let base_nonce = world.get_account(&admin).map(|a| a.nonce).unwrap_or(0);
+                    system_txs = payloads
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, data)| SwtchvmTransaction {
+                            from: admin,
+                            to: Some(contract),
+                            data,
+                            gas_limit: SYSTEM_TX_GAS_LIMIT,
+                            gas_price: 0,
+                            value: 0,
+                            nonce: base_nonce + i as u64,
+                            signature: TransactionSignature {
+                                v: 0,
+                                r: [0u8; 32],
+                                s: [0u8; 32],
+                            },
+                        })
+                        .collect();
                 }
                 _ => tracing::warn!("invalid SRA contract or admin address; credits not applied"),
             }
@@ -482,20 +457,25 @@ impl SraHost {
     /// settlements, and the spendable/locked balances of their recipients
     /// (read straight from contract storage, no transaction).
     pub async fn status_json(&self, world: &SwtchvmState) -> serde_json::Value {
-        let contract = parse_address(&self.config.astra_rewards_contract).ok();
-        let kv_u128 = |key: String| -> Option<u128> {
-            let contract = contract?;
-            let raw = world.contract_kv.get(&(contract, key.into_bytes()))?;
-            let bytes: [u8; 16] = raw.get(..16)?.try_into().ok()?;
-            Some(u128::from_le_bytes(bytes))
-        };
-        let initialized = contract.is_some_and(|c| {
-            world.contract_kv.contains_key(&(c, KEY_INITIALIZED.to_vec()))
+        use crate::native_rewards as nr;
+        let initialized = nr::is_initialized(world);
+        let phase = initialized.then(|| {
+            if nr::phase(world) == nr::PHASE_POA { "proof_of_authority" } else { "proof_of_stake" }
         });
-        let phase = contract
-            .and_then(|c| world.contract_kv.get(&(c, KEY_PHASE.to_vec())).cloned())
-            .and_then(|v| v.first().copied())
-            .map(|p| if p == 0 { "proof_of_authority" } else { "proof_of_stake" });
+        // Balances are native: the recipient key designates an address.
+        let address_of = |hex_key: &str| -> Option<SwtchvmAddress> {
+            let bytes: [u8; 32] = hex::decode(hex_key).ok()?.try_into().ok()?;
+            nr::key_address(&bytes)
+        };
+        let balance_of = |hex_key: &str| -> Option<u128> {
+            address_of(hex_key).map(|a| world.get_account(&a).map(|x| x.balance).unwrap_or(0))
+        };
+        let locked_of = |hex_key: &str| -> Option<u128> {
+            address_of(hex_key).map(|a| {
+                let (locked, released) = nr::lock_position(world, &a);
+                locked.saturating_sub(released)
+            })
+        };
         let log = self.credits_by_block.read().await;
         let recent: Vec<serde_json::Value> = log
             .iter()
@@ -512,8 +492,8 @@ impl SraHost {
                         "amount_wei": c.amount_wei,
                         "locked": c.locked,
                         "onchain_ok": c.onchain_ok,
-                        "balance_wei": kv_u128(format!("astra_rewards.balance.{}", c.recipient_did_hash_hex)).map(|v| v.to_string()),
-                        "locked_wei": kv_u128(format!("astra_rewards.locked.{}", c.recipient_did_hash_hex)).map(|v| v.to_string()),
+                        "balance_wei": balance_of(&c.recipient_did_hash_hex).map(|v| v.to_string()),
+                        "locked_wei": locked_of(&c.recipient_did_hash_hex).map(|v| v.to_string()),
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -531,7 +511,8 @@ impl SraHost {
                 "address": self.config.astra_rewards_contract,
                 "initialized": initialized,
                 "phase": phase,
-                "total_emitted_wei": kv_u128("astra_rewards.total_emitted".to_string()).map(|v| v.to_string()),
+                "total_emitted_wei": initialized.then(|| nr::total_emitted(world).to_string()),
+                "ledger": "native",
             },
             "recent_settlements": recent,
         })
@@ -592,7 +573,10 @@ fn proposer_event(block_number: u64, proposer_did: Option<&str>) -> Option<Servi
     log_hash[0..8].copy_from_slice(&block_number.to_le_bytes());
     log_hash[8..16].copy_from_slice(b"proposer");
     Some(ServiceRewardEvent {
-        operator_did_hash: spacekit_service_rewards::hash_did_bytes(did.as_bytes()),
+        // Keyed by the proposer's address (the one in its DID), so the reward
+        // mints where the proposer can spend it.
+        operator_did_hash: crate::native_rewards::did_reward_key(did)
+            .unwrap_or_else(|| spacekit_service_rewards::hash_did_bytes(did.as_bytes())),
         category: ServiceCategory::Consensus,
         resource_units: 1,
         log_event_hash: log_hash,

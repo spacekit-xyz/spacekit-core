@@ -183,7 +183,7 @@ impl StakingState {
                     .saturating_add(amount);
                 if committed > holdings {
                     return Err(format!(
-                        "cannot bond {amount} wei: {} holds {holdings} wei in AstraRewards and has \
+                        "cannot bond {amount} wei: {} holds {holdings} wei (balance plus locked rewards) and has \
                          {} wei bonded or unbonding",
                         body.did,
                         v.bonded_wei.saturating_add(v.unbonding_wei())

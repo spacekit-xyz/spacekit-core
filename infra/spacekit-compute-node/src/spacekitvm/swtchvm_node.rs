@@ -61,6 +61,15 @@ const MAX_CONTRACT_TABLE_ELEMENTS: usize = 100_000;
 /// explicit means a gas limit maps to a predictable instruction budget.
 const FUEL_PER_GAS: u64 = 1;
 
+/// Gas budget of one read-only contract call (`view_call`): one block's worth.
+pub const VIEW_CALL_GAS_LIMIT: u128 = 10_000_000;
+
+/// Gas charged for a plain value transfer (no contract code runs).
+pub const PLAIN_TRANSFER_GAS: u128 = 21_000;
+
+/// Largest accepted body of a read-only contract call.
+const MAX_VIEW_CALL_BYTES: u64 = 64 * 1024;
+
 /// Translate a transaction gas limit into a wasmtime fuel budget.
 fn fuel_for_gas_limit(gas_limit: u128) -> u64 {
     let scaled = gas_limit.saturating_mul(FUEL_PER_GAS as u128);
@@ -480,6 +489,11 @@ impl Clone for SwtchvmState {
 }
 
 impl SwtchvmState {
+    /// Sum of all native balances: every ASTRA in existence.
+    pub fn total_supply(&self) -> u128 {
+        self.accounts.values().map(|a| a.balance).fold(0u128, u128::saturating_add)
+    }
+
     pub fn new() -> Self {
         Self {
             accounts: HashMap::new(),
@@ -1662,41 +1676,53 @@ impl SwtchvmRuntime {
     ) -> Result<SwtchvmExecutionResult> {
         let outcome: Result<SwtchvmExecutionResult> = async {
             let mut state = self.state.write().await;
-            let sender = state.get_account_mut(&tx.from);
-
-            if sender.nonce != tx.nonce {
+            // Checked without touching state: a transaction refused here is
+            // left out of the block, so it must not change anything.
+            let (nonce, balance) = state
+                .get_account(&tx.from)
+                .map(|a| (a.nonce, a.balance))
+                .unwrap_or((0, 0));
+            if nonce != tx.nonce {
                 return Err(anyhow::anyhow!("Invalid nonce"));
             }
-
-            let gas_cost = tx.gas_limit * tx.gas_price;
-            if sender.balance < gas_cost + tx.value {
+            let gas_cost = tx
+                .gas_limit
+                .checked_mul(tx.gas_price)
+                .ok_or_else(|| anyhow::anyhow!("Insufficient balance"))?;
+            let required = gas_cost
+                .checked_add(tx.value)
+                .ok_or_else(|| anyhow::anyhow!("Insufficient balance"))?;
+            if balance < required {
                 return Err(anyhow::anyhow!("Insufficient balance"));
             }
 
-            sender.nonce += 1;
-            sender.balance -= gas_cost;
+            // The nonce and the gas budget are always consumed.
+            {
+                let sender = state.get_account_mut(&tx.from);
+                sender.nonce += 1;
+                sender.balance -= gas_cost;
+            }
 
-            let inner = if let Some(to_address) = tx.to {
-                self.call_contract(&mut state, &tx.from, &to_address, &tx.data, context)
-                    .await
+            // Everything else is the transaction's effect, recorded in its own
+            // journal so a failure undoes all of it (value, contract writes).
+            let block_journal = std::mem::take(&mut state.journal);
+            let inner = self.apply_transaction_effects(&mut state, tx, context).await;
+            let failed = !matches!(&inner, Ok(result) if result.success);
+            if failed {
+                let (_, undo) = state.checkpoint();
+                state.revert(undo);
+                state.journal = block_journal;
             } else {
-                self.create_contract(&mut state, &tx.from, &tx.data, context)
-                    .await
-            };
+                let tx_journal = std::mem::replace(&mut state.journal, block_journal);
+                state.journal.absorb(tx_journal);
+            }
 
             match inner {
                 Ok(result) => {
-                    let gas_refund = (tx.gas_limit - result.gas_used) * tx.gas_price;
+                    let unused = tx.gas_limit.saturating_sub(result.gas_used);
+                    let refund = unused.saturating_mul(tx.gas_price);
                     let sender = state.get_account_mut(&tx.from);
-                    sender.balance += gas_refund;
-
-                    if tx.value > 0 {
-                        if let Some(to_address) = tx.to {
-                            let recipient = state.get_account_mut(&to_address);
-                            recipient.balance += tx.value;
-                        }
-                    }
-
+                    sender.balance = sender.balance.saturating_add(refund);
                     Ok(result)
                 }
                 Err(e) => Err(e),
@@ -1710,6 +1736,95 @@ impl SwtchvmRuntime {
 
         self.persist_state_if_configured().await;
         outcome
+    }
+
+    /// Move the transaction's value and run it. Value moves before a call
+    /// (so the contract sees it in its balance) and after a deployment (to the
+    /// new contract). A transaction to an address without code is a plain
+    /// transfer if it carries no data.
+    async fn apply_transaction_effects(
+        &self,
+        state: &mut SwtchvmState,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
+        let move_value = |state: &mut SwtchvmState, to: &SwtchvmAddress| {
+            if tx.value > 0 && *to != tx.from {
+                state.get_account_mut(&tx.from).balance -= tx.value;
+                let recipient = state.get_account_mut(to);
+                recipient.balance = recipient.balance.saturating_add(tx.value);
+            }
+        };
+        match tx.to {
+            Some(to) => {
+                let has_code = state.get_account(&to).is_some_and(|a| a.code.is_some());
+                if !has_code {
+                    if !tx.data.is_empty() {
+                        return Err(anyhow::anyhow!("No code at address"));
+                    }
+                    move_value(state, &to);
+                    return Ok(SwtchvmExecutionResult {
+                        success: true,
+                        return_data: Vec::new(),
+                        gas_used: PLAIN_TRANSFER_GAS.min(tx.gas_limit),
+                        compute_units: 0,
+                        memory_used: 0,
+                        storage_changes: HashMap::new(),
+                        logs: Vec::new(),
+                        created_address: None,
+                        pq_signature: None,
+                        pq_signer_did: None,
+                        tool_effects: Vec::new(),
+                    });
+                }
+                move_value(state, &to);
+                self.call_contract(state, &tx.from, &to, &tx.data, context).await
+            }
+            None => {
+                let result = self.create_contract(state, &tx.from, &tx.data, context).await?;
+                if let (true, Some(created)) = (result.success, result.created_address) {
+                    move_value(state, &created);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Read-only contract call: run `call_data` against the current state and
+    /// undo every change it made. No nonce, gas or balance is charged, nothing
+    /// is persisted, and the pending journal of a block being produced is left
+    /// exactly as it was (the call's own changes are folded into the
+    /// commitment and reverted, a net change of zero).
+    pub async fn view_call(
+        &self,
+        contract: &SwtchvmAddress,
+        call_data: &[u8],
+        block_number: u64,
+        block_timestamp: u64,
+    ) -> Result<SwtchvmExecutionResult> {
+        let mut state = self.state.write().await;
+        if state.get_account(contract).and_then(|a| a.code.as_ref()).is_none() {
+            return Err(anyhow::anyhow!("no contract at 0x{}", hex::encode(contract.as_bytes())));
+        }
+        let pending = std::mem::take(&mut state.journal);
+        let caller = SwtchvmAddress::new([0u8; 20]);
+        let context = SwtchvmContext {
+            caller,
+            origin: caller,
+            gas_price: 0,
+            gas_limit: VIEW_CALL_GAS_LIMIT,
+            gas_used: 0,
+            block_number,
+            block_timestamp,
+            value: 0,
+        };
+        let result = self
+            .call_contract(&mut state, &caller, contract, call_data, context)
+            .await;
+        let (_, undo) = state.checkpoint();
+        state.revert(undo);
+        state.journal = pending;
+        result
     }
 
     async fn call_contract(
@@ -3449,172 +3564,99 @@ impl SwtchvmRuntime {
     fn add_payment_host_functions(&self, linker: &mut Linker<SwtchvmStoreData>) -> Result<()> {
         eprintln!("💰 Registering payment host functions for service marketplace...");
 
-        // msg_value() - Get payment sent with this call
+        // Value is native ASTRA in wei (u128). The i64 forms saturate at
+        // i64::MAX; contracts handling large amounts use the `_u128` forms,
+        // which write 16 little-endian bytes.
+
+        // msg_value() - value attached to this call (saturating i64)
         linker.func_wrap(
             "env",
             "msg_value",
             |caller: Caller<'_, SwtchvmStoreData>| -> i64 {
-                let store_data = caller.data();
-                unsafe { (*store_data.context).value as i64 }
+                let value = unsafe { (*caller.data().context).value };
+                saturating_i64(value)
             },
         )?;
 
-        // get_balance(address_ptr) - Get balance of an address
+        // msg_value_u128(out_ptr) - value attached to this call; 0 ok, 1 error
+        linker.func_wrap(
+            "env",
+            "msg_value_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, out_ptr: i32| -> i32 {
+                let value = unsafe { (*caller.data().context).value };
+                write_u128(&mut caller, out_ptr, value)
+            },
+        )?;
+
+        // get_balance(address_ptr) - native balance of an address (saturating i64)
         linker.func_wrap(
             "env",
             "get_balance",
             |mut caller: Caller<'_, SwtchvmStoreData>, address_ptr: i32| -> i64 {
-                eprintln!("💰 get_balance called for address at ptr {}", address_ptr);
-
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return 0,
-                };
-
-                let memory_data = memory.data(&caller);
-
-                // Read 20-byte address
-                if (address_ptr as usize + 20) > memory_data.len() {
-                    eprintln!("❌ Address pointer out of bounds");
-                    return 0;
-                }
-
-                let mut addr_bytes = [0u8; 20];
-                addr_bytes
-                    .copy_from_slice(&memory_data[address_ptr as usize..address_ptr as usize + 20]);
-                let address = SwtchvmAddress::new(addr_bytes);
-
-                let store_data = caller.data();
-                unsafe {
-                    if let Some(account) = (*store_data.state).get_account(&address) {
-                        eprintln!("💰 Balance for {:?}: {}", address, account.balance);
-                        account.balance as i64
-                    } else {
-                        eprintln!("💰 Account not found, balance: 0");
-                        0
-                    }
+                match read_address(&mut caller, address_ptr) {
+                    Some(address) => saturating_i64(native_balance(&caller, &address)),
+                    None => 0,
                 }
             },
         )?;
 
-        // transfer(to_ptr, amount) - Transfer tokens to address.
-        // If the recipient is a contract, invoke `spacekit_receive` (or `spacekit_fallback` if
-        // receive is absent), mirroring Ethereum's receive()/fallback() pattern.
+        // get_balance_u128(address_ptr, out_ptr) - native balance; 0 ok, 1 error
+        linker.func_wrap(
+            "env",
+            "get_balance_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, address_ptr: i32, out_ptr: i32| -> i32 {
+                let Some(address) = read_address(&mut caller, address_ptr) else {
+                    return 1;
+                };
+                let balance = native_balance(&caller, &address);
+                write_u128(&mut caller, out_ptr, balance)
+            },
+        )?;
+
+        // transfer(to_ptr, amount) - pay `amount` wei from the *executing
+        // contract's own* balance to `to`. Returns 0 on success, 1 on failure.
+        // A contract can never spend its caller's balance: callers fund a
+        // contract only by attaching value to the call.
         linker.func_wrap(
             "env",
             "transfer",
             |mut caller: Caller<'_, SwtchvmStoreData>, to_ptr: i32, amount: i64| -> i32 {
-                eprintln!(
-                    "💸 transfer called: {} tokens to address at ptr {}",
-                    amount, to_ptr
-                );
-
                 if amount <= 0 {
-                    eprintln!("❌ Invalid amount");
                     return 1;
                 }
-
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return 1,
-                };
-
-                let memory_data = memory.data(&caller);
-
-                if (to_ptr as usize + 20) > memory_data.len() {
-                    eprintln!("❌ Address pointer out of bounds");
+                let Some(to) = read_address(&mut caller, to_ptr) else {
                     return 1;
-                }
-
-                let mut to_bytes = [0u8; 20];
-                to_bytes.copy_from_slice(&memory_data[to_ptr as usize..to_ptr as usize + 20]);
-                let to_address = SwtchvmAddress::new(to_bytes);
-
-                let store_data = caller.data_mut();
-                let (from_address, recipient_has_code) = unsafe {
-                    let from_address = (*store_data.context).caller;
-
-                    if let Some(from_account) = (*store_data.state).accounts.get(&from_address) {
-                        if from_account.balance < amount as u128 {
-                            eprintln!(
-                                "❌ Insufficient balance: {} < {}",
-                                from_account.balance, amount
-                            );
-                            return 1;
-                        }
-                    } else {
-                        eprintln!("❌ Sender account not found");
-                        return 1;
-                    }
-
-                    let from_account = (*store_data.state).get_account_mut(&from_address);
-                    from_account.balance -= amount as u128;
-
-                    let to_account = (*store_data.state).get_account_mut(&to_address);
-                    to_account.balance += amount as u128;
-
-                    let has_code =
-                        to_account.code.is_some() && !to_account.code.as_ref().unwrap().is_empty();
-                    eprintln!(
-                        "✅ Transferred {} from {:?} to {:?} (contract={})",
-                        amount, from_address, to_address, has_code
-                    );
-                    (from_address, has_code)
                 };
-
-                // receive()/fallback(): if the recipient is a contract, try to invoke
-                // `spacekit_receive` (no-arg callback). If absent, try `spacekit_fallback`.
-                // If neither exists, the transfer still succeeds (EOA-style).
-                // Revert semantics: if the callback traps, we revert the credit.
-                if recipient_has_code {
-                    let wasm_code = unsafe {
-                        (*store_data.state)
-                            .get_account(&to_address)
-                            .and_then(|a| a.code.clone())
-                    };
-                    if let Some(code) = wasm_code {
-                        let engine = caller.engine().clone();
-                        if let Ok(module) = Module::new(&engine, &code) {
-                            let receive_exists =
-                                module.exports().any(|e| e.name() == "spacekit_receive");
-                            let fallback_exists =
-                                module.exports().any(|e| e.name() == "spacekit_fallback");
-                            let target_fn = if receive_exists {
-                                Some("spacekit_receive")
-                            } else if fallback_exists {
-                                Some("spacekit_fallback")
-                            } else {
-                                None
-                            };
-                            if let Some(fn_name) = target_fn {
-                                eprintln!("📞 Invoking {}() on contract {:?}", fn_name, to_address);
-                                // We log the invocation but don't execute inline (would require
-                                // a nested WASM instantiation within the same store, which
-                                // Wasmtime disallows). The callback is deferred: the runtime
-                                // picks up `pending_receive_calls` after the current execution
-                                // completes and replays them as nested contract_call with the
-                                // transferred value.
-                                // For now, the credit stands; a future iteration can add
-                                // synchronous nested execution via a trampoline.
-                            }
-                        }
-                    }
-                }
-
-                0 // Success
+                contract_transfer(&mut caller, &to, amount as u128)
             },
         )?;
 
-        // get_timestamp() — Unix seconds (parity with spacekit-js host.ts getTimestamp / Date.now)
+        // transfer_u128(to_ptr, amount_ptr) - as `transfer`, 16-byte LE amount
+        linker.func_wrap(
+            "env",
+            "transfer_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, to_ptr: i32, amount_ptr: i32| -> i32 {
+                let Some(to) = read_address(&mut caller, to_ptr) else {
+                    return 1;
+                };
+                let Some(amount) = read_u128(&mut caller, amount_ptr) else {
+                    return 1;
+                };
+                if amount == 0 {
+                    return 1;
+                }
+                contract_transfer(&mut caller, &to, amount)
+            },
+        )?;
+
+        // get_timestamp() - the block's timestamp (Unix seconds). Every node
+        // executing the block sees the same value; wall-clock time would make
+        // contract results differ between nodes.
         linker.func_wrap(
             "env",
             "get_timestamp",
-            |_caller: Caller<'_, SwtchvmStoreData>| -> i64 {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
+            |caller: Caller<'_, SwtchvmStoreData>| -> i64 {
+                unsafe { (*caller.data().context).block_timestamp as i64 }
             },
         )?;
 
@@ -4107,11 +4149,9 @@ impl SwtchvmRuntime {
                     _ => return 8,
                 };
 
-                // Return current timestamp in nanoseconds
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                // The block's timestamp in nanoseconds (deterministic across nodes).
+                let now = unsafe { (*caller.data().context).block_timestamp }
+                    .saturating_mul(1_000_000_000);
 
                 let memory_data_mut = memory.data_mut(&mut caller);
                 if (time_ptr as usize) + 8 <= memory_data_mut.len() {
@@ -4132,8 +4172,10 @@ impl SwtchvmRuntime {
                     _ => return 8,
                 };
 
-                // Fill with random bytes
-                let random_bytes: Vec<u8> = (0..buf_len).map(|_| rand::random()).collect();
+                // Deterministic bytes: every node must compute the same result.
+                // Seeded from the block, the call and the remaining fuel, so
+                // successive calls differ. Not suitable for secrets.
+                let random_bytes = deterministic_bytes(&caller, buf_len.max(0) as usize);
 
                 let memory_data_mut = memory.data_mut(&mut caller);
                 let start = buf_ptr as usize;
@@ -5333,6 +5375,8 @@ impl SwtchvmRuntime {
 
         let mut inner_ctx = unsafe { &*caller.data().context }.clone();
         inner_ctx.caller = from_contract;
+        // No value moves with a nested call; contracts pay with `transfer`.
+        inner_ctx.value = 0;
 
         let module = match Module::new(&self.engine, &code) {
             Ok(m) => m,
@@ -5680,6 +5724,108 @@ unsafe impl Send for SwtchvmStoreData {}
 
 /// Namespace for `contract_kv`: the contract whose code is executing, or the
 /// transaction caller for anonymous execution (`execute_wasm_direct`).
+fn saturating_i64(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn guest_memory(caller: &mut Caller<'_, SwtchvmStoreData>) -> Option<Memory> {
+    match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(mem)) => Some(mem),
+        _ => None,
+    }
+}
+
+fn read_guest<const N: usize>(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<[u8; N]> {
+    let memory = guest_memory(caller)?;
+    let start = usize::try_from(ptr).ok()?;
+    let bytes = memory.data(&*caller).get(start..start.checked_add(N)?)?;
+    bytes.try_into().ok()
+}
+
+fn read_address(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<SwtchvmAddress> {
+    read_guest::<20>(caller, ptr).map(SwtchvmAddress::new)
+}
+
+fn read_u128(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<u128> {
+    read_guest::<16>(caller, ptr).map(u128::from_le_bytes)
+}
+
+/// Write 16 little-endian bytes into guest memory. 0 on success, 1 on error.
+fn write_u128(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32, value: u128) -> i32 {
+    let Some(memory) = guest_memory(caller) else {
+        return 1;
+    };
+    let Ok(start) = usize::try_from(ptr) else {
+        return 1;
+    };
+    match memory.data_mut(&mut *caller).get_mut(start..start.saturating_add(16)) {
+        Some(out) if out.len() == 16 => {
+            out.copy_from_slice(&value.to_le_bytes());
+            0
+        }
+        _ => 1,
+    }
+}
+
+fn native_balance(caller: &Caller<'_, SwtchvmStoreData>, address: &SwtchvmAddress) -> u128 {
+    unsafe {
+        (*caller.data().state)
+            .get_account(address)
+            .map(|a| a.balance)
+            .unwrap_or(0)
+    }
+}
+
+/// Move `amount` wei from the executing contract's own balance to `to`.
+/// 0 on success, 1 if no contract is executing or its balance is too low.
+fn contract_transfer(caller: &mut Caller<'_, SwtchvmStoreData>, to: &SwtchvmAddress, amount: u128) -> i32 {
+    let data = caller.data_mut();
+    let Some(from) = data.executing_contract else {
+        return 1;
+    };
+    if from == *to {
+        return 0;
+    }
+    unsafe {
+        let state = &mut *data.state;
+        let available = state.get_account(&from).map(|a| a.balance).unwrap_or(0);
+        if available < amount {
+            return 1;
+        }
+        state.get_account_mut(&from).balance -= amount;
+        let recipient = state.get_account_mut(to);
+        recipient.balance = recipient.balance.saturating_add(amount);
+    }
+    0
+}
+
+/// Deterministic pseudo-random bytes for WASI `random_get`: SHA-256 in
+/// counter mode over the block, the caller, the executing contract and the
+/// remaining fuel. The same on every node; predictable, so never a secret.
+fn deterministic_bytes(caller: &Caller<'_, SwtchvmStoreData>, len: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let ctx = unsafe { &*caller.data().context };
+    let contract = caller.data().executing_contract.unwrap_or(ctx.caller);
+    let fuel = caller.get_fuel().unwrap_or(0);
+    let mut out = Vec::with_capacity(len);
+    let mut counter = 0u64;
+    while out.len() < len {
+        let block = Sha256::new()
+            .chain_update(b"SPACEKIT-WASI-RANDOM-v1")
+            .chain_update(ctx.block_number.to_le_bytes())
+            .chain_update(ctx.block_timestamp.to_le_bytes())
+            .chain_update(ctx.caller.as_bytes())
+            .chain_update(contract.as_bytes())
+            .chain_update(fuel.to_le_bytes())
+            .chain_update(counter.to_le_bytes())
+            .finalize();
+        out.extend_from_slice(&block);
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
 fn contract_kv_namespace(data: &SwtchvmStoreData) -> SwtchvmAddress {
     data.executing_contract
         .unwrap_or_else(|| unsafe { (*data.context).caller })
@@ -5776,7 +5922,7 @@ fn unix_millis() -> u64 {
 impl SwtchvmNode {
     fn faucet_policy() -> FaucetPolicy {
         FaucetPolicy {
-            amount: 1_000_000u128, // 1 ASTRA (1e6 uASTRA)
+            amount: 1_000_000_000_000_000_000u128, // 1 ASTRA (18 decimals)
             cooldown: Duration::from_secs(3600),
             max_requests: 10,
         }
@@ -5792,6 +5938,16 @@ impl SwtchvmNode {
     /// NOTE: `setup_account_balance` is not transactional, so the commit loop is
     /// best-effort atomic. A fully atomic version needs a runtime state
     /// snapshot/commit primitive — tracked as a follow-up before mainnet.
+    /// Writes outside block execution fork a multi-node network, so the
+    /// paths that make them (faucet, rollup settlement, PoTW awards, treasury
+    /// disbursement) are refused once consensus is on.
+    fn out_of_block_writes_refused(&self) -> Option<String> {
+        self.faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn settle_rollup_bundle(
         &self,
         bundle: &crate::rollup_bridge::RollupBundle,
@@ -6109,6 +6265,11 @@ impl SwtchvmNode {
         &self,
         receipt: crate::potw::PoTWReceipt,
     ) -> std::result::Result<crate::potw::AwardInstruction, String> {
+        if self.out_of_block_writes_refused().is_some() {
+            return Err(
+                "PoTW awards outside blocks are disabled on consensus (PoA/PoS) networks".to_string(),
+            );
+        }
         let host = self
             .potw_host
             .as_ref()
@@ -6162,6 +6323,13 @@ impl SwtchvmNode {
         &self,
         spend_id_hex: &str,
     ) -> std::result::Result<(String, u128), String> {
+        if self.out_of_block_writes_refused().is_some() {
+            return Err(
+                "treasury disbursement outside blocks is disabled on consensus (PoA/PoS) networks; \
+                 the treasury contract pays out from its own balance"
+                    .to_string(),
+            );
+        }
         let host = self
             .treasury_host
             .as_ref()
@@ -6293,6 +6461,28 @@ impl SwtchvmNode {
             .await
     }
 
+    /// Read-only call against the head state (see `SwtchvmRuntime::view_call`).
+    /// Returns the contract's return data; the state is unchanged.
+    pub async fn view_contract(
+        &self,
+        contract: &SwtchvmAddress,
+        call_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let head = self.get_latest_block();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .max(head.timestamp);
+        let result = self
+            .runtime
+            .view_call(contract, call_data, head.number, now)
+            .await?;
+        if !result.success {
+            return Err(anyhow::anyhow!("contract call reverted"));
+        }
+        Ok(result.return_data)
+    }
+
     /// Call a deployed contract (MCP / external callers).
     pub async fn call_contract(
         &self,
@@ -6370,6 +6560,7 @@ impl SwtchvmNode {
         &self,
         governance: crate::validator_governance::GovernanceState,
         staking: crate::staking::StakingParams,
+        treasury: Option<crate::validator_governance::TreasuryGenesis>,
     ) -> Result<()> {
         let mut state = self.runtime.state.write().await;
         if crate::chain_consensus::load(&state).is_some() {
@@ -6382,6 +6573,9 @@ impl SwtchvmNode {
             );
         }
         crate::chain_consensus::init_genesis(&mut state, governance, staking);
+        if let Some(t) = &treasury {
+            crate::chain_consensus::init_treasury(&mut state, t);
+        }
         drop(state);
         self.runtime.persist_state_if_configured().await;
         Ok(())
@@ -6417,6 +6611,13 @@ impl SwtchvmNode {
             let state = self.runtime.state.read().await;
             crate::chain_consensus::validate(&state, &msg, now).map_err(|e| anyhow::anyhow!(e))?;
         } else {
+            // System addresses (rewards, consensus) take only system
+            // transactions; value sent there would be lost.
+            if tx.to == Some(crate::native_rewards::rewards_address())
+                || tx.to == Some(crate::chain_consensus::consensus_address())
+            {
+                return Err(anyhow::anyhow!("transactions to system addresses are not accepted"));
+            }
             // Reject bad signatures here rather than include them as failed
             // transactions (and relay them to every peer).
             self.runtime.verify_signature(&tx)?;
@@ -7001,6 +7202,31 @@ impl SwtchvmNode {
             value: tx.value,
         };
         let tx_hash = Keccak256::digest(bincode::serialize(tx)?);
+        // Rewards mint into native balances, executed by the node itself (see
+        // `native_rewards`): there is no second ledger in a contract.
+        if tx.to == Some(crate::native_rewards::rewards_address()) {
+            let outcome = {
+                let mut state = self.runtime.state.write().await;
+                state.get_account_mut(&tx.from).nonce += 1;
+                crate::native_rewards::execute(&mut state, &tx.data, block_timestamp)
+            };
+            if let Err(error) = &outcome {
+                tracing::warn!(block_number, %error, "reward system call refused");
+            }
+            return Ok(SwtchvmReceipt {
+                tx_hash: hex::encode(tx_hash),
+                tx_index,
+                block_number,
+                success: outcome.is_ok(),
+                gas_used: 0,
+                cumulative_gas_used: *cumulative_gas_used,
+                logs: Vec::new(),
+                logs_bloom: logs_bloom_hex(&[]),
+                return_data: outcome.err().unwrap_or_default().into_bytes(),
+                created_address: None,
+                tool_effects: Vec::new(),
+            });
+        }
         let receipt = match self.runtime.execute_system_transaction(tx, context).await {
             Ok(result) => {
                 *total_gas_used += result.gas_used;
@@ -7695,6 +7921,27 @@ impl SwtchvmNode {
             .and_then(deploy_contract_handler)
             .map(Reply::into_response);
 
+        // POST /api/contracts/{address}/call — read-only call. The body is the
+        // raw call data; the reply is the contract's raw return data. Nothing
+        // is charged or persisted (storage and messaging nodes use this to
+        // check entitlements).
+        let view_contract = warp::path!("api" / "contracts" / String / "call")
+            .and(warp::post())
+            .and(warp::body::content_length_limit(MAX_VIEW_CALL_BYTES))
+            .and(warp::body::bytes())
+            .and(with_node(node.clone()))
+            .and_then(view_contract_handler)
+            .map(Reply::into_response);
+
+        // GET /v1/balance/{address} — the native ASTRA balance (wei, as a
+        // decimal string so JavaScript keeps full precision), the nonce, and
+        // any locked, not yet released rewards.
+        let balance = warp::path!("v1" / "balance" / String)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(balance_handler)
+            .map(Reply::into_response);
+
         let call_contract = warp::path!("contract" / "call")
             .and(warp::post())
             .and(warp::body::json())
@@ -7840,6 +8087,10 @@ impl SwtchvmNode {
             .or(deploy_contract)
             .unify()
             .or(call_contract)
+            .unify()
+            .or(view_contract)
+            .unify()
+            .or(balance)
             .unify()
             .or(get_receipt)
             .unify();
@@ -8290,6 +8541,80 @@ async fn call_contract_handler(
         node,
     )
     .await)
+}
+
+async fn balance_handler(
+    address: String,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let hex_part = address.trim_start_matches("0x");
+    if hex_part.len() != 40 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": "address must be 20 bytes of hex" })),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    }
+    let Ok(addr) = SwtchvmAddress::from_hex(hex_part) else {
+        return Err(warp::reject::reject());
+    };
+    let state = node.runtime.state.read().await;
+    let (balance, nonce) = state
+        .get_account(&addr)
+        .map(|a| (a.balance, a.nonce))
+        .unwrap_or((0, 0));
+    let (locked, released) = crate::native_rewards::lock_position(&state, &addr);
+    Ok(warp::reply::json(&serde_json::json!({
+        "address": format!("0x{}", hex_part.to_ascii_lowercase()),
+        "balance_wei": balance.to_string(),
+        "locked_wei": locked.saturating_sub(released).to_string(),
+        "nonce": nonce,
+        "decimals": 18,
+        "symbol": "ASTRA",
+    }))
+    .into_response())
+}
+
+async fn view_contract_handler(
+    address: String,
+    body: bytes::Bytes,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let reply_error = |status: warp::http::StatusCode, message: String| {
+        warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": message })),
+            status,
+        )
+        .into_response()
+    };
+    let hex_part = address.trim_start_matches("0x");
+    if hex_part.len() != 40 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(reply_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "contract address must be 20 bytes of hex".into(),
+        ));
+    }
+    let contract = match SwtchvmAddress::from_hex(hex_part) {
+        Ok(a) => a,
+        Err(e) => return Ok(reply_error(warp::http::StatusCode::BAD_REQUEST, e.to_string())),
+    };
+    match node.view_contract(&contract, &body).await {
+        Ok(output) => Ok(warp::reply::with_header(
+            output,
+            "content-type",
+            "application/octet-stream",
+        )
+        .into_response()),
+        Err(e) if e.to_string().starts_with("no contract at") => {
+            Ok(reply_error(warp::http::StatusCode::NOT_FOUND, e.to_string()))
+        }
+        Err(e) => Ok(reply_error(
+            warp::http::StatusCode::UNPROCESSABLE_ENTITY,
+            e.to_string(),
+        )),
+    }
 }
 
 async fn get_block_handler(
@@ -9808,6 +10133,450 @@ mod tests {
             .expect("contract persisted across restart");
         assert_eq!(contract_account.code.as_deref(), Some(wasm.as_slice()));
         assert_eq!(restarted.get_account(&sender).await.unwrap().nonce, 2);
+        Ok(())
+    }
+
+    /// A k256 key and its address, for tests that need several senders.
+    struct TestAccount {
+        key: k256::ecdsa::SigningKey,
+        address: SwtchvmAddress,
+    }
+
+    impl TestAccount {
+        fn new() -> Self {
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            use sha3::{Digest, Keccak256};
+            let key = k256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+            let point = key.verifying_key().to_encoded_point(false);
+            let full: [u8; 32] = Keccak256::digest(&point.as_bytes()[1..]).into();
+            let mut a = [0u8; 20];
+            a.copy_from_slice(&full[12..]);
+            Self { key, address: SwtchvmAddress::new(a) }
+        }
+
+        fn did(&self) -> String {
+            format!("did:spacekit:{}", hex::encode(self.address.as_bytes()))
+        }
+
+        fn tx(&self, to: Option<SwtchvmAddress>, data: Vec<u8>, value: u128, nonce: u64) -> SwtchvmTransaction {
+            use k256::ecdsa::signature::hazmat::PrehashSigner;
+            use sha2::{Digest, Sha256};
+            let mut tx = SwtchvmTransaction {
+                from: self.address,
+                to,
+                data,
+                gas_limit: 2_000_000,
+                gas_price: 1,
+                value,
+                nonce,
+                signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+            };
+            let hash: [u8; 32] = Sha256::digest(transaction_signing_payload(1337, &tx).as_bytes()).into();
+            let (sig, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+                self.key.sign_prehash(&hash).unwrap();
+            let bytes = sig.to_bytes();
+            tx.signature.r.copy_from_slice(&bytes[..32]);
+            tx.signature.s.copy_from_slice(&bytes[32..]);
+            tx.signature.v = recid.to_byte() + 27;
+            tx
+        }
+    }
+
+    const WEI: u128 = 1_000_000_000_000_000_000;
+
+    /// Value moves with the transaction and only if it succeeds; a plain
+    /// transfer needs no contract; a contract cannot spend its caller's
+    /// balance; nothing is created.
+    #[tokio::test]
+    async fn value_is_conserved_and_reverted_with_failed_transactions() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let alice = TestAccount::new();
+        let bob = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        node.runtime.state.write().await.checkpoint();
+        let supply = |state: &SwtchvmState| state.accounts.values().map(|a| a.balance).sum::<u128>();
+        let before = supply(&*node.runtime.state.read().await);
+
+        // Plain transfer to an address without code.
+        node.submit_transaction(alice.tx(Some(bob.address), Vec::new(), 3 * WEI, 0)).await?;
+        let block = node.mine_block().await?;
+        assert!(block.receipts[0].success);
+        let gas = block.receipts[0].gas_used;
+        assert_eq!(gas, PLAIN_TRANSFER_GAS);
+        assert_eq!(node.runtime.get_account_balance(&bob.address).await?, 3 * WEI);
+        assert_eq!(node.runtime.get_account_balance(&alice.address).await?, 7 * WEI - gas);
+
+        // A contract that tries to spend its caller's money: `transfer` pays
+        // from the contract, which has nothing, so the call fails and the
+        // value Alice attached comes back.
+        let thief = wat::parse_str(
+            r#"(module
+                (import "env" "transfer" (func $transfer (param i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "main") (param i32 i32) (result i32)
+                    ;; send 5 ASTRA to the address at offset 64 (zeros) and
+                    ;; fail if that did not work
+                    (if (call $transfer (i32.const 64) (i64.const 5000000000000000000))
+                        (then (return (i32.const -1))))
+                    i32.const 0))"#,
+        )?;
+        let contract = SwtchvmAddress::new([0x44; 20]);
+        {
+            let mut state = node.runtime.state.write().await;
+            state.get_account_mut(&contract).code = Some(thief);
+            state.checkpoint();
+        }
+        let alice_before = node.runtime.get_account_balance(&alice.address).await?;
+        node.submit_transaction(alice.tx(Some(contract), b"x".to_vec(), WEI, 1)).await?;
+        let block = node.mine_block().await?;
+        assert!(!block.receipts[0].success);
+        let spent = node.runtime.get_account_balance(&alice.address).await?;
+        assert_eq!(alice_before - spent, block.receipts[0].gas_used, "only gas is charged");
+        assert_eq!(node.runtime.get_account_balance(&contract).await?, 0);
+        assert_eq!(node.runtime.get_account_balance(&SwtchvmAddress::new([0; 20])).await?, 0);
+
+        // Insufficient balance: refused, nothing created, no account touched.
+        let carol = TestAccount::new();
+        node.submit_transaction(carol.tx(Some(bob.address), Vec::new(), WEI, 0)).await.ok();
+        node.mine_block().await?;
+        assert!(node.runtime.state.read().await.get_account(&carol.address).is_none());
+
+        // Gas is burned at the gas price of 1 used by these transactions.
+        let burned: u128 = node.chain.read().unwrap().blockchain.iter()
+            .flat_map(|b| b.receipts.iter())
+            .map(|r| r.gas_used)
+            .sum();
+        assert_eq!(supply(&*node.runtime.state.read().await) + burned, before, "no value created");
+        Ok(())
+    }
+
+    fn ledger_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_ENTITLEMENT_LEDGER_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_entitlement_ledger.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    fn ledger_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn create_listing(listing: &str, file: &str, price: u128, pricing: u8, period: u64) -> Vec<u8> {
+        let mut d = vec![0x01];
+        ledger_string(&mut d, listing);
+        ledger_string(&mut d, file);
+        d.extend_from_slice(&price.to_le_bytes());
+        ledger_string(&mut d, "ASTRA");
+        d.push(pricing);
+        d.extend_from_slice(&period.to_le_bytes());
+        d
+    }
+
+    fn purchase(listing: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x02];
+        ledger_string(&mut d, listing);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    fn verify_listing(ent: &[u8], buyer: &str, listing: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x08];
+        d.extend_from_slice(ent);
+        ledger_string(&mut d, buyer);
+        ledger_string(&mut d, listing);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    fn verify_file(ent: &[u8], buyer: &str, file: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x03];
+        d.extend_from_slice(ent);
+        ledger_string(&mut d, buyer);
+        ledger_string(&mut d, file);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    /// The entitlement ledger, built from `sdks/.../astra-entitlement-ledger`,
+    /// running on the chain: payments reach the publisher, a squatted listing
+    /// does not pass `OP_VERIFY_LISTING`, renewals keep the id, amounts above
+    /// u64 work, and a second node replays the blocks to the same state.
+    #[tokio::test]
+    async fn entitlement_ledger_end_to_end() -> Result<()> {
+        let Some(wasm) = ledger_wasm() else {
+            eprintln!("skipped: build astra-entitlement-ledger for wasm32 or set SPACEKIT_ENTITLEMENT_LEDGER_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let replica = SwtchvmNode::new(false, false).await?;
+        let ledger = SwtchvmAddress::new([0x1e; 20]);
+        let publisher = TestAccount::new();
+        let buyer = TestAccount::new();
+        let squatter = TestAccount::new();
+        for n in [&node, &replica] {
+            for a in [&publisher, &buyer, &squatter] {
+                n.set_account_balance(&a.address, 1_000 * WEI).await?;
+            }
+            let mut state = n.runtime.state.write().await;
+            state.get_account_mut(&ledger).code = Some(wasm.clone());
+            state.checkpoint();
+        }
+        let mut nonces: HashMap<SwtchvmAddress, u64> = HashMap::new();
+        let mut send = |who: &TestAccount, data: Vec<u8>, value: u128| {
+            let n = nonces.entry(who.address).or_insert(0);
+            let tx = who.tx(Some(ledger), data, value, *n);
+            *n += 1;
+            tx
+        };
+        async fn run(node: &SwtchvmNode, txs: Vec<SwtchvmTransaction>) -> Result<SwtchvmBlock> {
+            for tx in txs {
+                node.submit_transaction(tx).await?;
+            }
+            node.mine_block().await
+        }
+        let pk = [0x5a; 32];
+        let price = 5 * WEI;
+        let period = 30 * 86_400u64;
+
+        // Publisher lists the channel; the squatter cannot take the listing id.
+        let b = run(&node, vec![
+            send(&publisher, create_listing("channel:grp1", "grp:1", price, 2, period), 0),
+            send(&squatter, create_listing("channel:grp1", "grp:other", 0, 2, period), 0),
+        ]).await?;
+        assert!(b.receipts[0].success);
+        assert!(!b.receipts[1].success, "listing ids belong to their publisher");
+
+        // The squatter makes a free listing for the same group and buys it.
+        let b = run(&node, vec![
+            send(&squatter, create_listing("squat", "grp:1", 0, 2, period), 0),
+            send(&squatter, purchase("squat", pk), 0),
+        ]).await?;
+        assert!(b.receipts.iter().all(|r| r.success));
+        let squat_ent = b.receipts[1].return_data[1..33].to_vec();
+        // Legacy OP_VERIFY by file id is fooled; OP_VERIFY_LISTING is not.
+        assert_eq!(node.view_contract(&ledger, &verify_file(&squat_ent, &squatter.did(), "grp:1", pk)).await?, vec![1, 1]);
+        assert_eq!(node.view_contract(&ledger, &verify_listing(&squat_ent, &squatter.did(), "channel:grp1", pk)).await?, vec![1, 6]);
+
+        // Underpaying fails and the value comes back; paying works and the
+        // publisher receives exactly the price; the ledger keeps nothing.
+        let publisher_before = node.runtime.get_account_balance(&publisher.address).await?;
+        let buyer_before = node.runtime.get_account_balance(&buyer.address).await?;
+        let b = run(&node, vec![
+            send(&buyer, purchase("channel:grp1", pk), price - 1),
+            send(&buyer, purchase("channel:grp1", pk), price),
+            send(&buyer, purchase("channel:grp1", pk), price),
+        ]).await?;
+        assert!(!b.receipts[0].success);
+        assert!(b.receipts[1].success && b.receipts[2].success);
+        let gas: u128 = b.receipts.iter().map(|r| r.gas_used).sum();
+        assert_eq!(node.runtime.get_account_balance(&buyer.address).await?, buyer_before - 2 * price - gas);
+        assert_eq!(node.runtime.get_account_balance(&publisher.address).await?, publisher_before + 2 * price);
+        assert_eq!(node.runtime.get_account_balance(&ledger).await?, 0);
+        let ent = b.receipts[1].return_data[1..33].to_vec();
+        let ent2 = b.receipts[2].return_data[1..33].to_vec();
+        assert_ne!(ent, ent2, "two purchases in one block get distinct ids");
+
+        let check = |e: &[u8], pk_hash| verify_listing(e, &buyer.did(), "channel:grp1", pk_hash);
+        assert_eq!(node.view_contract(&ledger, &check(&ent, pk)).await?, vec![1, 1]);
+        assert_eq!(node.view_contract(&ledger, &check(&ent, [9; 32])).await?, vec![1, 5]);
+
+        // Expiry follows the block's clock: one period after the block.
+        let mut get = vec![0x06];
+        get.extend_from_slice(&ent);
+        let record = node.view_contract(&ledger, &get).await?;
+        let expires = |rec: &[u8]| {
+            let mut pos = 1;
+            for _ in 0..2 {
+                let len = u16::from_le_bytes([rec[pos], rec[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+            u64::from_le_bytes(rec[pos + 8..pos + 16].try_into().unwrap())
+        };
+        assert_eq!(expires(&record), b.timestamp + period);
+
+        // Renewal pays the publisher and extends the same entitlement.
+        let old_expiry = expires(&record);
+        let mut renew = vec![0x09];
+        renew.extend_from_slice(&ent);
+        let b = run(&node, vec![send(&buyer, renew, price)]).await?;
+        assert!(b.receipts[0].success);
+        let new_expiry = u64::from_le_bytes(b.receipts[0].return_data[1..9].try_into().unwrap());
+        assert_eq!(new_expiry, old_expiry + period);
+        let record = node.view_contract(&ledger, &get).await?;
+        assert_eq!(expires(&record), new_expiry);
+        assert_eq!(node.runtime.get_account_balance(&publisher.address).await?, publisher_before + 3 * price);
+
+        // Value sent with an operation that takes none is refused (and returned).
+        let buyer_before = node.runtime.get_account_balance(&buyer.address).await?;
+        let b = run(&node, vec![send(&buyer, create_listing("mine", "f", 0, 1, 0), WEI)]).await?;
+        assert!(!b.receipts[0].success);
+        assert_eq!(node.runtime.get_account_balance(&buyer.address).await?, buyer_before - b.receipts[0].gas_used);
+
+        // Prices above u64 (18.4 ASTRA) work end to end.
+        let big = 100 * WEI;
+        let b = run(&node, vec![
+            send(&publisher, create_listing("vip", "grp:vip", big, 1, 0), 0),
+            send(&buyer, purchase("vip", pk), big),
+        ]).await?;
+        assert!(b.receipts.iter().all(|r| r.success));
+
+        // Another node replays every block to the same state.
+        let blocks: Vec<SwtchvmBlock> =
+            node.chain.read().unwrap().blockchain.iter().skip(1).cloned().collect();
+        for block in blocks {
+            replica.import_block("spacekitvm-rs", block).await?;
+        }
+        assert_eq!(
+            replica.runtime.state.read().await.state_root(),
+            node.runtime.state.read().await.state_root()
+        );
+        Ok(())
+    }
+
+    fn treasury_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_TREASURY_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_treasury.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    /// The treasury holds native ASTRA (minted to it by the rewards INIT) and
+    /// pays it out from its own balance once M of N signers approve.
+    #[tokio::test]
+    async fn treasury_pays_from_its_native_balance() -> Result<()> {
+        let Some(wasm) = treasury_wasm() else {
+            eprintln!("skipped: build spacekit-treasury for wasm32 or set SPACEKIT_TREASURY_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let s1 = TestAccount::new();
+        let s2 = TestAccount::new();
+        let outsider = TestAccount::new();
+        let recipient = SwtchvmAddress::new([0x77; 20]);
+        let treasury = crate::native_rewards::treasury_address();
+        {
+            let mut state = node.runtime.state.write().await;
+            for a in [&s1, &s2, &outsider] {
+                state.get_account_mut(&a.address).balance = 10 * WEI;
+            }
+            state.get_account_mut(&treasury).code = Some(wasm);
+            crate::chain_consensus::init_treasury(
+                &mut state,
+                &crate::validator_governance::TreasuryGenesis {
+                    threshold: 2,
+                    signer_dids: vec![s1.did(), s2.did()],
+                },
+            );
+            crate::native_rewards::execute(&mut state, &[0x01, 0], 1).unwrap();
+            state.checkpoint();
+        }
+        let pool = crate::native_rewards::GENESIS_TREASURY_WEI;
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool);
+
+        let spend = |id: u8, amount: u128| {
+            let mut d = vec![0x10];
+            d.extend_from_slice(&[id; 32]);
+            d.extend_from_slice(recipient.as_bytes());
+            d.extend_from_slice(&amount.to_le_bytes());
+            d.extend_from_slice(&[0u8; 32]);
+            d
+        };
+        let mut approve = vec![0x11];
+        approve.extend_from_slice(&[1u8; 32]);
+
+        node.submit_transaction(outsider.tx(Some(treasury), spend(9, WEI), 0, 0)).await?;
+        node.submit_transaction(s1.tx(Some(treasury), spend(1, 25 * WEI), 0, 0)).await?;
+        let b = node.mine_block().await?;
+        assert!(!b.receipts[0].success, "not a signer");
+        assert!(b.receipts[1].success);
+        assert_eq!(node.runtime.get_account_balance(&recipient).await?, 0, "one approval of two");
+
+        node.submit_transaction(s2.tx(Some(treasury), approve.clone(), 0, 0)).await?;
+        let b = node.mine_block().await?;
+        assert!(b.receipts[0].success);
+        assert_eq!(node.runtime.get_account_balance(&recipient).await?, 25 * WEI);
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool - 25 * WEI);
+
+        // Value with a signer operation is refused; DEPOSIT accepts it.
+        node.submit_transaction(s1.tx(Some(treasury), approve, WEI, 1)).await?;
+        node.submit_transaction(outsider.tx(Some(treasury), vec![0x20], WEI, 1)).await?;
+        let b = node.mine_block().await?;
+        assert!(!b.receipts[0].success);
+        assert!(b.receipts[1].success);
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool - 24 * WEI);
+        Ok(())
+    }
+
+    /// A read-only call returns the contract's output and leaves no trace: the
+    /// contract's own write is undone, nothing is charged, and changes pending
+    /// in the current block are still pending afterwards.
+    #[tokio::test]
+    async fn view_call_returns_output_and_changes_nothing() -> Result<()> {
+        let node = Arc::new(SwtchvmNode::new(false, false).await?);
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "storage_write" (func $write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "k")
+                (data (i32.const 8) "v")
+                (data (i32.const 16) "okay")
+                (func (export "main") (param i32 i32) (result i32)
+                    (drop (call $write (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 1)))
+                    i32.const 4)
+                (func (export "get_result") (param $ptr i32) (param $len i32) (result i32)
+                    (memory.copy (local.get $ptr) (i32.const 16) (i32.const 4))
+                    i32.const 4)
+            )"#,
+        )?;
+        let contract = SwtchvmAddress::new([7u8; 20]);
+        let other = SwtchvmAddress::new([9u8; 20]);
+        {
+            let mut state = node.runtime.state.write().await;
+            state.get_account_mut(&contract).code = Some(wasm);
+            state.checkpoint();
+            // A change made by a block in progress.
+            state.get_account_mut(&other).balance = 5;
+        }
+        let root_before = node.runtime.state.read().await.state_root();
+
+        let output = node.view_contract(&contract, b"input").await?;
+        assert_eq!(output, b"okay");
+
+        let mut state = node.runtime.state.write().await;
+        assert_eq!(state.state_root(), root_before);
+        assert!(state.kv_get(&contract, b"k").is_none());
+        assert_eq!(state.get_account(&contract).unwrap().nonce, 0);
+        let (_, pending) = state.checkpoint();
+        assert!(pending.accounts.contains_key(&other));
+        assert_eq!(pending.len(), 1);
+        drop(state);
+
+        // Over HTTP: raw bytes in, raw bytes out; unknown contracts are 404.
+        let routes = SwtchvmNode::http_dev_api_routes(node.clone());
+        let reply = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/contracts/0x{}/call", hex::encode(contract.as_bytes())))
+            .body(b"input".to_vec())
+            .reply(&routes)
+            .await;
+        assert_eq!(reply.status(), warp::http::StatusCode::OK);
+        assert_eq!(reply.body().as_ref(), b"okay");
+        let missing = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/contracts/0x{}/call", hex::encode([1u8; 20])))
+            .body(Vec::new())
+            .reply(&routes)
+            .await;
+        assert_eq!(missing.status(), warp::http::StatusCode::NOT_FOUND);
         Ok(())
     }
 

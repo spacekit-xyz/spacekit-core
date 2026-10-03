@@ -137,6 +137,20 @@ impl StateJournal {
     pub fn len(&self) -> usize {
         self.accounts.len() + self.kv.len() + self.storage.len()
     }
+
+    /// Merge a later journal into this one. An entry this journal already
+    /// holds keeps its (earlier) value; others take the later journal's.
+    pub fn absorb(&mut self, later: StateJournal) {
+        for (k, v) in later.accounts {
+            self.accounts.entry(k).or_insert(v);
+        }
+        for (k, v) in later.kv {
+            self.kv.entry(k).or_insert(v);
+        }
+        for (k, v) in later.storage {
+            self.storage.entry(k).or_insert(v);
+        }
+    }
 }
 
 #[cfg(test)]
