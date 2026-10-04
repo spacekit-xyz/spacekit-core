@@ -7928,6 +7928,25 @@ impl SwtchvmNode {
             .and_then(get_tx_handler)
             .map(Reply::into_response);
 
+        // Explorer views (read-only).
+        let explorer_blocks = warp::path!("v1" / "blocks")
+            .and(warp::get())
+            .and(warp::query::<BlocksQuery>())
+            .and(with_node(node.clone()))
+            .and_then(explorer_blocks_handler)
+            .map(Reply::into_response);
+        let explorer_block = warp::path!("v1" / "blocks" / u64)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(explorer_block_handler)
+            .map(Reply::into_response);
+        let explorer_address = warp::path!("v1" / "address" / String)
+            .and(warp::get())
+            .and(warp::query::<AddressQuery>())
+            .and(with_node(node.clone()))
+            .and_then(explorer_address_handler)
+            .map(Reply::into_response);
+
         let call_contract = warp::path!("contract" / "call")
             .and(warp::post())
             .and(warp::body::json())
@@ -8079,6 +8098,12 @@ impl SwtchvmNode {
             .or(balance)
             .unify()
             .or(get_tx)
+            .unify()
+            .or(explorer_blocks)
+            .unify()
+            .or(explorer_block)
+            .unify()
+            .or(explorer_address)
             .unify()
             .or(get_receipt)
             .unify();
@@ -8643,19 +8668,205 @@ async fn get_tx_handler(
     node: Arc<SwtchvmNode>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     use warp::Reply;
-    let Some(transfer) = spacekit_payments::ChainLookup::transfer(node.as_ref(), &hash) else {
+    let Some(hash) = parse_hash32(&hash) else {
         return Err(warp::reject::not_found());
     };
+    let Some((tx, receipt, timestamp)) = node.find_transaction(&hash) else {
+        return Err(warp::reject::not_found());
+    };
+    let head = node.get_latest_block().number;
+    let mut body = explorer_tx_json(receipt.tx_index as usize, &tx, Some(&receipt));
+    let obj = body.as_object_mut().expect("object");
+    // `tx_hash` kept for clients written against the earlier response shape.
+    if let Some(h) = obj.get("hash").cloned() {
+        obj.insert("tx_hash".into(), h);
+    }
+    obj.insert("block_number".into(), receipt.block_number.into());
+    obj.insert("block_timestamp".into(), (timestamp as i64).into());
+    obj.insert(
+        "confirmations".into(),
+        (head.saturating_sub(receipt.block_number) + 1).into(),
+    );
+    Ok(warp::reply::json(&body).into_response())
+}
+
+// ── Explorer endpoints ──
+//
+// Normalized, read-only views for block explorers: hashes and addresses as
+// 0x-hex, wei amounts as decimal strings (JavaScript-safe), transaction data
+// reported by size only.
+
+const EXPLORER_MAX_BLOCKS: u64 = 100;
+const EXPLORER_MAX_SCAN: u64 = 1_000;
+
+fn parse_hash32(raw: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(raw.trim().trim_start_matches("0x")).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
+fn hex0x(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn tx_kind(tx: &SwtchvmTransaction) -> &'static str {
+    let rewards = crate::native_rewards::rewards_address();
+    match tx.to {
+        None => "deploy",
+        Some(to) if to == rewards => "system",
+        Some(_) if tx.data.is_empty() => "transfer",
+        Some(_) => "call",
+    }
+}
+
+fn explorer_tx_json(index: usize, tx: &SwtchvmTransaction, receipt: Option<&SwtchvmReceipt>) -> serde_json::Value {
+    let hash = receipt.map(|r| {
+        let h = r.tx_hash.trim_start_matches("0x");
+        format!("0x{h}")
+    });
+    serde_json::json!({
+        "index": index,
+        "hash": hash,
+        "kind": tx_kind(tx),
+        "from": hex0x(tx.from.as_bytes()),
+        "to": tx.to.map(|a| hex0x(a.as_bytes())),
+        "value_wei": tx.value.to_string(),
+        "nonce": tx.nonce,
+        "gas_limit": tx.gas_limit.to_string(),
+        "gas_price": tx.gas_price.to_string(),
+        "data_bytes": tx.data.len(),
+        "success": receipt.map(|r| r.success),
+        "gas_used": receipt.map(|r| r.gas_used.to_string()),
+        "logs": receipt.map(|r| r.logs.len()),
+        "created_address": receipt.and_then(|r| r.created_address).map(|a| hex0x(a.as_bytes())),
+    })
+}
+
+fn explorer_block_summary(block: &SwtchvmBlock) -> serde_json::Value {
+    serde_json::json!({
+        "number": block.number,
+        "hash": hex0x(&block.hash),
+        "parent_hash": hex0x(&block.parent_hash),
+        "state_root": hex0x(&block.state_root),
+        "timestamp": block.timestamp,
+        "tx_count": block.transactions.len(),
+        "gas_used": block.gas_used.to_string(),
+        "gas_limit": block.gas_limit.to_string(),
+        "proposer_did": block.proposer_did,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BlocksQuery {
+    limit: Option<u64>,
+    before: Option<u64>,
+}
+
+/// GET /v1/blocks?limit=20&before=N — newest blocks first.
+async fn explorer_blocks_handler(
+    q: BlocksQuery,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let head = node.get_latest_block().number;
+    let limit = q.limit.unwrap_or(20).clamp(1, EXPLORER_MAX_BLOCKS);
+    let top = q.before.map(|b| b.saturating_sub(1)).unwrap_or(head).min(head);
+    let blocks: Vec<serde_json::Value> = (0..limit)
+        .filter_map(|i| top.checked_sub(i))
+        .filter_map(|n| node.get_block_by_number(n))
+        .map(|b| explorer_block_summary(&b))
+        .collect();
+    Ok(warp::reply::json(&serde_json::json!({ "head": head, "blocks": blocks })).into_response())
+}
+
+/// GET /v1/blocks/{number} — one block with its transactions.
+async fn explorer_block_handler(
+    number: u64,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(block) = node.get_block_by_number(number) else {
+        return Err(warp::reject::not_found());
+    };
+    let mut body = explorer_block_summary(&block);
+    let txs: Vec<serde_json::Value> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| explorer_tx_json(i, tx, block.receipts.get(i)))
+        .collect();
+    body["transactions"] = serde_json::Value::Array(txs);
+    body["head"] = node.get_latest_block().number.into();
+    Ok(warp::reply::json(&body).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct AddressQuery {
+    scan: Option<u64>,
+}
+
+/// GET /v1/address/{address}?scan=200 — balance, nonce, locked rewards,
+/// whether it is a contract, and its transactions in the last `scan` blocks
+/// (the node keeps no per-address index).
+async fn explorer_address_handler(
+    address: String,
+    q: AddressQuery,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(addr) = crate::native_rewards::did_address(&address) else {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": "expected a 0x address or did:spacekit:<address>" })),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    };
+    let (balance, nonce, code_bytes) = {
+        let state = node.runtime.state.read().await;
+        state
+            .get_account(&addr)
+            .map(|a| (a.balance, a.nonce, a.code.as_ref().map(|c| c.len()).unwrap_or(0)))
+            .unwrap_or((0, 0, 0))
+    };
+    let (_, locked) = node.native_holdings(&addr).await;
+    let head = node.get_latest_block().number;
+    let scan = q.scan.unwrap_or(200).clamp(1, EXPLORER_MAX_SCAN);
+    let mut activity = Vec::new();
+    for n in (head.saturating_sub(scan - 1)..=head).rev() {
+        let Some(block) = node.get_block_by_number(n) else { continue };
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let receipt = block.receipts.get(i);
+            let created = receipt.and_then(|r| r.created_address);
+            let outgoing = tx.from == addr;
+            let incoming = tx.to == Some(addr) || created == Some(addr);
+            if !(outgoing || incoming) {
+                continue;
+            }
+            let mut entry = explorer_tx_json(i, tx, receipt);
+            entry["block_number"] = n.into();
+            entry["timestamp"] = block.timestamp.into();
+            entry["direction"] = (if outgoing && incoming { "self" } else if outgoing { "out" } else { "in" }).into();
+            activity.push(entry);
+            if activity.len() >= 100 {
+                break;
+            }
+        }
+        if activity.len() >= 100 {
+            break;
+        }
+    }
     Ok(warp::reply::json(&serde_json::json!({
-        "tx_hash": transfer.tx_hash,
-        "from": transfer.from,
-        "to": transfer.to,
-        "value_wei": transfer.value_wei.to_string(),
-        "success": transfer.success,
-        "block_number": transfer.block_number,
-        "block_timestamp": transfer.block_timestamp,
-        "confirmations": spacekit_payments::ChainLookup::head(node.as_ref())
-            .saturating_sub(transfer.block_number) + 1,
+        "address": hex0x(addr.as_bytes()),
+        "did": format!("did:spacekit:{}", hex::encode(addr.as_bytes())),
+        "balance_wei": balance.to_string(),
+        "locked_wei": locked.to_string(),
+        "nonce": nonce,
+        "is_contract": code_bytes > 0,
+        "code_bytes": code_bytes,
+        "decimals": 18,
+        "symbol": "ASTRA",
+        "scanned_blocks": scan.min(head + 1),
+        "head": head,
+        "activity": activity,
     }))
     .into_response())
 }
@@ -10320,6 +10531,34 @@ mod tests {
         assert_eq!(receipt.amount_wei, 2 * WEI);
         assert!(verifier.verify(&tx_hash, &req(2 * WEI, &shop.address)).is_err(), "used twice");
         assert!(ChainLookup::transfer(node.as_ref(), &format!("0x{}", "ab".repeat(32))).is_none());
+
+        // Explorer views of the same transfer.
+        let routes = SwtchvmNode::http_dev_api_routes(node.clone());
+        let get = |path: String| {
+            let routes = routes.clone();
+            async move {
+                let r = warp::test::request().path(&path).reply(&routes).await;
+                assert_eq!(r.status(), warp::http::StatusCode::OK, "{path}");
+                serde_json::from_slice::<serde_json::Value>(r.body()).unwrap()
+            }
+        };
+        let shop_hex = format!("0x{}", hex::encode(shop.address.as_bytes()));
+        let blocks = get("/v1/blocks?limit=5".into()).await;
+        assert_eq!(blocks["blocks"][0]["number"], block.number);
+        assert_eq!(blocks["blocks"][0]["tx_count"], 1);
+        let detail = get(format!("/v1/blocks/{}", block.number)).await;
+        let tx = &detail["transactions"][0];
+        assert_eq!(tx["kind"], "transfer");
+        assert_eq!(tx["to"], shop_hex);
+        assert_eq!(tx["value_wei"], (2 * WEI).to_string());
+        assert_eq!(tx["success"], true);
+        let one = get(format!("/v1/tx/{tx_hash}")).await;
+        assert_eq!(one["hash"], tx["hash"]);
+        assert_eq!(one["confirmations"], 1);
+        let addr = get(format!("/v1/address/did:spacekit:{}", hex::encode(shop.address.as_bytes()))).await;
+        assert_eq!(addr["balance_wei"], (2 * WEI).to_string());
+        assert_eq!(addr["activity"][0]["direction"], "in");
+        assert_eq!(addr["is_contract"], false);
         Ok(())
     }
 
