@@ -111,8 +111,13 @@ function normalizeToBytes(input: Uint8Array | string, encoding: "hex" | "base64"
 
 // Lazy-loaded ed25519 module
 let ed25519Module: typeof import("@noble/ed25519") | null = null;
-let sha512SyncFn: ((msg: Uint8Array) => Uint8Array) | null = null;
-let sha512AsyncFn: ((msg: Uint8Array) => Promise<Uint8Array>) | null = null;
+let sha512SyncFn: ((...messages: Uint8Array[]) => Uint8Array) | null = null;
+let sha512AsyncFn: ((...messages: Uint8Array[]) => Promise<Uint8Array>) | null = null;
+
+type Sha512Slot = {
+  sha512Sync?: (...messages: Uint8Array[]) => Uint8Array;
+  sha512Async?: (...messages: Uint8Array[]) => Promise<Uint8Array>;
+};
 
 async function getEd25519(): Promise<typeof import("@noble/ed25519")> {
   if (ed25519Module) return ed25519Module;
@@ -122,13 +127,38 @@ async function getEd25519(): Promise<typeof import("@noble/ed25519")> {
     ed25519Module = await import("@noble/ed25519");
     if (!sha512SyncFn || !sha512AsyncFn) {
       const { sha512 } = await import("@noble/hashes/sha512");
-      sha512SyncFn = (msg: Uint8Array) => sha512(msg);
-      sha512AsyncFn = async (msg: Uint8Array) => sha512(msg);
+      // noble calls the hook with one or more chunks and expects them hashed as a
+      // single concatenated message.
+      const hashFn = (...messages: Uint8Array[]) => {
+        if (messages.length === 1) return sha512(messages[0]);
+        const total = messages.reduce((sum, chunk) => sum + chunk.length, 0);
+        const joined = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of messages) {
+          joined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        return sha512(joined);
+      };
+      sha512SyncFn = hashFn;
+      sha512AsyncFn = async (...messages: Uint8Array[]) => hashFn(...messages);
     }
     if (sha512SyncFn) {
-      // Ensure noble has SHA-512 configured for browsers
-      (ed25519Module.utils as { sha512Sync?: (msg: Uint8Array) => Uint8Array }).sha512Sync = sha512SyncFn;
-      (ed25519Module.utils as { sha512Async?: (msg: Uint8Array) => Promise<Uint8Array> }).sha512Async = sha512AsyncFn ?? (async (msg) => sha512SyncFn!(msg));
+      // Ensure noble has SHA-512 configured. The hook moved between major versions:
+      // v1 reads `utils`, v2 reads `etc`, and 2.3+ reads `hashes`. Fill whichever
+      // this build exposes, leaving any value noble already set in place.
+      const slots: Array<Sha512Slot | undefined> = [
+        (ed25519Module as { hashes?: Sha512Slot }).hashes,
+        (ed25519Module as { etc?: Sha512Slot }).etc,
+        ed25519Module.utils as Sha512Slot,
+      ];
+      for (const slot of slots) {
+        if (!slot) continue;
+        if (!slot.sha512Sync) slot.sha512Sync = sha512SyncFn;
+        if (!slot.sha512Async) {
+          slot.sha512Async = sha512AsyncFn ?? (async (...messages) => sha512SyncFn!(...messages));
+        }
+      }
     }
     return ed25519Module;
   } catch (error) {
