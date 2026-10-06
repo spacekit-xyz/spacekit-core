@@ -1,3 +1,5 @@
+> **Retired (October 2026).** SpaceKit Pay is no longer part of SpaceKit. The network has one currency, ASTRA; marketplace sales are paid in ASTRA through the entitlement ledger. Kept for history only; do not deploy. See [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 # SpaceKit Pay
 
 SpaceKit Pay is the payment layer for the AI economy. Same-network

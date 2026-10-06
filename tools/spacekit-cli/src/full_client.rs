@@ -1343,7 +1343,7 @@ enum StorageCommands {
         #[arg(long, default_value = "public")]
         access: Option<String>,
 
-        /// Pricing model: free, or a price in aUSD (e.g. "10.00") for one-time purchase
+        /// Pricing model: free, or a price in ASTRA (e.g. "10.5") for one-time purchase
         #[arg(long, default_value = "free")]
         price: Option<String>,
 
@@ -1580,6 +1580,18 @@ enum NetworkCommands {
         no_compute: bool,
         #[arg(long)]
         enable_gateway: bool,
+        /// Proof-of-authority genesis file shared by every node (enables the blockchain)
+        #[arg(long)]
+        poa_genesis: Option<PathBuf>,
+        /// This node's authority DID wallet, used to seal the blocks it produces
+        #[arg(long)]
+        authority_wallet: Option<PathBuf>,
+    },
+
+    /// Local proof-of-authority devnet: N authority nodes on this machine
+    Devnet {
+        #[command(subcommand)]
+        action: crate::network_devnet::DevnetAction,
     },
 
     /// Start enabled embedded services from the network profile (like `docker compose up`).
@@ -1593,10 +1605,11 @@ enum NetworkCommands {
         /// Enable all services + blockchain (genesis, validators, operator rewards).
         ///
         /// Equivalent to `--only storage,messaging,compute,gateway` plus `blockchain.enabled = true`.
-        /// For agent/storage/compute work use plain `network up` (no blockchain). `--full` runs an
-        /// in-process block producer that persists `ledger.json` and can increase RSS over long runs.
-        /// Tune `[blockchain] block_time_ms` in `~/.spacekit/network/config.toml` (default 10s) or
-        /// `SPACEKIT_BLOCK_TIME_MS` for local dev.
+        /// For agent/storage/compute work use plain `network up` (no blockchain). With `--full` the
+        /// compute node produces blocks on its own, by default only when there is work (transactions,
+        /// due rewards) plus a heartbeat every 5 minutes. Set `[blockchain] production = "interval"`
+        /// in `~/.spacekit/network/config.toml` for a block every `block_time_ms` (default 10 s),
+        /// or tune `heartbeat_secs` / `batch_window_ms`.
         #[arg(long)]
         full: bool,
     },
@@ -1981,7 +1994,7 @@ enum SimulatorCommands {
         base_custom_chain_id: Option<u64>,
     },
 
-    /// Show funded testnet accounts (100M ASTRA + 100M aUSD each)
+    /// Show funded testnet accounts (ASTRA balances)
     Accounts,
 
     /// VPN operations
@@ -7304,17 +7317,28 @@ async fn handle_storage_deploy(
                     Vec::new()
                 });
 
+        // Prices are ASTRA, the only currency; stored as wei (decimal string).
         let pricing_obj = match price.unwrap_or("free") {
             "free" | "0" | "0.00" => serde_json::json!({
                 "model": "free",
-                "amount_cents": 0
+                "asset": "ASTRA",
+                "amount_wei": "0"
             }),
             amount => {
-                let dollars = amount.parse::<f64>().unwrap_or(0.0);
-                let cents = (dollars * 100.0).round() as u64;
+                let astra = amount
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        Box::new(CliError::Config(format!(
+                            "--price must be \"free\" or an amount of ASTRA, got {amount}"
+                        )))
+                    })?;
                 serde_json::json!({
                     "model": "one-time",
-                    "amount_cents": cents
+                    "asset": "ASTRA",
+                    "amount_wei": crate::content_monetization::astra_to_wei(astra).to_string()
                 })
             }
         };
@@ -7873,6 +7897,8 @@ async fn handle_network_init(
     no_messaging: bool,
     no_compute: bool,
     enable_gateway: bool,
+    poa_genesis: Option<PathBuf>,
+    authority_wallet: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if port_offset > u16::MAX - crate::network_profile::DEFAULT_KEYMASTER_GUARDIAN_BASE_PORT {
         return Err(format!("port offset {port_offset} overflows default service ports").into());
@@ -7906,6 +7932,17 @@ async fn handle_network_init(
     let mut file = file;
     file.admission.allowlist = allowlist;
     file.admission.shared_genesis_hash = shared_genesis_hash;
+    if let Some(genesis) = poa_genesis {
+        let genesis = std::fs::canonicalize(&genesis)
+            .map_err(|e| format!("--poa-genesis {}: {e}", genesis.display()))?;
+        file.blockchain.enabled = true;
+        file.blockchain.poa.genesis_file = Some(genesis);
+    }
+    if let Some(wallet) = authority_wallet {
+        let wallet = std::fs::canonicalize(&wallet)
+            .map_err(|e| format!("--authority-wallet {}: {e}", wallet.display()))?;
+        file.blockchain.poa.authority_wallet = Some(wallet);
+    }
     let path = crate::network_profile::write_network_profile(&file, force)?;
     println!(
         "{} {}",
@@ -7979,6 +8016,8 @@ async fn handle_network_command(
             no_messaging,
             no_compute,
             enable_gateway,
+            poa_genesis,
+            authority_wallet,
         } => {
             handle_network_init(
                 *force,
@@ -8006,9 +8045,12 @@ async fn handle_network_command(
                 *no_messaging,
                 *no_compute,
                 *enable_gateway,
+                poa_genesis.clone(),
+                authority_wallet.clone(),
             )
             .await
         }
+        NetworkCommands::Devnet { action } => crate::network_devnet::handle(action).await,
         NetworkCommands::Up { detach, only, full } => {
             let only_list = only
                 .as_ref()
@@ -10480,9 +10522,8 @@ async fn handle_storage_node(action: &NodeAction) -> Result<(), Box<dyn std::err
 //             let accounts = net.list_funded_accounts().await;
 //             println!("\n💰 {} pre-funded testnet accounts:", accounts.len().to_string().yellow());
 //             for acct in &accounts {
-//                 println!("   {} — {} ASTRA + {} aUSD",
+//                 println!("   {} — {} ASTRA",
 //                     acct.address.green(),
-//                     "100M".yellow(),
 //                     "100M".yellow()
 //                 );
 //             }
@@ -10511,12 +10552,11 @@ async fn handle_storage_node(action: &NodeAction) -> Result<(), Box<dyn std::err
 //                 .map_err(|e| Box::new(CliError::ComputeNode(e.to_string())))?;
 //             let accounts = net.list_funded_accounts().await;
 //             println!("💰 {} pre-funded testnet accounts:\n", accounts.len().to_string().yellow());
-//             println!("{:<44} {:>16} {:>16}", "Address".bold(), "ASTRA".bold(), "aUSD".bold());
-//             println!("{}", "─".repeat(78));
+//             println!("{:<44} {:>16}", "Address".bold(), "ASTRA".bold());
+//             println!("{}", "─".repeat(61));
 //             for acct in &accounts {
-//                 println!("{:<44} {:>13}M   {:>13}M",
+//                 println!("{:<44} {:>13}M",
 //                     acct.address.green(),
-//                     "100".yellow(),
 //                     "100".yellow()
 //                 );
 //             }
@@ -14841,7 +14881,8 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
                     "access": "public",
                     "pricing": {
                         "model": pricing,
-                        "amount_ausd": 0,
+                        "asset": "ASTRA",
+                        "amount_wei": "0",
                     },
                     "artifacts": uploaded_fact_ids.iter().map(|(fid, path)| {
                         serde_json::json!({

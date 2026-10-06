@@ -15,6 +15,8 @@ pub mod access_control; // Access control and permissions
 pub mod compression; // Message compression
 pub mod config;
 pub mod encryption;
+pub mod entitlement;
+pub mod identity;
 pub mod gateway;
 pub mod handlers;
 pub mod history_store;
@@ -49,6 +51,65 @@ use crate::network_p2p::{P2PCommand, P2PMessage, P2PNetworkEvent};
 use libp2p::Multiaddr;
 use tokio::time::Duration;
 
+/// Gossip topic for group announcements and join requests.
+pub const GATEWAY_GROUPS_TOPIC: &str = "gateway/groups";
+
+/// Gateway traffic received from another node, with the libp2p peer that
+/// signed it (for binding DIDs to peers).
+#[derive(Debug, Clone)]
+pub enum GatewayNetworkEvent {
+    Envelope {
+        peer: String,
+        sender_did: String,
+        payload: serde_json::Value,
+        /// Signed by the key behind `sender_did`.
+        verified: bool,
+        /// The signed original (kept for backfill).
+        signed: Option<identity::SignedMessage>,
+    },
+    Group {
+        peer: String,
+        sender_did: String,
+        group: gateway::GroupInfo,
+        verified: bool,
+    },
+    Join {
+        peer: String,
+        sender_did: String,
+        request: gateway::GroupJoinRequest,
+        verified: bool,
+    },
+    BackfillRequest {
+        sender_did: String,
+        since: String,
+        verified: bool,
+    },
+    BackfillResponse {
+        to_did: String,
+        messages: Vec<identity::SignedMessage>,
+    },
+}
+
+/// The node's identity, if its private key certifies its DID.
+fn node_identity(config: &MessagingConfig) -> Option<identity::NodeIdentity> {
+    match identity::NodeIdentity::from_hex(&config.private_key) {
+        Ok(id) if id.did == config.node_did => Some(id),
+        Ok(id) => {
+            tracing::warn!(
+                "messaging: node_did {} is not the DID of private_key ({}); gateway messages \
+                 will be unsigned and peers that require signatures will drop them",
+                config.node_did,
+                id.did
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("messaging: private_key is not a k256 key ({e}); gateway messages will be unsigned");
+            None
+        }
+    }
+}
+
 /// Core messaging node that provides quantum-resistant group and direct messaging
 #[derive(Clone)]
 pub struct MessagingNode {
@@ -64,6 +125,12 @@ pub struct MessagingNode {
     directory_tx: broadcast::Sender<P2PMessage>,
     /// Browser/API envelopes received from other messaging processes
     gateway_tx: broadcast::Sender<serde_json::Value>,
+    /// Gateway traffic from other nodes with the libp2p peer that signed it:
+    /// envelopes addressed to this node, group announcements, join requests.
+    gateway_events_tx: broadcast::Sender<GatewayNetworkEvent>,
+    /// The key behind this node's DID; signs every gateway message it
+    /// publishes. `None` when the configured key does not certify the DID.
+    identity: Option<identity::NodeIdentity>,
     /// Node status
     status: Arc<RwLock<NodeStatus>>,
     /// Access control manager
@@ -162,6 +229,8 @@ impl MessagingNode {
         let (message_tx, _) = broadcast::channel(1000);
         let (directory_tx, _) = broadcast::channel(500);
         let (gateway_tx, _) = broadcast::channel(1000);
+        let (gateway_events_tx, _) = broadcast::channel(1000);
+        let identity = node_identity(&config);
 
         // Initialize with public node by default (can be changed)
         let access_control = Arc::new(access_control::AccessControlManager::new(NodeType::Public));
@@ -187,6 +256,8 @@ impl MessagingNode {
             message_tx,
             directory_tx,
             gateway_tx,
+            gateway_events_tx,
+            identity: identity.clone(),
             status,
             access_control,
         })
@@ -235,6 +306,8 @@ impl MessagingNode {
         let (message_tx, _) = broadcast::channel(1000);
         let (directory_tx, _) = broadcast::channel(500);
         let (gateway_tx, _) = broadcast::channel(1000);
+        let (gateway_events_tx, _) = broadcast::channel(1000);
+        let identity = node_identity(&config);
         let access_control = Arc::new(access_control::AccessControlManager::new(node_type));
 
         let status = Arc::new(RwLock::new(NodeStatus {
@@ -258,6 +331,8 @@ impl MessagingNode {
             message_tx,
             directory_tx,
             gateway_tx,
+            gateway_events_tx,
+            identity: identity.clone(),
             status,
             access_control,
         })
@@ -635,23 +710,102 @@ impl MessagingNode {
         self.gateway_tx.subscribe()
     }
 
+    /// This node's identity (key and self-certifying DID), when configured.
+    pub fn identity(&self) -> Option<&identity::NodeIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// Sign a gateway message with this node's key (when it has one).
+    fn seal(&self, message: P2PMessage) -> P2PMessage {
+        match &self.identity {
+            Some(id) => match serde_json::to_string(&message) {
+                Ok(body) => P2PMessage::Signed(id.sign(body)),
+                Err(_) => message,
+            },
+            None => message,
+        }
+    }
+
+    /// Gateway traffic from other nodes, with the peer that signed it.
+    pub fn subscribe_gateway_events(&self) -> broadcast::Receiver<GatewayNetworkEvent> {
+        self.gateway_events_tx.subscribe()
+    }
+
+    /// Announce a group this node is authoritative for.
+    pub async fn publish_gateway_group(&self, group: gateway::GroupInfo) -> Result<()> {
+        let network = self.network.lock().await;
+        network.publish_p2p_message(
+            GATEWAY_GROUPS_TOPIC,
+            self.seal(P2PMessage::GatewayGroup {
+                sender_did: self.config.node_did.clone(),
+                group,
+            }),
+        )
+    }
+
+    /// Send a join or leave request towards the group creator's node.
+    pub async fn publish_gateway_join(&self, request: gateway::GroupJoinRequest) -> Result<()> {
+        let network = self.network.lock().await;
+        network.publish_p2p_message(
+            GATEWAY_GROUPS_TOPIC,
+            self.seal(P2PMessage::GatewayGroupJoin {
+                sender_did: self.config.node_did.clone(),
+                request,
+            }),
+        )
+    }
+
     /// Publish an API envelope on the signed libp2p gossipsub transport.
+    /// Returns the signed message (when this node signs), to keep for backfill.
     pub async fn publish_gateway_envelope(
         &self,
         message_id: String,
         sender_did: String,
         recipient_dids: Vec<String>,
         payload: serde_json::Value,
+    ) -> Result<Option<identity::SignedMessage>> {
+        let sealed = self.seal(P2PMessage::GatewayEnvelope {
+            message_id,
+            sender_did,
+            recipient_dids,
+            payload,
+        });
+        let signed = match &sealed {
+            P2PMessage::Signed(m) => Some(m.clone()),
+            _ => None,
+        };
+        let network = self.network.lock().await;
+        network.publish_p2p_message("gateway/envelopes", sealed)?;
+        Ok(signed)
+    }
+
+    /// Ask peers for messages this node missed since `since` (RFC 3339).
+    pub async fn publish_backfill_request(&self, since: String) -> Result<()> {
+        let network = self.network.lock().await;
+        network.publish_p2p_message(
+            GATEWAY_GROUPS_TOPIC,
+            self.seal(P2PMessage::GatewayBackfillRequest {
+                sender_did: self.config.node_did.clone(),
+                since,
+                nonce: Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64,
+            }),
+        )
+    }
+
+    /// Answer a backfill request with signed originals.
+    pub async fn publish_backfill_response(
+        &self,
+        to_did: String,
+        messages: Vec<identity::SignedMessage>,
     ) -> Result<()> {
         let network = self.network.lock().await;
         network.publish_p2p_message(
-            "gateway/envelopes",
-            P2PMessage::GatewayEnvelope {
-                message_id,
-                sender_did,
-                recipient_dids,
-                payload,
-            },
+            GATEWAY_GROUPS_TOPIC,
+            self.seal(P2PMessage::GatewayBackfillResponse {
+                sender_did: self.config.node_did.clone(),
+                to_did,
+                messages,
+            }),
         )
     }
 
@@ -894,6 +1048,7 @@ impl MessagingNode {
         let mut network = self.network.lock().await;
         network.subscribe_p2p_topic("directory/lookup")?;
         network.subscribe_p2p_topic("gateway/envelopes")?;
+        network.subscribe_p2p_topic(GATEWAY_GROUPS_TOPIC)?;
         let scoped_topic = format!("directory/lookup/{}", self.config.node_did);
         network.subscribe_p2p_topic(&scoped_topic)?;
         let mut event_rx = network
@@ -908,6 +1063,7 @@ impl MessagingNode {
         };
         let directory_tx = self.directory_tx.clone();
         let gateway_tx = self.gateway_tx.clone();
+        let gateway_events_tx = self.gateway_events_tx.clone();
         let responder_did = self.config.node_did.clone();
         let status = self.status.clone();
 
@@ -921,7 +1077,78 @@ impl MessagingNode {
                         let mut status = status.write().await;
                         status.active_connections = status.active_connections.saturating_sub(1);
                     }
-                    P2PNetworkEvent::MessageReceived { message, .. } => match message.clone() {
+                    P2PNetworkEvent::MessageReceived { message, from } => {
+                        // Unwrap a signed gateway message; `verified` says the
+                        // signature is by the DID the inner message claims.
+                        let mut last_signed: Option<identity::SignedMessage> = None;
+                        let (message, verified) = match message {
+                            P2PMessage::Signed(signed) => {
+                                match serde_json::from_str::<P2PMessage>(&signed.body) {
+                                    Ok(inner @ (P2PMessage::GatewayEnvelope { .. }
+                                    | P2PMessage::GatewayGroup { .. }
+                                    | P2PMessage::GatewayGroupJoin { .. }
+                                    | P2PMessage::GatewayBackfillRequest { .. }
+                                    | P2PMessage::GatewayBackfillResponse { .. })) => {
+                                        let claimed = match &inner {
+                                            P2PMessage::GatewayEnvelope { sender_did, .. }
+                                            | P2PMessage::GatewayGroup { sender_did, .. }
+                                            | P2PMessage::GatewayGroupJoin { sender_did, .. }
+                                            | P2PMessage::GatewayBackfillRequest { sender_did, .. }
+                                            | P2PMessage::GatewayBackfillResponse { sender_did, .. } => {
+                                                sender_did.clone()
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        if !signed.signed_by(&claimed) {
+                                            tracing::warn!("messaging: dropped message signed by someone other than {claimed}");
+                                            continue;
+                                        }
+                                        last_signed = Some(signed.clone());
+                                        (inner, true)
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            other => (other, false),
+                        };
+                        match message.clone() {
+                        P2PMessage::GatewayGroup { sender_did, group } => {
+                            if sender_did != responder_did {
+                                let _ = gateway_events_tx.send(GatewayNetworkEvent::Group {
+                                    peer: from,
+                                    sender_did,
+                                    group,
+                                    verified,
+                                });
+                            }
+                        }
+                        P2PMessage::GatewayBackfillRequest { sender_did, since, .. } => {
+                            if sender_did != responder_did {
+                                let _ = gateway_events_tx.send(GatewayNetworkEvent::BackfillRequest {
+                                    sender_did,
+                                    since,
+                                    verified,
+                                });
+                            }
+                        }
+                        P2PMessage::GatewayBackfillResponse { to_did, messages, .. } => {
+                            if to_did == responder_did {
+                                let _ = gateway_events_tx.send(GatewayNetworkEvent::BackfillResponse {
+                                    to_did,
+                                    messages,
+                                });
+                            }
+                        }
+                        P2PMessage::GatewayGroupJoin { sender_did, request } => {
+                            if sender_did != responder_did {
+                                let _ = gateway_events_tx.send(GatewayNetworkEvent::Join {
+                                    peer: from,
+                                    sender_did,
+                                    request,
+                                    verified,
+                                });
+                            }
+                        }
                         P2PMessage::GatewayEnvelope {
                             sender_did,
                             recipient_dids,
@@ -931,6 +1158,13 @@ impl MessagingNode {
                             if sender_did != responder_did
                                 && recipient_dids.iter().any(|did| did == &responder_did)
                             {
+                                let _ = gateway_events_tx.send(GatewayNetworkEvent::Envelope {
+                                    peer: from,
+                                    sender_did: sender_did.clone(),
+                                    payload: payload.clone(),
+                                    verified,
+                                    signed: last_signed.clone(),
+                                });
                                 let _ = gateway_tx.send(payload);
                                 let mut status = status.write().await;
                                 status.messages_received_today += 1;
@@ -984,7 +1218,8 @@ impl MessagingNode {
                             let _ = directory_tx.send(message);
                         }
                         _ => {}
-                    },
+                        }
+                    }
                     _ => {}
                 }
             }

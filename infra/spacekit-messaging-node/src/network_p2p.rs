@@ -50,6 +50,32 @@ pub enum P2PMessage {
         recipient_dids: Vec<String>,
         payload: serde_json::Value,
     },
+    /// A gateway message (envelope, group, join) signed by its sender's DID
+    /// key (see `identity`). The body is the JSON of the inner message.
+    Signed(crate::identity::SignedMessage),
+    /// A group's state, announced by its creator's node (see `gateway`).
+    GatewayGroup {
+        sender_did: String,
+        group: crate::gateway::GroupInfo,
+    },
+    /// Ask peers for messages missed while offline (signed by the requester).
+    GatewayBackfillRequest {
+        sender_did: String,
+        /// RFC 3339: messages created after this.
+        since: String,
+        nonce: u64,
+    },
+    /// Signed originals for one requester (each verified on receipt).
+    GatewayBackfillResponse {
+        sender_did: String,
+        to_did: String,
+        messages: Vec<crate::identity::SignedMessage>,
+    },
+    /// A join or leave request, addressed to the group creator's node.
+    GatewayGroupJoin {
+        sender_did: String,
+        request: crate::gateway::GroupJoinRequest,
+    },
     /// Direct encrypted message
     DirectMessage {
         message_id: String,
@@ -170,8 +196,21 @@ impl P2PNetwork {
         event_tx: mpsc::UnboundedSender<P2PNetworkEvent>,
         command_rx: mpsc::UnboundedReceiver<P2PCommand>,
     ) -> Result<Self> {
-        // Generate or load identity
-        let local_key = identity::Keypair::generate_ed25519();
+        // A stable identity derived from the node's private key, so the peer
+        // id (which other nodes bind this node's DID to) survives restarts.
+        // Without a configured key the identity is ephemeral.
+        let local_key = if config.private_key.trim().is_empty() {
+            warn!("messaging: no private_key configured; using an ephemeral P2P identity");
+            identity::Keypair::generate_ed25519()
+        } else {
+            use sha2::{Digest, Sha256};
+            let mut seed: [u8; 32] = Sha256::new()
+                .chain_update(b"SPACEKIT-MESSAGING-P2P-v1")
+                .chain_update(config.private_key.trim().as_bytes())
+                .finalize()
+                .into();
+            identity::Keypair::ed25519_from_bytes(&mut seed)?
+        };
         let local_peer_id = PeerId::from(local_key.public());
 
         info!("Local peer ID: {}", local_peer_id);
@@ -424,8 +463,11 @@ impl P2PNetwork {
 
                 // Deserialize the message
                 if let Ok(p2p_message) = serde_json::from_slice::<P2PMessage>(&message.data) {
+                    // The signed author (strict validation checked the
+                    // signature), not the neighbour that forwarded it.
+                    let author = message.source.unwrap_or(propagation_source);
                     let _ = self.event_tx.send(P2PNetworkEvent::MessageReceived {
-                        from: propagation_source.to_string(),
+                        from: author.to_string(),
                         message: p2p_message,
                     });
                 }

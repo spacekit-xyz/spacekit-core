@@ -82,12 +82,13 @@ export {
   EntitlementOp, EntitlementStatus, ENTITLEMENT_EVENT,
   buildCreateListingInput, buildPurchaseInput, buildVerifyInput, parsePurchaseResult,
   buildGrantInput, parseGrantResult, buildRevokeInput,
+  buildVerifyListingInput, buildRenewInput,
   buyerPkHashFromPublicKeyHex,
   fetchRewrappedEnvelope, purchaseAndDownload,
   uploadDeliveryCapsule, grantAndPrepareDelivery, downloadWithEntitlement,
 } from "./entitlement.js";
 export type {
-  RewrapOptions, PurchaseAndDownloadOptions,
+  RewrapOptions, PurchaseAndDownloadOptions, SubmitLedgerCall,
   UploadDeliveryCapsuleOptions, GrantAndPrepareDeliveryOptions,
   DownloadWithEntitlementOptions,
 } from "./entitlement.js";
@@ -150,7 +151,6 @@ export {
   TESTNET_GENESIS_CONFIG,
   TESTNET_FUNDED_ADDRESSES,
   TESTNET_ASTRA_PER_ACCOUNT,
-  TESTNET_AUSD_PER_ACCOUNT,
   NETWORK_DECIMAL_PRESETS,
   getGenesisPresetForNetwork,
   computeGenesisHash,
@@ -328,7 +328,6 @@ export {
 } from "./intent_builder.js";
 export type {
   ExecuteContractAction,
-  VaultChargeAction,
   TransferAction,
   IntentAction,
   IntentConstraints,
@@ -378,3 +377,9 @@ export {
 export type { IntentMessagingAdapterOptions } from "./tools/intent_messaging_adapter.js";
 export { HttpPaymentAdapter, NoopPaymentAdapter } from "./tools/payments_adapter.js";
 export type { PaymentAdapterOptions } from "./tools/payments_adapter.js";
+
+// Messaging node client: P2P messaging, groups, paid channels, channel keys.
+export * from "./messaging/index.js";
+
+// The chain is the only ledger: balances, transfers, signed transactions.
+export * from "./chain/index.js";

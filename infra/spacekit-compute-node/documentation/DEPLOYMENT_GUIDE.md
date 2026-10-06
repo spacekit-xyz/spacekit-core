@@ -212,7 +212,7 @@ WASM_MEMORY_LIMIT_BYTES=1073741824  # 1GB
 WASM_EXECUTION_TIMEOUT_MS=30000     # 30 seconds
 WASM_FUEL_LIMIT=1000000
 
-# Cost Configuration
+# Cost Configuration (placeholder rates, in ASTRA; ASTRA is the only currency)
 COST_CPU_CYCLE_RATE=0.001
 COST_MEMORY_BYTE_RATE=0.0001
 COST_GPU_HOUR_RATE=2.50
@@ -330,8 +330,8 @@ impl Metrics {
         ).unwrap();
         
         let cost_total = Counter::new(
-            "gpu_wasm_cost_total_dollars",
-            "Total cost in dollars"
+            "gpu_wasm_cost_total_astra",
+            "Total cost in ASTRA"
         ).unwrap();
         
         let error_counter = Counter::new(
@@ -433,7 +433,7 @@ pub struct ExecutionRequest {
     #[validate(range(min = 1, max = 3600))] // Max 1 hour
     pub timeout_seconds: u64,
     
-    #[validate(range(min = 0.0, max = 1000.0))] // Max $1000
+    #[validate(range(min = 0.0, max = 1000.0))] // Max 1000 ASTRA (placeholder)
     pub max_cost: f64,
 }
 ```
@@ -455,8 +455,8 @@ impl Default for SecurityLimits {
             max_memory_bytes: 1024 * 1024 * 1024, // 1GB
             max_execution_time_ms: 30_000,         // 30 seconds
             max_gpu_memory_gb: 4.0,                // 4GB
-            max_cost_per_execution: 10.0,          // $10
-            max_daily_cost: 100.0,                 // $100
+            max_cost_per_execution: 10.0,          // 10 ASTRA (placeholder)
+            max_daily_cost: 100.0,                 // 100 ASTRA (placeholder)
             rate_limit_per_minute: 60,             // 60 requests/min
         }
     }

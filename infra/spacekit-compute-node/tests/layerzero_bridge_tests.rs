@@ -113,7 +113,6 @@ fn create_test_config() -> LayerZeroBridgeConfig {
         TokenBridgeMapping {
             astra_token: "0xETH_ASTRA".to_string(),
             wrapped_astra: Some("0xETH_WASTRA".to_string()),
-            usdc_token: "0xUSDC_ETH".to_string(),
             supported_tokens: HashMap::new(),
         },
     );
@@ -122,7 +121,6 @@ fn create_test_config() -> LayerZeroBridgeConfig {
         TokenBridgeMapping {
             astra_token: "0xARB_ASTRA".to_string(),
             wrapped_astra: Some("0xARB_WASTRA".to_string()),
-            usdc_token: "0xUSDC_ARB".to_string(),
             supported_tokens: HashMap::new(),
         },
     );

@@ -61,6 +61,15 @@ const MAX_CONTRACT_TABLE_ELEMENTS: usize = 100_000;
 /// explicit means a gas limit maps to a predictable instruction budget.
 const FUEL_PER_GAS: u64 = 1;
 
+/// Gas budget of one read-only contract call (`view_call`): one block's worth.
+pub const VIEW_CALL_GAS_LIMIT: u128 = 10_000_000;
+
+/// Gas charged for a plain value transfer (no contract code runs).
+pub const PLAIN_TRANSFER_GAS: u128 = 21_000;
+
+/// Largest accepted body of a read-only contract call.
+const MAX_VIEW_CALL_BYTES: u64 = 64 * 1024;
+
 /// Translate a transaction gas limit into a wasmtime fuel budget.
 fn fuel_for_gas_limit(gas_limit: u128) -> u64 {
     let scaled = gas_limit.saturating_mul(FUEL_PER_GAS as u128);
@@ -284,6 +293,10 @@ pub struct SwtchvmBlock {
     /// Verkle witness for stateless block validation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verkle_witness: Option<VerkleBlockWitness>,
+    /// The authority or validator that produced the block. Its seal must be
+    /// by this DID, and it earns the block's consensus reward.
+    #[serde(default)]
+    pub proposer_did: Option<String>,
 }
 
 /// Verkle witness included in blocks for stateless validation.
@@ -435,6 +448,13 @@ pub struct SwtchvmState {
     pub fact_packages: HashMap<String, String>,
     #[serde(skip)]
     verkle_tree: Option<QuantumTree<NistSisScheme>>,
+    /// Entries changed since the last checkpoint, with their earlier values.
+    #[serde(skip)]
+    journal: super::state_commitment::StateJournal,
+    /// LtHash over all entries as of the last checkpoint; `None` until first
+    /// computed (after loading a snapshot, for example).
+    #[serde(skip)]
+    commitment: Option<super::state_commitment::LtHash>,
 }
 
 impl std::fmt::Debug for SwtchvmState {
@@ -460,6 +480,8 @@ impl Clone for SwtchvmState {
             contract_kv: self.contract_kv.clone(),
             fact_packages: self.fact_packages.clone(),
             verkle_tree: None,
+            journal: self.journal.clone(),
+            commitment: self.commitment.clone(),
         };
         cloned.rebuild_verkle_tree();
         cloned
@@ -467,6 +489,11 @@ impl Clone for SwtchvmState {
 }
 
 impl SwtchvmState {
+    /// Sum of all native balances: every ASTRA in existence.
+    pub fn total_supply(&self) -> u128 {
+        self.accounts.values().map(|a| a.balance).fold(0u128, u128::saturating_add)
+    }
+
     pub fn new() -> Self {
         Self {
             accounts: HashMap::new(),
@@ -475,6 +502,8 @@ impl SwtchvmState {
             contract_kv: HashMap::new(),
             fact_packages: HashMap::new(),
             verkle_tree: Some(new_quantum_tree()),
+            journal: Default::default(),
+            commitment: None,
         }
     }
 
@@ -488,6 +517,10 @@ impl SwtchvmState {
     }
 
     pub fn get_account_mut(&mut self, address: &SwtchvmAddress) -> &mut SwtchvmAccount {
+        if !self.journal.accounts.contains_key(address) {
+            let before = self.accounts.get(address).cloned();
+            self.journal.accounts.insert(*address, before);
+        }
         self.accounts
             .entry(*address)
             .or_insert_with(|| SwtchvmAccount {
@@ -508,6 +541,10 @@ impl SwtchvmState {
     }
 
     pub fn set_storage(&mut self, address: &SwtchvmAddress, key: [u8; 32], value: [u8; 32]) {
+        if !self.journal.storage.contains_key(&(*address, key)) {
+            let before = self.storage.get(&(*address, key)).copied();
+            self.journal.storage.insert((*address, key), before);
+        }
         if value == [0u8; 32] {
             self.storage.remove(&(*address, key));
             if let Some(tree) = &mut self.verkle_tree {
@@ -553,22 +590,140 @@ impl SwtchvmState {
         format!("0x{}", hex::encode(hasher.finalize()))
     }
 
+    /// Write a contract KV entry (journaled).
+    pub fn kv_insert(&mut self, address: SwtchvmAddress, key: Vec<u8>, value: Vec<u8>) {
+        let k = (address, key);
+        if !self.journal.kv.contains_key(&k) {
+            let before = self.contract_kv.get(&k).cloned();
+            self.journal.kv.insert(k.clone(), before);
+        }
+        self.contract_kv.insert(k, value);
+    }
+
+    /// Delete a contract KV entry (journaled).
+    pub fn kv_remove(&mut self, address: SwtchvmAddress, key: &[u8]) {
+        let k = (address, key.to_vec());
+        if !self.contract_kv.contains_key(&k) {
+            return;
+        }
+        if !self.journal.kv.contains_key(&k) {
+            let before = self.contract_kv.get(&k).cloned();
+            self.journal.kv.insert(k.clone(), before);
+        }
+        self.contract_kv.remove(&k);
+    }
+
+    pub fn kv_get(&self, address: &SwtchvmAddress, key: &[u8]) -> Option<&Vec<u8>> {
+        self.contract_kv.get(&(*address, key.to_vec()))
+    }
+
+    fn full_commitment(&self) -> super::state_commitment::LtHash {
+        use super::state_commitment::{account_entry, kv_entry, storage_entry, LtHash};
+        let mut h = LtHash::default();
+        for (addr, account) in &self.accounts {
+            h.add(&account_entry(addr, account));
+        }
+        for ((addr, key), value) in &self.contract_kv {
+            h.add(&kv_entry(addr, key, value));
+        }
+        for ((addr, key), value) in &self.storage {
+            h.add(&storage_entry(addr, key, value));
+        }
+        h
+    }
+
+    /// Apply the journal's changes to `h` (old entries out, current ones in).
+    fn fold_journal_into(&self, h: &mut super::state_commitment::LtHash) {
+        use super::state_commitment::{account_entry, kv_entry, storage_entry};
+        for (addr, before) in &self.journal.accounts {
+            if let Some(old) = before {
+                h.remove(&account_entry(addr, old));
+            }
+            if let Some(cur) = self.accounts.get(addr) {
+                h.add(&account_entry(addr, cur));
+            }
+        }
+        for ((addr, key), before) in &self.journal.kv {
+            if let Some(old) = before {
+                h.remove(&kv_entry(addr, key, old));
+            }
+            if let Some(cur) = self.contract_kv.get(&(*addr, key.clone())) {
+                h.add(&kv_entry(addr, key, cur));
+            }
+        }
+        for ((addr, key), before) in &self.journal.storage {
+            if let Some(old) = before {
+                h.remove(&storage_entry(addr, key, old));
+            }
+            if let Some(cur) = self.storage.get(&(*addr, *key)) {
+                h.add(&storage_entry(addr, key, cur));
+            }
+        }
+    }
+
+    /// Commitment to the whole state (see `state_commitment`): every account,
+    /// contract KV entry and storage slot.
     pub fn state_root(&self) -> [u8; 32] {
-        if let Some(tree) = &self.verkle_tree {
-            return tree.root().0;
+        match &self.commitment {
+            Some(h) if self.journal.is_empty() => h.root(),
+            Some(h) => {
+                let mut h = h.clone();
+                self.fold_journal_into(&mut h);
+                h.root()
+            }
+            None => self.full_commitment().root(),
         }
-        let leaves = state_merkle_leaves(self);
-        let root = merkle_root_from_leaves(&leaves);
-        if root == "merkle:empty" {
-            return [0u8; 32];
+    }
+
+    /// Checkpoint: fold pending changes into the commitment and return the
+    /// root together with the journal (the values from before the changes),
+    /// which undoes them.
+    pub fn checkpoint(&mut self) -> ([u8; 32], super::state_commitment::StateJournal) {
+        let journal = std::mem::take(&mut self.journal);
+        let h = match self.commitment.take() {
+            Some(mut h) => {
+                let saved = std::mem::replace(&mut self.journal, journal);
+                self.fold_journal_into(&mut h);
+                let journal = std::mem::replace(&mut self.journal, saved);
+                let root = h.root();
+                self.commitment = Some(h);
+                return (root, journal);
+            }
+            None => self.full_commitment(),
+        };
+        let root = h.root();
+        self.commitment = Some(h);
+        (root, journal)
+    }
+
+    /// Undo a checkpointed journal (restore the values it recorded). Pending
+    /// changes are checkpointed first; the restore itself is checkpointed too.
+    pub fn revert(&mut self, undo: super::state_commitment::StateJournal) -> [u8; 32] {
+        let _ = self.checkpoint();
+        for (addr, before) in undo.accounts {
+            if !self.journal.accounts.contains_key(&addr) {
+                let cur = self.accounts.get(&addr).cloned();
+                self.journal.accounts.insert(addr, cur);
+            }
+            match before {
+                Some(account) => {
+                    self.accounts.insert(addr, account);
+                }
+                None => {
+                    self.accounts.remove(&addr);
+                }
+            }
         }
-        let bytes = hex::decode(root).unwrap_or_default();
-        if bytes.len() != 32 {
-            return [0u8; 32];
+        for ((addr, key), before) in undo.kv {
+            match before {
+                Some(value) => self.kv_insert(addr, key, value),
+                None => self.kv_remove(addr, &key),
+            }
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        out
+        for ((addr, key), before) in undo.storage {
+            self.set_storage(&addr, key, before.unwrap_or([0u8; 32]));
+        }
+        self.checkpoint().0
     }
 
     /// Legacy merkle state root (for backwards compatibility / comparison).
@@ -638,9 +793,18 @@ pub struct SwtchvmRuntime {
     l1_persistence: L1PersistenceConfig,
     /// Transaction digests (SHA-256 of bincode(`SwtchvmTransaction`)) batched into the next snapshot `tx_root`.
     commit_tx_digests: StdMutex<Vec<[u8; 32]>>,
+    /// Numeric chain id bound into transaction signatures (`SPACEKIT-TX-v2`).
+    tx_chain_id: std::sync::atomic::AtomicU64,
+    /// Whether contracts may read outside the chain (storage-node fallback).
+    /// Off on multi-node networks, where results must be identical everywhere.
+    external_reads: AtomicBool,
 }
 
 impl SwtchvmRuntime {
+    pub fn external_reads_allowed(&self) -> bool {
+        self.external_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn init_runtime_identity() -> Option<Arc<QuantumResistantDID>> {
         let did = env::var("SPACEKIT_NODE_DID").ok()?;
         let identity =
@@ -729,7 +893,7 @@ impl SwtchvmRuntime {
             .trim_start_matches("0x");
         let addr = SwtchvmAddress::from_hex(hex)?;
         let mut state = self.state.write().await;
-        state.contract_kv.insert((addr, key.to_vec()), value);
+        state.kv_insert(addr, key.to_vec(), value);
         Ok(())
     }
 
@@ -895,6 +1059,8 @@ impl SwtchvmRuntime {
             state_persistence_path,
             l1_persistence,
             commit_tx_digests: StdMutex::new(Vec::new()),
+            tx_chain_id: std::sync::atomic::AtomicU64::new(1337),
+            external_reads: AtomicBool::new(true),
         })
     }
 
@@ -1239,7 +1405,6 @@ impl SwtchvmRuntime {
                     constraint_state: super::tool_policy::ConstraintState::new(),
                     tool_effects: Vec::new(),
                     buffered_messages: Vec::new(),
-                    buffered_payments: Vec::new(),
                     pending_tool_requests: Vec::new(),
                     limiter: ContractResourceLimiter::new(),
                 },
@@ -1485,44 +1650,78 @@ impl SwtchvmRuntime {
         context: SwtchvmContext,
     ) -> Result<SwtchvmExecutionResult> {
         self.verify_signature(tx)?;
+        self.execute_transaction_unverified(tx, context).await
+    }
 
+    /// Execute a protocol system transaction (e.g. Service Reward Accumulator
+    /// credits) without a user signature.
+    ///
+    /// Only block production and block import call this, and only for the
+    /// leading system transactions that every node derives independently from
+    /// chain state (see `SraHost::plan_block`). Mempool transactions always go
+    /// through [`execute_transaction`](Self::execute_transaction).
+    pub(crate) async fn execute_system_transaction(
+        &self,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
+        self.execute_transaction_unverified(tx, context).await
+    }
+
+    async fn execute_transaction_unverified(
+        &self,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
         let outcome: Result<SwtchvmExecutionResult> = async {
             let mut state = self.state.write().await;
-            let sender = state.get_account_mut(&tx.from);
-
-            if sender.nonce != tx.nonce {
+            // Checked without touching state: a transaction refused here is
+            // left out of the block, so it must not change anything.
+            let (nonce, balance) = state
+                .get_account(&tx.from)
+                .map(|a| (a.nonce, a.balance))
+                .unwrap_or((0, 0));
+            if nonce != tx.nonce {
                 return Err(anyhow::anyhow!("Invalid nonce"));
             }
-
-            let gas_cost = tx.gas_limit * tx.gas_price;
-            if sender.balance < gas_cost + tx.value {
+            let gas_cost = tx
+                .gas_limit
+                .checked_mul(tx.gas_price)
+                .ok_or_else(|| anyhow::anyhow!("Insufficient balance"))?;
+            let required = gas_cost
+                .checked_add(tx.value)
+                .ok_or_else(|| anyhow::anyhow!("Insufficient balance"))?;
+            if balance < required {
                 return Err(anyhow::anyhow!("Insufficient balance"));
             }
 
-            sender.nonce += 1;
-            sender.balance -= gas_cost;
+            // The nonce and the gas budget are always consumed.
+            {
+                let sender = state.get_account_mut(&tx.from);
+                sender.nonce += 1;
+                sender.balance -= gas_cost;
+            }
 
-            let inner = if let Some(to_address) = tx.to {
-                self.call_contract(&mut state, &tx.from, &to_address, &tx.data, context)
-                    .await
+            // Everything else is the transaction's effect, recorded in its own
+            // journal so a failure undoes all of it (value, contract writes).
+            let block_journal = std::mem::take(&mut state.journal);
+            let inner = self.apply_transaction_effects(&mut state, tx, context).await;
+            let failed = !matches!(&inner, Ok(result) if result.success);
+            if failed {
+                let (_, undo) = state.checkpoint();
+                state.revert(undo);
+                state.journal = block_journal;
             } else {
-                self.create_contract(&mut state, &tx.from, &tx.data, context)
-                    .await
-            };
+                let tx_journal = std::mem::replace(&mut state.journal, block_journal);
+                state.journal.absorb(tx_journal);
+            }
 
             match inner {
                 Ok(result) => {
-                    let gas_refund = (tx.gas_limit - result.gas_used) * tx.gas_price;
+                    let unused = tx.gas_limit.saturating_sub(result.gas_used);
+                    let refund = unused.saturating_mul(tx.gas_price);
                     let sender = state.get_account_mut(&tx.from);
-                    sender.balance += gas_refund;
-
-                    if tx.value > 0 {
-                        if let Some(to_address) = tx.to {
-                            let recipient = state.get_account_mut(&to_address);
-                            recipient.balance += tx.value;
-                        }
-                    }
-
+                    sender.balance = sender.balance.saturating_add(refund);
                     Ok(result)
                 }
                 Err(e) => Err(e),
@@ -1536,6 +1735,95 @@ impl SwtchvmRuntime {
 
         self.persist_state_if_configured().await;
         outcome
+    }
+
+    /// Move the transaction's value and run it. Value moves before a call
+    /// (so the contract sees it in its balance) and after a deployment (to the
+    /// new contract). A transaction to an address without code is a plain
+    /// transfer if it carries no data.
+    async fn apply_transaction_effects(
+        &self,
+        state: &mut SwtchvmState,
+        tx: &SwtchvmTransaction,
+        context: SwtchvmContext,
+    ) -> Result<SwtchvmExecutionResult> {
+        let move_value = |state: &mut SwtchvmState, to: &SwtchvmAddress| {
+            if tx.value > 0 && *to != tx.from {
+                state.get_account_mut(&tx.from).balance -= tx.value;
+                let recipient = state.get_account_mut(to);
+                recipient.balance = recipient.balance.saturating_add(tx.value);
+            }
+        };
+        match tx.to {
+            Some(to) => {
+                let has_code = state.get_account(&to).is_some_and(|a| a.code.is_some());
+                if !has_code {
+                    if !tx.data.is_empty() {
+                        return Err(anyhow::anyhow!("No code at address"));
+                    }
+                    move_value(state, &to);
+                    return Ok(SwtchvmExecutionResult {
+                        success: true,
+                        return_data: Vec::new(),
+                        gas_used: PLAIN_TRANSFER_GAS.min(tx.gas_limit),
+                        compute_units: 0,
+                        memory_used: 0,
+                        storage_changes: HashMap::new(),
+                        logs: Vec::new(),
+                        created_address: None,
+                        pq_signature: None,
+                        pq_signer_did: None,
+                        tool_effects: Vec::new(),
+                    });
+                }
+                move_value(state, &to);
+                self.call_contract(state, &tx.from, &to, &tx.data, context).await
+            }
+            None => {
+                let result = self.create_contract(state, &tx.from, &tx.data, context).await?;
+                if let (true, Some(created)) = (result.success, result.created_address) {
+                    move_value(state, &created);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Read-only contract call: run `call_data` against the current state and
+    /// undo every change it made. No nonce, gas or balance is charged, nothing
+    /// is persisted, and the pending journal of a block being produced is left
+    /// exactly as it was (the call's own changes are folded into the
+    /// commitment and reverted, a net change of zero).
+    pub async fn view_call(
+        &self,
+        contract: &SwtchvmAddress,
+        call_data: &[u8],
+        block_number: u64,
+        block_timestamp: u64,
+    ) -> Result<SwtchvmExecutionResult> {
+        let mut state = self.state.write().await;
+        if state.get_account(contract).and_then(|a| a.code.as_ref()).is_none() {
+            return Err(anyhow::anyhow!("no contract at 0x{}", hex::encode(contract.as_bytes())));
+        }
+        let pending = std::mem::take(&mut state.journal);
+        let caller = SwtchvmAddress::new([0u8; 20]);
+        let context = SwtchvmContext {
+            caller,
+            origin: caller,
+            gas_price: 0,
+            gas_limit: VIEW_CALL_GAS_LIMIT,
+            gas_used: 0,
+            block_number,
+            block_timestamp,
+            value: 0,
+        };
+        let result = self
+            .call_contract(&mut state, &caller, contract, call_data, context)
+            .await;
+        let (_, undo) = state.checkpoint();
+        state.revert(undo);
+        state.journal = pending;
+        result
     }
 
     async fn call_contract(
@@ -1580,7 +1868,6 @@ impl SwtchvmRuntime {
                 constraint_state: super::tool_policy::ConstraintState::new(),
                 tool_effects: Vec::new(),
                 buffered_messages: Vec::new(),
-                buffered_payments: Vec::new(),
                 pending_tool_requests: Vec::new(),
                 limiter: ContractResourceLimiter::new(),
             },
@@ -1990,11 +2277,12 @@ impl SwtchvmRuntime {
         let Some(data) = Self::read_contract_mem_vec(&mut caller, data_ptr, data_len) else {
             return 0;
         };
-        let caller_addr = unsafe { (*caller.data().context).caller };
+        // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
         unsafe {
-            (*caller.data_mut().state)
-                .contract_kv
-                .insert((caller_addr, key), data);
+            (*caller.data_mut().state).kv_insert(caller_addr, key, data);
         }
         data_len
     }
@@ -2019,14 +2307,19 @@ impl SwtchvmRuntime {
         if max_len <= 0 {
             return 0;
         }
-        let caller_addr = unsafe { (*caller.data().context).caller };
+        // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
         let mut blob = unsafe {
             (*caller.data().state)
                 .contract_kv
                 .get(&(caller_addr, key.clone()))
                 .cloned()
         };
-        if blob.is_none() {
+        // The storage-node fallback reads data outside the chain, so nodes
+        // could compute different results; it is off on consensus networks.
+        if blob.is_none() && unsafe { (*caller.data().runtime).external_reads_allowed() } {
             #[cfg(feature = "storage-integration")]
             {
                 let key_s = String::from_utf8_lossy(&key).to_string();
@@ -2087,7 +2380,10 @@ impl SwtchvmRuntime {
                 let Some(key) = Self::read_contract_mem_vec(&mut caller, key_ptr, key_len) else {
                     return -1;
                 };
-                let caller_addr = unsafe { (*caller.data().context).caller };
+                // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
                 let value_opt = unsafe {
                     (*caller.data().state)
                         .contract_kv
@@ -2480,14 +2776,19 @@ impl SwtchvmRuntime {
                 let Some(key) = Self::read_contract_mem_vec(&mut caller, key_ptr, key_len) else {
                     return -2;
                 };
-                let caller_addr = unsafe { (*caller.data().context).caller };
+                // Contract storage is namespaced by the executing contract, not by
+                // whoever sent the transaction. Keying by the caller gave every
+                // sender a private copy of the contract's state.
+                let caller_addr = contract_kv_namespace(caller.data());
                 let mut blob = unsafe {
                     (*caller.data().state)
                         .contract_kv
                         .get(&(caller_addr, key.clone()))
                         .cloned()
                 };
-                if blob.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
+                if blob.as_ref().map(|b| b.is_empty()).unwrap_or(true)
+                    && unsafe { (*caller.data().runtime).external_reads_allowed() }
+                {
                     #[cfg(feature = "storage-integration")]
                     {
                         let key_s = String::from_utf8_lossy(&key).to_string();
@@ -2829,134 +3130,93 @@ impl SwtchvmRuntime {
                     }
                 }
 
-                store.buffered_payments.push(BufferedPaymentEffect {
-                    effect_type: "transfer".into(),
-                    to: to.clone(),
-                    asset,
-                    amount: amount.to_string(),
-                    beneficiary: None,
-                });
-                store
+                // Payments are native ASTRA, paid now from the executing
+                // contract's own balance (like `transfer_u128`), and undone
+                // with the rest of the transaction if it fails.
+                let refused = if !spacekit_payments::intent::is_astra_asset(&asset) {
+                    Some((
+                        super::tool_policy::SKTCS_UNSUPPORTED_ASSET,
+                        format!("asset {asset} is not ASTRA; SpaceKit settles only in ASTRA"),
+                    ))
+                } else if amount <= 0 {
+                    Some((super::tool_policy::SKTCS_OUT_OF_RANGE, "amount must be positive".into()))
+                } else {
+                    None
+                };
+                let payee = payee_address(&to);
+                let outcome = match (refused, payee) {
+                    (Some(r), _) => Err(r),
+                    (None, None) => Err((
+                        super::tool_policy::SKTCS_INVALID_FORMAT,
+                        format!("payee {to} is not an address or did:spacekit DID"),
+                    )),
+                    (None, Some(payee)) => {
+                        if contract_transfer(&mut caller, &payee, amount as u128) == 0 {
+                            Ok(())
+                        } else {
+                            Err((
+                                super::tool_policy::SKTCS_PAYMENT_FAILED,
+                                "the contract's ASTRA balance does not cover the payment".into(),
+                            ))
+                        }
+                    }
+                };
+                let (code, status, reason, cost) = match outcome {
+                    Ok(()) => (1, "fulfilled", None, amount.to_string()),
+                    Err((code, reason)) => (code, "rejected", Some(reason), "0".to_string()),
+                };
+                caller
+                    .data_mut()
                     .tool_effects
                     .push(super::tool_policy::ToolEffectRecord {
                         tool_id: "payment_transfer".into(),
                         caller_did,
                         params_hash: String::new(),
                         result_hash: None,
-                        cost_charged: "0".into(),
+                        cost_charged: cost,
                         timestamp: ts_now_ms(),
                         effect_round: 0,
-                        status: "fulfilled".into(),
-                        reason: None,
+                        status: status.into(),
+                        reason,
                     });
-                1
+                code
             },
         )?;
 
+        // aUSD vault charges no longer exist: SpaceKit settles only in ASTRA.
+        // The import stays so existing contracts still link; every call is
+        // refused and recorded. Contracts pay with `payment_transfer` (asset
+        // "ASTRA") or `transfer_u128`.
         linker.func_wrap(
             "spacekit_payments",
             "payment_vault_charge",
             |mut caller: Caller<'_, SwtchvmStoreData>,
-             amount_ptr: i32,
-             amount_len: i32,
-             beneficiary_ptr: i32,
-             beneficiary_len: i32|
+             _amount_ptr: i32,
+             _amount_len: i32,
+             _beneficiary_ptr: i32,
+             _beneficiary_len: i32|
              -> i32 {
-                let amount_str =
-                    match Self::read_contract_mem_vec(&mut caller, amount_ptr, amount_len) {
-                        Some(b) => String::from_utf8_lossy(&b).to_string(),
-                        None => return -2,
-                    };
-                let beneficiary = match Self::read_contract_mem_vec(
-                    &mut caller,
-                    beneficiary_ptr,
-                    beneficiary_len,
-                ) {
-                    Some(b) => String::from_utf8_lossy(&b).to_string(),
-                    None => return -2,
-                };
-
                 let caller_did = {
                     let ctx = unsafe { &*caller.data().context };
                     format!("did:spacekit:{}", hex::encode(ctx.caller.as_bytes()))
                 };
-
-                let store = caller.data_mut();
-                if let Some(ref manifest) = store.tool_manifest {
-                    if let Some(tool_def) = manifest.tools.get("payment_vault_charge") {
-                        let mut params = std::collections::HashMap::new();
-                        params.insert(
-                            "amount".to_string(),
-                            serde_json::Value::String(amount_str.clone()),
-                        );
-                        params.insert(
-                            "beneficiary".to_string(),
-                            serde_json::Value::String(beneficiary.clone()),
-                        );
-                        if let Err((code, reason)) =
-                            super::tool_policy::validate_tool_params(tool_def, &params)
-                        {
-                            store
-                                .tool_effects
-                                .push(super::tool_policy::ToolEffectRecord {
-                                    tool_id: "payment_vault_charge".into(),
-                                    caller_did: caller_did.clone(),
-                                    params_hash: String::new(),
-                                    result_hash: None,
-                                    cost_charged: "0".into(),
-                                    timestamp: ts_now_ms(),
-                                    effect_round: 0,
-                                    status: "rejected".into(),
-                                    reason: Some(reason),
-                                });
-                            return code;
-                        }
-                        if let Err((code, reason)) = super::tool_policy::check_constraints(
-                            "payment_vault_charge",
-                            tool_def,
-                            &caller_did,
-                            &mut store.constraint_state,
-                            Some(&params),
-                        ) {
-                            store
-                                .tool_effects
-                                .push(super::tool_policy::ToolEffectRecord {
-                                    tool_id: "payment_vault_charge".into(),
-                                    caller_did: caller_did.clone(),
-                                    params_hash: String::new(),
-                                    result_hash: None,
-                                    cost_charged: "0".into(),
-                                    timestamp: ts_now_ms(),
-                                    effect_round: 0,
-                                    status: "rejected".into(),
-                                    reason: Some(reason),
-                                });
-                            return code;
-                        }
-                    }
-                }
-
-                store.buffered_payments.push(BufferedPaymentEffect {
-                    effect_type: "vault_charge".into(),
-                    to: beneficiary.clone(),
-                    asset: "ausd".into(),
-                    amount: amount_str.clone(),
-                    beneficiary: Some(beneficiary),
-                });
-                store
+                caller
+                    .data_mut()
                     .tool_effects
                     .push(super::tool_policy::ToolEffectRecord {
                         tool_id: "payment_vault_charge".into(),
                         caller_did,
                         params_hash: String::new(),
                         result_hash: None,
-                        cost_charged: amount_str,
+                        cost_charged: "0".into(),
                         timestamp: ts_now_ms(),
                         effect_round: 0,
-                        status: "fulfilled".into(),
-                        reason: None,
+                        status: "rejected".into(),
+                        reason: Some(
+                            "vault charges were removed; pay in ASTRA with payment_transfer".into(),
+                        ),
                     });
-                1
+                super::tool_policy::SKTCS_UNSUPPORTED_ASSET
             },
         )?;
 
@@ -3261,172 +3521,99 @@ impl SwtchvmRuntime {
     fn add_payment_host_functions(&self, linker: &mut Linker<SwtchvmStoreData>) -> Result<()> {
         eprintln!("💰 Registering payment host functions for service marketplace...");
 
-        // msg_value() - Get payment sent with this call
+        // Value is native ASTRA in wei (u128). The i64 forms saturate at
+        // i64::MAX; contracts handling large amounts use the `_u128` forms,
+        // which write 16 little-endian bytes.
+
+        // msg_value() - value attached to this call (saturating i64)
         linker.func_wrap(
             "env",
             "msg_value",
             |caller: Caller<'_, SwtchvmStoreData>| -> i64 {
-                let store_data = caller.data();
-                unsafe { (*store_data.context).value as i64 }
+                let value = unsafe { (*caller.data().context).value };
+                saturating_i64(value)
             },
         )?;
 
-        // get_balance(address_ptr) - Get balance of an address
+        // msg_value_u128(out_ptr) - value attached to this call; 0 ok, 1 error
+        linker.func_wrap(
+            "env",
+            "msg_value_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, out_ptr: i32| -> i32 {
+                let value = unsafe { (*caller.data().context).value };
+                write_u128(&mut caller, out_ptr, value)
+            },
+        )?;
+
+        // get_balance(address_ptr) - native balance of an address (saturating i64)
         linker.func_wrap(
             "env",
             "get_balance",
             |mut caller: Caller<'_, SwtchvmStoreData>, address_ptr: i32| -> i64 {
-                eprintln!("💰 get_balance called for address at ptr {}", address_ptr);
-
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return 0,
-                };
-
-                let memory_data = memory.data(&caller);
-
-                // Read 20-byte address
-                if (address_ptr as usize + 20) > memory_data.len() {
-                    eprintln!("❌ Address pointer out of bounds");
-                    return 0;
-                }
-
-                let mut addr_bytes = [0u8; 20];
-                addr_bytes
-                    .copy_from_slice(&memory_data[address_ptr as usize..address_ptr as usize + 20]);
-                let address = SwtchvmAddress::new(addr_bytes);
-
-                let store_data = caller.data();
-                unsafe {
-                    if let Some(account) = (*store_data.state).get_account(&address) {
-                        eprintln!("💰 Balance for {:?}: {}", address, account.balance);
-                        account.balance as i64
-                    } else {
-                        eprintln!("💰 Account not found, balance: 0");
-                        0
-                    }
+                match read_address(&mut caller, address_ptr) {
+                    Some(address) => saturating_i64(native_balance(&caller, &address)),
+                    None => 0,
                 }
             },
         )?;
 
-        // transfer(to_ptr, amount) - Transfer tokens to address.
-        // If the recipient is a contract, invoke `spacekit_receive` (or `spacekit_fallback` if
-        // receive is absent), mirroring Ethereum's receive()/fallback() pattern.
+        // get_balance_u128(address_ptr, out_ptr) - native balance; 0 ok, 1 error
+        linker.func_wrap(
+            "env",
+            "get_balance_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, address_ptr: i32, out_ptr: i32| -> i32 {
+                let Some(address) = read_address(&mut caller, address_ptr) else {
+                    return 1;
+                };
+                let balance = native_balance(&caller, &address);
+                write_u128(&mut caller, out_ptr, balance)
+            },
+        )?;
+
+        // transfer(to_ptr, amount) - pay `amount` wei from the *executing
+        // contract's own* balance to `to`. Returns 0 on success, 1 on failure.
+        // A contract can never spend its caller's balance: callers fund a
+        // contract only by attaching value to the call.
         linker.func_wrap(
             "env",
             "transfer",
             |mut caller: Caller<'_, SwtchvmStoreData>, to_ptr: i32, amount: i64| -> i32 {
-                eprintln!(
-                    "💸 transfer called: {} tokens to address at ptr {}",
-                    amount, to_ptr
-                );
-
                 if amount <= 0 {
-                    eprintln!("❌ Invalid amount");
                     return 1;
                 }
-
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return 1,
-                };
-
-                let memory_data = memory.data(&caller);
-
-                if (to_ptr as usize + 20) > memory_data.len() {
-                    eprintln!("❌ Address pointer out of bounds");
+                let Some(to) = read_address(&mut caller, to_ptr) else {
                     return 1;
-                }
-
-                let mut to_bytes = [0u8; 20];
-                to_bytes.copy_from_slice(&memory_data[to_ptr as usize..to_ptr as usize + 20]);
-                let to_address = SwtchvmAddress::new(to_bytes);
-
-                let store_data = caller.data_mut();
-                let (from_address, recipient_has_code) = unsafe {
-                    let from_address = (*store_data.context).caller;
-
-                    if let Some(from_account) = (*store_data.state).accounts.get(&from_address) {
-                        if from_account.balance < amount as u128 {
-                            eprintln!(
-                                "❌ Insufficient balance: {} < {}",
-                                from_account.balance, amount
-                            );
-                            return 1;
-                        }
-                    } else {
-                        eprintln!("❌ Sender account not found");
-                        return 1;
-                    }
-
-                    let from_account = (*store_data.state).get_account_mut(&from_address);
-                    from_account.balance -= amount as u128;
-
-                    let to_account = (*store_data.state).get_account_mut(&to_address);
-                    to_account.balance += amount as u128;
-
-                    let has_code =
-                        to_account.code.is_some() && !to_account.code.as_ref().unwrap().is_empty();
-                    eprintln!(
-                        "✅ Transferred {} from {:?} to {:?} (contract={})",
-                        amount, from_address, to_address, has_code
-                    );
-                    (from_address, has_code)
                 };
-
-                // receive()/fallback(): if the recipient is a contract, try to invoke
-                // `spacekit_receive` (no-arg callback). If absent, try `spacekit_fallback`.
-                // If neither exists, the transfer still succeeds (EOA-style).
-                // Revert semantics: if the callback traps, we revert the credit.
-                if recipient_has_code {
-                    let wasm_code = unsafe {
-                        (*store_data.state)
-                            .get_account(&to_address)
-                            .and_then(|a| a.code.clone())
-                    };
-                    if let Some(code) = wasm_code {
-                        let engine = caller.engine().clone();
-                        if let Ok(module) = Module::new(&engine, &code) {
-                            let receive_exists =
-                                module.exports().any(|e| e.name() == "spacekit_receive");
-                            let fallback_exists =
-                                module.exports().any(|e| e.name() == "spacekit_fallback");
-                            let target_fn = if receive_exists {
-                                Some("spacekit_receive")
-                            } else if fallback_exists {
-                                Some("spacekit_fallback")
-                            } else {
-                                None
-                            };
-                            if let Some(fn_name) = target_fn {
-                                eprintln!("📞 Invoking {}() on contract {:?}", fn_name, to_address);
-                                // We log the invocation but don't execute inline (would require
-                                // a nested WASM instantiation within the same store, which
-                                // Wasmtime disallows). The callback is deferred: the runtime
-                                // picks up `pending_receive_calls` after the current execution
-                                // completes and replays them as nested contract_call with the
-                                // transferred value.
-                                // For now, the credit stands; a future iteration can add
-                                // synchronous nested execution via a trampoline.
-                            }
-                        }
-                    }
-                }
-
-                0 // Success
+                contract_transfer(&mut caller, &to, amount as u128)
             },
         )?;
 
-        // get_timestamp() — Unix seconds (parity with spacekit-js host.ts getTimestamp / Date.now)
+        // transfer_u128(to_ptr, amount_ptr) - as `transfer`, 16-byte LE amount
+        linker.func_wrap(
+            "env",
+            "transfer_u128",
+            |mut caller: Caller<'_, SwtchvmStoreData>, to_ptr: i32, amount_ptr: i32| -> i32 {
+                let Some(to) = read_address(&mut caller, to_ptr) else {
+                    return 1;
+                };
+                let Some(amount) = read_u128(&mut caller, amount_ptr) else {
+                    return 1;
+                };
+                if amount == 0 {
+                    return 1;
+                }
+                contract_transfer(&mut caller, &to, amount)
+            },
+        )?;
+
+        // get_timestamp() - the block's timestamp (Unix seconds). Every node
+        // executing the block sees the same value; wall-clock time would make
+        // contract results differ between nodes.
         linker.func_wrap(
             "env",
             "get_timestamp",
-            |_caller: Caller<'_, SwtchvmStoreData>| -> i64 {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
+            |caller: Caller<'_, SwtchvmStoreData>| -> i64 {
+                unsafe { (*caller.data().context).block_timestamp as i64 }
             },
         )?;
 
@@ -3919,11 +4106,9 @@ impl SwtchvmRuntime {
                     _ => return 8,
                 };
 
-                // Return current timestamp in nanoseconds
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                // The block's timestamp in nanoseconds (deterministic across nodes).
+                let now = unsafe { (*caller.data().context).block_timestamp }
+                    .saturating_mul(1_000_000_000);
 
                 let memory_data_mut = memory.data_mut(&mut caller);
                 if (time_ptr as usize) + 8 <= memory_data_mut.len() {
@@ -3944,8 +4129,10 @@ impl SwtchvmRuntime {
                     _ => return 8,
                 };
 
-                // Fill with random bytes
-                let random_bytes: Vec<u8> = (0..buf_len).map(|_| rand::random()).collect();
+                // Deterministic bytes: every node must compute the same result.
+                // Seeded from the block, the call and the remaining fuel, so
+                // successive calls differ. Not suitable for secrets.
+                let random_bytes = deterministic_bytes(&caller, buf_len.max(0) as usize);
 
                 let memory_data_mut = memory.data_mut(&mut caller);
                 let start = buf_ptr as usize;
@@ -5145,6 +5332,8 @@ impl SwtchvmRuntime {
 
         let mut inner_ctx = unsafe { &*caller.data().context }.clone();
         inner_ctx.caller = from_contract;
+        // No value moves with a nested call; contracts pay with `transfer`.
+        inner_ctx.value = 0;
 
         let module = match Module::new(&self.engine, &code) {
             Ok(m) => m,
@@ -5182,7 +5371,6 @@ impl SwtchvmRuntime {
                 constraint_state: super::tool_policy::ConstraintState::new(),
                 tool_effects: Vec::new(),
                 buffered_messages: Vec::new(),
-                buffered_payments: Vec::new(),
                 pending_tool_requests: Vec::new(),
                 limiter: ContractResourceLimiter::new(),
             },
@@ -5295,58 +5483,91 @@ impl SwtchvmRuntime {
         }
 
         use sha2::{Digest, Sha256};
-        let to_hex = tx
-            .to
-            .as_ref()
-            .map(|a| hex::encode(a.as_bytes()))
-            .unwrap_or_default();
-        let canonical = format!(
-            "{}|{}|{}|{}|{}",
-            hex::encode(tx.from.as_bytes()),
-            to_hex,
-            tx.value,
-            tx.nonce,
-            hex::encode(&tx.data),
-        );
-        let message_hash: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(canonical.as_bytes());
-            h.finalize().into()
+        let chain_id = self.tx_chain_id.load(std::sync::atomic::Ordering::Relaxed);
+        let recover = |payload: &str| -> Result<[u8; 20]> {
+            let message_hash: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
+            recover_tx_signer(&message_hash, sig)
         };
-
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(&sig.r);
-        sig_bytes[32..].copy_from_slice(&sig.s);
-
-        let recid = k256::ecdsa::RecoveryId::try_from(sig.v.wrapping_sub(27))
-            .map_err(|_| anyhow::anyhow!("Invalid recovery id v={}", sig.v))?;
-        let ecdsa_sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid ECDSA signature bytes"))?;
-        let recovered =
-            k256::ecdsa::VerifyingKey::recover_from_prehash(&message_hash, &ecdsa_sig, recid)
-                .map_err(|_| anyhow::anyhow!("ECDSA recovery failed"))?;
-
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
-        let uncompressed = recovered.to_encoded_point(false);
-        let recovered_addr: [u8; 20] = {
-            use sha3::Keccak256;
-            let mut kh = Keccak256::new();
-            kh.update(&uncompressed.as_bytes()[1..]);
-            let full_hash: [u8; 32] = kh.finalize().into();
-            let mut a = [0u8; 20];
-            a.copy_from_slice(&full_hash[12..]);
-            a
+        let recovered_addr = recover(&transaction_signing_payload(chain_id, tx))?;
+        // `SPACEKIT_LEGACY_TX_SIGNATURES=1` also accepts the v1 payload, which
+        // does not cover gas or the chain id. Test networks only.
+        let recovered_addr = if recovered_addr != tx.from.0 && legacy_tx_signatures_allowed() {
+            recover(&legacy_transaction_signing_payload(tx)).unwrap_or(recovered_addr)
+        } else {
+            recovered_addr
         };
-
         if recovered_addr != tx.from.0 {
             anyhow::bail!(
-                "Signature mismatch: recovered {} but tx.from is {}",
+                "Signature mismatch: recovered {} but tx.from is {} (sign the SPACEKIT-TX-v2 \
+                 payload for chain {chain_id})",
                 hex::encode(recovered_addr),
                 hex::encode(tx.from.0),
             );
         }
         Ok(())
     }
+}
+
+/// What a transaction's ECDSA (secp256k1) signature covers: SHA-256 of
+///
+/// ```text
+/// SPACEKIT-TX-v2\n{chain_id}\n{from}\n{to}\n{value}\n{nonce}\n{gas_limit}\n{gas_price}\n{data}
+/// ```
+///
+/// Addresses and data are lowercase hex without `0x`; `to` is empty for a
+/// deployment; numbers are decimal. Binding gas and the chain id means a relay
+/// cannot change the fee, and a signature for one network is invalid on another.
+pub fn transaction_signing_payload(chain_id: u64, tx: &SwtchvmTransaction) -> String {
+    format!(
+        "SPACEKIT-TX-v2\n{chain_id}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        hex::encode(tx.from.as_bytes()),
+        tx.to.as_ref().map(|a| hex::encode(a.as_bytes())).unwrap_or_default(),
+        tx.value,
+        tx.nonce,
+        tx.gas_limit,
+        tx.gas_price,
+        hex::encode(&tx.data),
+    )
+}
+
+/// The pre-v2 payload: `{from}|{to}|{value}|{nonce}|{data}`.
+fn legacy_transaction_signing_payload(tx: &SwtchvmTransaction) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        hex::encode(tx.from.as_bytes()),
+        tx.to.as_ref().map(|a| hex::encode(a.as_bytes())).unwrap_or_default(),
+        tx.value,
+        tx.nonce,
+        hex::encode(&tx.data),
+    )
+}
+
+fn legacy_tx_signatures_allowed() -> bool {
+    std::env::var("SPACEKIT_LEGACY_TX_SIGNATURES")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn recover_tx_signer(message_hash: &[u8; 32], sig: &TransactionSignature) -> Result<[u8; 20]> {
+    use sha3::Digest as _;
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(&sig.r);
+    sig_bytes[32..].copy_from_slice(&sig.s);
+
+    let recid = k256::ecdsa::RecoveryId::try_from(sig.v.wrapping_sub(27))
+        .map_err(|_| anyhow::anyhow!("Invalid recovery id v={}", sig.v))?;
+    let ecdsa_sig = k256::ecdsa::Signature::from_slice(&sig_bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid ECDSA signature bytes"))?;
+    let recovered =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(message_hash, &ecdsa_sig, recid)
+            .map_err(|_| anyhow::anyhow!("ECDSA recovery failed"))?;
+
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let uncompressed = recovered.to_encoded_point(false);
+    let full_hash: [u8; 32] = sha3::Keccak256::digest(&uncompressed.as_bytes()[1..]).into();
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&full_hash[12..]);
+    Ok(a)
 }
 
 pub struct SwtchvmStoreData {
@@ -5378,8 +5599,6 @@ pub struct SwtchvmStoreData {
     pub tool_effects: Vec<super::tool_policy::ToolEffectRecord>,
     /// Buffered fire-and-forget messages (`messaging_send`).
     pub buffered_messages: Vec<BufferedMessage>,
-    /// Buffered fire-and-forget payment intents (`payment_transfer`, `payment_vault_charge`).
-    pub buffered_payments: Vec<BufferedPaymentEffect>,
     /// Pending async tool requests returned as -3 PENDING to the guest (`remote_storage_put/get`, `web_search`).
     pub pending_tool_requests: Vec<PendingToolRequest>,
     /// Memory and table ceilings for this execution. Installed via
@@ -5392,16 +5611,6 @@ pub struct SwtchvmStoreData {
 pub struct BufferedMessage {
     pub recipient_did: String,
     pub payload: Vec<u8>,
-}
-
-/// A fire-and-forget payment intent buffered during contract execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BufferedPaymentEffect {
-    pub effect_type: String,
-    pub to: String,
-    pub asset: String,
-    pub amount: String,
-    pub beneficiary: Option<String>,
 }
 
 /// An async tool request that returned -3 PENDING to the guest.
@@ -5457,6 +5666,121 @@ fn tool_request_key(tool_name: &str, data: &[u8]) -> String {
 // async task, and wasmtime's Store ensures they are not accessed concurrently.
 unsafe impl Send for SwtchvmStoreData {}
 
+/// Namespace for `contract_kv`: the contract whose code is executing, or the
+/// transaction caller for anonymous execution (`execute_wasm_direct`).
+fn saturating_i64(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn guest_memory(caller: &mut Caller<'_, SwtchvmStoreData>) -> Option<Memory> {
+    match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(mem)) => Some(mem),
+        _ => None,
+    }
+}
+
+fn read_guest<const N: usize>(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<[u8; N]> {
+    let memory = guest_memory(caller)?;
+    let start = usize::try_from(ptr).ok()?;
+    let bytes = memory.data(&*caller).get(start..start.checked_add(N)?)?;
+    bytes.try_into().ok()
+}
+
+fn read_address(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<SwtchvmAddress> {
+    read_guest::<20>(caller, ptr).map(SwtchvmAddress::new)
+}
+
+fn read_u128(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32) -> Option<u128> {
+    read_guest::<16>(caller, ptr).map(u128::from_le_bytes)
+}
+
+/// Write 16 little-endian bytes into guest memory. 0 on success, 1 on error.
+fn write_u128(caller: &mut Caller<'_, SwtchvmStoreData>, ptr: i32, value: u128) -> i32 {
+    let Some(memory) = guest_memory(caller) else {
+        return 1;
+    };
+    let Ok(start) = usize::try_from(ptr) else {
+        return 1;
+    };
+    match memory.data_mut(&mut *caller).get_mut(start..start.saturating_add(16)) {
+        Some(out) if out.len() == 16 => {
+            out.copy_from_slice(&value.to_le_bytes());
+            0
+        }
+        _ => 1,
+    }
+}
+
+fn native_balance(caller: &Caller<'_, SwtchvmStoreData>, address: &SwtchvmAddress) -> u128 {
+    unsafe {
+        (*caller.data().state)
+            .get_account(address)
+            .map(|a| a.balance)
+            .unwrap_or(0)
+    }
+}
+
+/// The address a `payment_transfer` payee names: `0x…` or
+/// `did:spacekit:<40 hex>`.
+fn payee_address(to: &str) -> Option<SwtchvmAddress> {
+    crate::native_rewards::did_address(to)
+}
+
+/// Move `amount` wei from the executing contract's own balance to `to`.
+/// 0 on success, 1 if no contract is executing or its balance is too low.
+fn contract_transfer(caller: &mut Caller<'_, SwtchvmStoreData>, to: &SwtchvmAddress, amount: u128) -> i32 {
+    let data = caller.data_mut();
+    let Some(from) = data.executing_contract else {
+        return 1;
+    };
+    if from == *to {
+        return 0;
+    }
+    unsafe {
+        let state = &mut *data.state;
+        let available = state.get_account(&from).map(|a| a.balance).unwrap_or(0);
+        if available < amount {
+            return 1;
+        }
+        state.get_account_mut(&from).balance -= amount;
+        let recipient = state.get_account_mut(to);
+        recipient.balance = recipient.balance.saturating_add(amount);
+    }
+    0
+}
+
+/// Deterministic pseudo-random bytes for WASI `random_get`: SHA-256 in
+/// counter mode over the block, the caller, the executing contract and the
+/// remaining fuel. The same on every node; predictable, so never a secret.
+fn deterministic_bytes(caller: &Caller<'_, SwtchvmStoreData>, len: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let ctx = unsafe { &*caller.data().context };
+    let contract = caller.data().executing_contract.unwrap_or(ctx.caller);
+    let fuel = caller.get_fuel().unwrap_or(0);
+    let mut out = Vec::with_capacity(len);
+    let mut counter = 0u64;
+    while out.len() < len {
+        let block = Sha256::new()
+            .chain_update(b"SPACEKIT-WASI-RANDOM-v1")
+            .chain_update(ctx.block_number.to_le_bytes())
+            .chain_update(ctx.block_timestamp.to_le_bytes())
+            .chain_update(ctx.caller.as_bytes())
+            .chain_update(contract.as_bytes())
+            .chain_update(fuel.to_le_bytes())
+            .chain_update(counter.to_le_bytes())
+            .finalize();
+        out.extend_from_slice(&block);
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+fn contract_kv_namespace(data: &SwtchvmStoreData) -> SwtchvmAddress {
+    data.executing_contract
+        .unwrap_or_else(|| unsafe { (*data.context).caller })
+}
+
 // Helper functions for memory operations
 unsafe fn read_bytes_from_memory(
     _caller: &Caller<'_, SwtchvmStoreData>,
@@ -5479,6 +5803,9 @@ unsafe fn write_bytes_to_memory(
 struct SwtchvmChainState {
     blockchain: Vec<SwtchvmBlock>,
     pending_transactions: Vec<SwtchvmTransaction>,
+    /// Hashes of pending transactions (and of those taken into a block being
+    /// assembled), for de-duplicating relayed transactions.
+    pending_hashes: std::collections::HashSet<[u8; 32]>,
     receipts_by_tx: HashMap<[u8; 32], SwtchvmReceipt>,
     transactions_by_tx: HashMap<[u8; 32], SwtchvmTransaction>,
 }
@@ -5494,18 +5821,58 @@ pub struct SwtchvmNode {
     faucet_requests: Arc<RwLock<HashMap<String, FaucetRecord>>>,
     /// Optional SRA host (production ASTRA emission). See `service_reward_accumulator`.
     sra_host: Option<Arc<crate::service_reward_accumulator::SraHost>>,
+    /// When set, `mine_block` refuses with this reason (e.g. a node without an
+    /// authority key on a proof-of-authority network, whose blocks peers
+    /// would reject).
+    mining_blocked: std::sync::RwLock<Option<String>>,
+    /// Set on multi-node (PoA) networks: the faucet writes balances outside
+    /// blocks, so using it on one node would fork that node's state root.
+    faucet_blocked: std::sync::RwLock<Option<String>>,
+    /// Highest block number a peer has announced (see `note_peer_head`).
+    peer_head_hint: std::sync::atomic::AtomicU64,
     /// Optional PoTW award host (reviewer-quorum emission). See `potw_host`.
     potw_host: Option<Arc<crate::potw_host::PoTWHost>>,
     /// Optional Treasury disbursement bridge (native mirror). See `treasury_host`.
     treasury_host: Option<Arc<crate::treasury_host::TreasuryHost>>,
     /// Locally mined blocks. The standalone process bridges this stream to the real TCP P2P layer.
     mined_blocks_tx: broadcast::Sender<SwtchvmBlock>,
+    /// Transactions newly accepted into the pending pool (local or gossiped),
+    /// for the P2P bridge to relay.
+    new_txs_tx: broadcast::Sender<SwtchvmTransaction>,
+    /// When the oldest transaction still pending arrived (unix ms).
+    pending_since_ms: std::sync::Mutex<Option<u64>>,
+    /// DID written into blocks this node produces.
+    producer_did: StdRwLock<Option<String>>,
+    /// Undo records for the most recent blocks (fork choice).
+    undo_log: StdMutex<std::collections::VecDeque<BlockUndo>>,
+    /// Sealed blocks of competing branches, by hash, with their seals.
+    side_blocks: StdMutex<HashMap<[u8; 32], (SwtchvmBlock, SideSeal)>>,
+}
+
+/// Upper bound on the pending pool, so relayed transactions cannot exhaust memory.
+const MAX_PENDING_TRANSACTIONS: usize = 50_000;
+/// Blocks that can be rolled back by fork choice. Deeper blocks are final.
+pub const MAX_REORG_DEPTH: usize = 64;
+
+/// What undoes one block (see `rollback_head_locked`).
+struct BlockUndo {
+    number: u64,
+    hash: [u8; 32],
+    state: super::state_commitment::StateJournal,
+    sra: Option<spacekit_service_rewards::SraState>,
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SwtchvmNode {
     fn faucet_policy() -> FaucetPolicy {
         FaucetPolicy {
-            amount: 1_000_000u128, // 1 ASTRA (1e6 uASTRA)
+            amount: 1_000_000_000_000_000_000u128, // 1 ASTRA (18 decimals)
             cooldown: Duration::from_secs(3600),
             max_requests: 10,
         }
@@ -5521,10 +5888,33 @@ impl SwtchvmNode {
     /// NOTE: `setup_account_balance` is not transactional, so the commit loop is
     /// best-effort atomic. A fully atomic version needs a runtime state
     /// snapshot/commit primitive — tracked as a follow-up before mainnet.
+    /// Writes outside block execution fork a multi-node network, so the
+    /// paths that make them (faucet, rollup settlement, PoTW awards, treasury
+    /// disbursement) are refused once consensus is on.
+    fn out_of_block_writes_refused(&self) -> Option<String> {
+        self.faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn settle_rollup_bundle(
         &self,
         bundle: &crate::rollup_bridge::RollupBundle,
     ) -> anyhow::Result<usize> {
+        // Settlement writes balances outside blocks. On a multi-node network
+        // that would fork this node, so it is refused there until bundles are
+        // settled by consensus transactions.
+        if self
+            .faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            anyhow::bail!(
+                "rollup settlement outside blocks is disabled on consensus (PoA/PoS) networks"
+            );
+        }
         let payloads = match &bundle.tx_payloads {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(0),
@@ -5632,6 +6022,20 @@ impl SwtchvmNode {
         address: SwtchvmAddress,
         amount_override: Option<u128>,
     ) -> FaucetResponse {
+        if let Some(reason) = self
+            .faucet_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return FaucetResponse {
+                success: false,
+                amount: 0,
+                new_balance: 0,
+                error: Some(reason),
+                cooldown_remaining: None,
+            };
+        }
         let policy = Self::faucet_policy();
         let amount = amount_override.unwrap_or(policy.amount);
         let now = Instant::now();
@@ -5716,11 +6120,13 @@ impl SwtchvmNode {
         };
 
         let (mined_blocks_tx, _) = broadcast::channel(256);
+        let (new_txs_tx, _) = broadcast::channel(4096);
         Ok(Self {
             runtime,
             chain: StdRwLock::new(SwtchvmChainState {
                 blockchain: vec![Self::genesis_block()],
                 pending_transactions: Vec::new(),
+                pending_hashes: std::collections::HashSet::new(),
                 receipts_by_tx: HashMap::new(),
                 transactions_by_tx: HashMap::new(),
             }),
@@ -5730,15 +6136,26 @@ impl SwtchvmNode {
             chain_id_num: 1337,
             faucet_requests: Arc::new(RwLock::new(HashMap::new())),
             sra_host: None,
+            mining_blocked: std::sync::RwLock::new(None),
+            faucet_blocked: std::sync::RwLock::new(None),
+            peer_head_hint: std::sync::atomic::AtomicU64::new(0),
             potw_host: None,
             treasury_host: None,
             mined_blocks_tx,
+            new_txs_tx,
+            pending_since_ms: std::sync::Mutex::new(None),
+            producer_did: StdRwLock::new(None),
+            undo_log: StdMutex::new(std::collections::VecDeque::new()),
+            side_blocks: StdMutex::new(HashMap::new()),
         })
     }
 
     pub fn set_chain_id(&mut self, label: String, numeric: u64) {
         self.chain_id = label;
         self.chain_id_num = numeric;
+        self.runtime
+            .tx_chain_id
+            .store(numeric, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn chain_id(&self) -> &str {
@@ -5798,6 +6215,11 @@ impl SwtchvmNode {
         &self,
         receipt: crate::potw::PoTWReceipt,
     ) -> std::result::Result<crate::potw::AwardInstruction, String> {
+        if self.out_of_block_writes_refused().is_some() {
+            return Err(
+                "PoTW awards outside blocks are disabled on consensus (PoA/PoS) networks".to_string(),
+            );
+        }
         let host = self
             .potw_host
             .as_ref()
@@ -5851,6 +6273,13 @@ impl SwtchvmNode {
         &self,
         spend_id_hex: &str,
     ) -> std::result::Result<(String, u128), String> {
+        if self.out_of_block_writes_refused().is_some() {
+            return Err(
+                "treasury disbursement outside blocks is disabled on consensus (PoA/PoS) networks; \
+                 the treasury contract pays out from its own balance"
+                    .to_string(),
+            );
+        }
         let host = self
             .treasury_host
             .as_ref()
@@ -5970,6 +6399,33 @@ impl SwtchvmNode {
             .cloned()
     }
 
+    /// The transaction with this hash, its receipt, and its block's
+    /// timestamp, if it is in a block on this node.
+    pub fn find_transaction(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Option<(SwtchvmTransaction, SwtchvmReceipt, u64)> {
+        let receipt = self.get_receipt(tx_hash)?;
+        let block = self.get_block_by_number(receipt.block_number)?;
+        let index = receipt.tx_index as usize;
+        // The receipt at that index must be this transaction's.
+        let stored = block.receipts.get(index)?;
+        if stored.tx_hash.trim_start_matches("0x") != receipt.tx_hash.trim_start_matches("0x") {
+            return None;
+        }
+        let tx = block.transactions.get(index)?.clone();
+        Some((tx, receipt, block.timestamp))
+    }
+
+    /// Native ASTRA held by an address: its balance and its locked rewards
+    /// not yet released (both wei).
+    pub async fn native_holdings(&self, addr: &SwtchvmAddress) -> (u128, u128) {
+        let state = self.runtime.state.read().await;
+        let balance = state.get_account(addr).map(|a| a.balance).unwrap_or(0);
+        let (locked, released) = crate::native_rewards::lock_position(&state, addr);
+        (balance, locked.saturating_sub(released))
+    }
+
     /// Deploy a WASM contract via the runtime (MCP / external callers).
     pub async fn deploy_contract(
         &self,
@@ -5980,6 +6436,28 @@ impl SwtchvmNode {
         self.runtime
             .deploy_contract(deployer, wasm_code, context)
             .await
+    }
+
+    /// Read-only call against the head state (see `SwtchvmRuntime::view_call`).
+    /// Returns the contract's return data; the state is unchanged.
+    pub async fn view_contract(
+        &self,
+        contract: &SwtchvmAddress,
+        call_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let head = self.get_latest_block();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .max(head.timestamp);
+        let result = self
+            .runtime
+            .view_call(contract, call_data, head.number, now)
+            .await?;
+        if !result.success {
+            return Err(anyhow::anyhow!("contract call reverted"));
+        }
+        Ok(result.return_data)
     }
 
     /// Call a deployed contract (MCP / external callers).
@@ -6019,35 +6497,301 @@ impl SwtchvmNode {
             state_root: [0u8; 32],
             compute_root: [0u8; 32],
             verkle_witness: None,
+            proposer_did: None,
         }
     }
 
     pub async fn submit_transaction(&self, tx: SwtchvmTransaction) -> Result<[u8; 32]> {
-        // Basic validation
-        if tx.gas_limit == 0 || tx.gas_price == 0 {
-            return Err(anyhow::anyhow!("Invalid gas parameters"));
-        }
-
-        // Generate transaction hash
-        let tx_bytes = bincode::serialize(&tx)?;
-        let hash = Keccak256::digest(&tx_bytes);
-
-        // Add to the pending pool only after all local validation/hash work succeeds.
-        self.chain
-            .write()
-            .expect("SwtchVM chain lock poisoned")
-            .pending_transactions
-            .push(tx.clone());
+        let (hash, _new) = self.add_pending_transaction(tx.clone()).await?;
 
         // Broadcast to network if enabled
         if let Some(networking) = &self.networking {
             networking.broadcast_transaction(tx).await?;
         }
 
-        Ok(hash.into())
+        Ok(hash)
+    }
+
+    /// Queue a governance or staking message for the next block. Returns
+    /// the transaction hash; fails if the message is invalid right now.
+    pub async fn submit_consensus_message(
+        &self,
+        msg: &crate::chain_consensus::ConsensusMessage,
+    ) -> Result<([u8; 32], bool)> {
+        self.add_pending_transaction(msg.to_transaction()).await
+    }
+
+    /// Chain-held governance and staking, as of the head block.
+    pub async fn consensus_state(&self) -> Option<crate::chain_consensus::ConsensusState> {
+        crate::chain_consensus::load(&*self.runtime.state.read().await)
+    }
+
+    /// Who may produce the next block, from chain state.
+    pub async fn producer_set(&self, now: u64) -> crate::chain_consensus::ProducerSet {
+        crate::chain_consensus::producer_set(&*self.runtime.state.read().await, now)
+    }
+
+    /// Install the PoA genesis governance state while the chain is at
+    /// height 0 (every node of a network does this identically).
+    pub async fn init_consensus_genesis(
+        &self,
+        governance: crate::validator_governance::GovernanceState,
+        staking: crate::staking::StakingParams,
+        treasury: Option<crate::validator_governance::TreasuryGenesis>,
+    ) -> Result<()> {
+        let mut state = self.runtime.state.write().await;
+        if crate::chain_consensus::load(&state).is_some() {
+            return Ok(());
+        }
+        if self.get_latest_block().number > 0 {
+            anyhow::bail!(
+                "this chain has blocks but no on-chain governance state; it was created by an \
+                 older node version. Start the network from fresh state."
+            );
+        }
+        crate::chain_consensus::init_genesis(&mut state, governance, staking);
+        if let Some(t) = &treasury {
+            crate::chain_consensus::init_treasury(&mut state, t);
+        }
+        drop(state);
+        self.runtime.persist_state_if_configured().await;
+        Ok(())
+    }
+
+    /// Allow or forbid contract reads from outside the chain.
+    pub fn set_external_reads(&self, allowed: bool) {
+        self.runtime
+            .external_reads
+            .store(allowed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A transaction relayed by a peer. Returns whether it was new here.
+    pub async fn accept_gossiped_transaction(&self, tx: SwtchvmTransaction) -> Result<bool> {
+        self.add_pending_transaction(tx).await.map(|(_, new)| new)
+    }
+
+    /// Validate a transaction and add it to the pending pool, once.
+    ///
+    /// New transactions are published to `subscribe_new_transactions`, which
+    /// the P2P bridge relays to peers, so any authority can include a
+    /// transaction whichever node it was sent to.
+    async fn add_pending_transaction(&self, tx: SwtchvmTransaction) -> Result<([u8; 32], bool)> {
+        if tx.gas_limit == 0 || tx.gas_price == 0 {
+            return Err(anyhow::anyhow!("Invalid gas parameters"));
+        }
+        if crate::chain_consensus::is_consensus_tx(&tx) {
+            // Governance and staking messages carry their own SPHINCS+
+            // signatures; check them against the current chain state.
+            let msg = crate::chain_consensus::ConsensusMessage::from_transaction(&tx)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let now = unix_millis() / 1_000;
+            let state = self.runtime.state.read().await;
+            crate::chain_consensus::validate(&state, &msg, now).map_err(|e| anyhow::anyhow!(e))?;
+        } else {
+            // System addresses (rewards, consensus) take only system
+            // transactions; value sent there would be lost.
+            if tx.to == Some(crate::native_rewards::rewards_address())
+                || tx.to == Some(crate::chain_consensus::consensus_address())
+            {
+                return Err(anyhow::anyhow!("transactions to system addresses are not accepted"));
+            }
+            // Reject bad signatures here rather than include them as failed
+            // transactions (and relay them to every peer).
+            self.runtime.verify_signature(&tx)?;
+            let account_nonce = self
+                .runtime
+                .state
+                .read()
+                .await
+                .get_account(&tx.from)
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            if tx.nonce < account_nonce {
+                return Err(anyhow::anyhow!(
+                    "Invalid nonce: {} is already used (account nonce {account_nonce})",
+                    tx.nonce
+                ));
+            }
+        }
+
+        let hash: [u8; 32] = Keccak256::digest(bincode::serialize(&tx)?).into();
+        {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            if chain.transactions_by_tx.contains_key(&hash) {
+                return Ok((hash, false));
+            }
+            if chain.pending_hashes.contains(&hash) {
+                return Ok((hash, false));
+            }
+            if chain.pending_transactions.len() >= MAX_PENDING_TRANSACTIONS {
+                return Err(anyhow::anyhow!("transaction pool is full"));
+            }
+            chain.pending_hashes.insert(hash);
+            chain.pending_transactions.push(tx.clone());
+        }
+        {
+            let mut since = self
+                .pending_since_ms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if since.is_none() {
+                *since = Some(unix_millis());
+            }
+        }
+        let _ = self.new_txs_tx.send(tx);
+        Ok((hash, true))
+    }
+
+    pub fn subscribe_new_transactions(&self) -> broadcast::Receiver<SwtchvmTransaction> {
+        self.new_txs_tx.subscribe()
+    }
+
+    /// Transactions waiting for a block.
+    pub fn pending_count(&self) -> usize {
+        self.chain
+            .read()
+            .expect("SwtchVM chain lock poisoned")
+            .pending_transactions
+            .len()
+    }
+
+    /// When the oldest pending transaction arrived (unix ms), if any.
+    pub fn pending_since_ms(&self) -> Option<u64> {
+        *self.pending_since_ms.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drop pending transactions a new block made obsolete (included, or
+    /// with a nonce the sender has already used), and reset the pending clock
+    /// when the pool is empty.
+    async fn prune_pending_after_block(&self, block: &SwtchvmBlock) {
+        let included: std::collections::HashSet<[u8; 32]> = block
+            .transactions
+            .iter()
+            .filter_map(|tx| bincode::serialize(tx).ok())
+            .map(|b| Keccak256::digest(b).into())
+            .collect();
+        let pending = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            std::mem::take(&mut chain.pending_transactions)
+        };
+        let mut keep = Vec::with_capacity(pending.len());
+        {
+            let state = self.runtime.state.read().await;
+            for tx in pending {
+                let hash: [u8; 32] = match bincode::serialize(&tx) {
+                    Ok(b) => Keccak256::digest(b).into(),
+                    Err(_) => continue,
+                };
+                let nonce = state.get_account(&tx.from).map(|a| a.nonce).unwrap_or(0);
+                if !included.contains(&hash) && tx.nonce >= nonce {
+                    keep.push((hash, tx));
+                }
+            }
+        }
+        let empty = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            // Keep anything that arrived while we pruned.
+            let arrived = std::mem::take(&mut chain.pending_transactions);
+            let mut hashes: std::collections::HashSet<[u8; 32]> =
+                keep.iter().map(|(h, _)| *h).collect();
+            let mut txs: Vec<SwtchvmTransaction> = keep.into_iter().map(|(_, tx)| tx).collect();
+            for tx in arrived {
+                if let Ok(b) = bincode::serialize(&tx) {
+                    hashes.insert(Keccak256::digest(b).into());
+                }
+                txs.push(tx);
+            }
+            chain.pending_transactions = txs;
+            chain.pending_hashes = hashes;
+            chain.pending_transactions.is_empty()
+        };
+        if empty {
+            *self.pending_since_ms.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    /// Block (`Some(reason)`) or allow (`None`) local block production.
+    /// Record a peer's announced head height (P2P bridge).
+    pub fn note_peer_head(&self, number: u64) {
+        self.peer_head_hint
+            .fetch_max(number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Highest head height any peer has announced so far.
+    pub fn peer_head_hint(&self) -> u64 {
+        self.peer_head_hint.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_faucet_blocked(&self, reason: Option<String>) {
+        *self
+            .faucet_blocked
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
+    }
+
+    /// Apply `SPACEKIT_GENESIS_ALLOC_FILE` while the chain is still at genesis.
+    ///
+    /// The file is `{ "accounts": [ { "address": "0x…", "balance": "123" } ] }`
+    /// (balance in base units, as a string or number). Every node of a network
+    /// must use the same file, like the PoA genesis file: the balances become
+    /// part of the genesis state that block 1 builds on. Accounts that already
+    /// hold a balance are left alone, so restarts are harmless.
+    pub async fn apply_genesis_alloc_from_env(&self) -> Result<usize> {
+        let Some(path) = std::env::var_os("SPACEKIT_GENESIS_ALLOC_FILE") else {
+            return Ok(0);
+        };
+        if self.get_latest_block().number > 0 {
+            return Ok(0);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("reading genesis alloc {}: {e}", std::path::Path::new(&path).display())
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&raw)?;
+        let accounts = json["accounts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("genesis alloc has no accounts array"))?;
+        let mut applied = 0;
+        {
+            let mut state = self.runtime.state.write().await;
+            for entry in accounts {
+                let address = entry["address"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("genesis alloc entry without address"))?;
+                let balance: u128 = match &entry["balance"] {
+                    serde_json::Value::String(s) => s.trim().parse()?,
+                    serde_json::Value::Number(n) => n
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("bad balance for {address}"))?
+                        .into(),
+                    _ => anyhow::bail!("genesis alloc entry {address} has no balance"),
+                };
+                let account = state.get_account_mut(&SwtchvmAddress::from_hex(address)?);
+                if account.balance == 0 {
+                    account.balance = balance;
+                    applied += 1;
+                }
+            }
+        }
+        self.runtime.persist_state_if_configured().await;
+        Ok(applied)
+    }
+
+    pub fn set_mining_blocked(&self, reason: Option<String>) {
+        *self
+            .mining_blocked
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reason;
     }
 
     pub async fn mine_block(&self) -> Result<SwtchvmBlock> {
+        if let Some(reason) = self
+            .mining_blocked
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Err(anyhow::anyhow!("block production disabled on this node: {reason}"));
+        }
         let _mining_guard = self.mining_lock.lock().await;
         let (current_block, pending_transactions) = {
             let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
@@ -6059,13 +6803,32 @@ impl SwtchvmNode {
             let pending = std::mem::take(&mut chain.pending_transactions);
             (current, pending)
         };
+        let block_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            // Never step back from the parent (clock skew between producers).
+            .max(current_block.timestamp);
+        // Start this block's journal (its undo record) and apply the
+        // time-based consensus transitions every block begins with.
+        {
+            let mut state = self.runtime.state.write().await;
+            let _ = state.checkpoint();
+            crate::chain_consensus::begin_block(&mut state, block_timestamp);
+        }
+        let sra_before = self.sra_host.as_ref().map(|s| s.snapshot());
+        // Protocol system transactions (SRA reward settlement) lead the block.
+        let sra_plan = match &self.sra_host {
+            Some(sra) => {
+                let world = self.runtime.state.read().await;
+                Some(sra.plan_block(&world, current_block.number + 1, block_timestamp))
+            }
+            None => None,
+        };
         let mut new_block = SwtchvmBlock {
             number: current_block.number + 1,
             parent_hash: current_block.hash,
             hash: [0u8; 32],
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
+            timestamp: block_timestamp,
             gas_limit: 10_000_000,
             gas_used: 0,
             transactions: Vec::new(),
@@ -6073,6 +6836,7 @@ impl SwtchvmNode {
             state_root: [0u8; 32],
             compute_root: [0u8; 32],
             verkle_witness: None,
+            proposer_did: self.producer_did(),
         };
 
         // Execute pending transactions
@@ -6082,7 +6846,48 @@ impl SwtchvmNode {
         let mut receipts = Vec::new();
         let mut remaining_txs = Vec::new();
 
+        // System transactions first. They are not counted against the block
+        // gas limit and are always included, even if they revert, so that
+        // every node's block matches its own plan.
+        if let Some(plan) = &sra_plan {
+            for tx in &plan.system_txs {
+                let receipt = self
+                    .execute_block_system_tx(
+                        tx,
+                        new_block.number,
+                        new_block.timestamp,
+                        included_txs.len() as u64,
+                        &mut total_gas_used,
+                        &mut cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                included_txs.push(tx.clone());
+            }
+        }
+
+        let mut consensus_count = 0usize;
         for tx in pending_transactions {
+            // Governance and staking messages: applied in order, no gas.
+            if crate::chain_consensus::is_consensus_tx(&tx) {
+                if consensus_count >= crate::chain_consensus::MAX_CONSENSUS_TXS_PER_BLOCK {
+                    remaining_txs.push(tx);
+                    continue;
+                }
+                consensus_count += 1;
+                let receipt = self
+                    .execute_consensus_tx(
+                        &tx,
+                        new_block.number,
+                        new_block.timestamp,
+                        included_txs.len() as u64,
+                        cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                included_txs.push(tx);
+                continue;
+            }
             if total_gas_used + tx.gas_limit > new_block.gas_limit {
                 // Put back transaction for next block
                 remaining_txs.push(tx);
@@ -6164,9 +6969,11 @@ impl SwtchvmNode {
         new_block.receipts = receipts;
         new_block.gas_used = total_gas_used;
 
-        // Calculate state root (verkle-based if available, else legacy merkle)
-        let state = self.runtime.state.read().await;
-        new_block.state_root = state.state_root();
+        // Commit to the whole state; the journal since the block started is
+        // what undoes it.
+        let mut state = self.runtime.state.write().await;
+        let (state_root, undo) = state.checkpoint();
+        new_block.state_root = state_root;
 
         // Include verkle witness for stateless validation
         if state.verkle_tree.is_some() {
@@ -6180,22 +6987,18 @@ impl SwtchvmNode {
             });
         }
 
-        // Service Reward Accumulator (protocol emission credits for this block)
-        if let Some(sra) = &self.sra_host {
-            let txs = new_block.transactions.clone();
-            let rcpts = new_block.receipts.clone();
-            if let Err(e) = sra
-                .on_block_finalized(
-                    &self.runtime,
-                    new_block.number,
-                    new_block.timestamp,
-                    &txs,
-                    &rcpts,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, block = new_block.number, "SRA block processing failed");
-            }
+        drop(state);
+        // Service Reward Accumulator: adopt the settlement and record this
+        // block's service events for the current epoch.
+        if let (Some(sra), Some(plan)) = (&self.sra_host, sra_plan) {
+            sra.commit_block(
+                plan,
+                new_block.number,
+                new_block.proposer_did.as_deref(),
+                &new_block.transactions,
+                &new_block.receipts,
+            )
+            .await;
         }
 
         // Calculate block hash
@@ -6218,19 +7021,238 @@ impl SwtchvmNode {
             }
             chain.blockchain.push(new_block.clone());
         }
+        self.remember_undo(BlockUndo {
+            number: new_block.number,
+            hash: new_block.hash,
+            state: undo,
+            sra: sra_before,
+        });
 
         // Broadcast block if networking enabled
         if let Some(networking) = &self.networking {
             networking.broadcast_block(new_block.clone()).await?;
         }
+        self.prune_pending_after_block(&new_block).await;
         let _ = self.mined_blocks_tx.send(new_block.clone());
 
         Ok(new_block)
     }
 
+    /// Apply a governance or staking message (see `chain_consensus`). Pays no
+    /// gas; the receipt fails if the message is invalid at this point in the
+    /// chain, and `return_data` says what happened.
+    async fn execute_consensus_tx(
+        &self,
+        tx: &SwtchvmTransaction,
+        block_number: u64,
+        block_timestamp: u64,
+        tx_index: u64,
+        cumulative_gas_used: u128,
+    ) -> Result<SwtchvmReceipt> {
+        let tx_hash = Keccak256::digest(bincode::serialize(tx)?);
+        let outcome = match crate::chain_consensus::ConsensusMessage::from_transaction(tx) {
+            Ok(msg) => {
+                let mut state = self.runtime.state.write().await;
+                crate::chain_consensus::apply(&mut state, &msg, block_timestamp)
+            }
+            Err(e) => Err(e),
+        };
+        let (success, message) = match outcome {
+            Ok(summary) => (true, summary),
+            Err(error) => (false, error),
+        };
+        Ok(SwtchvmReceipt {
+            tx_hash: hex::encode(tx_hash),
+            tx_index,
+            block_number,
+            success,
+            gas_used: 0,
+            cumulative_gas_used,
+            logs: Vec::new(),
+            logs_bloom: logs_bloom_hex(&[]),
+            return_data: message.into_bytes(),
+            created_address: None,
+            tool_effects: Vec::new(),
+        })
+    }
+
+    /// The DID this node puts in blocks it produces (its sealing authority).
+    pub fn set_producer_did(&self, did: Option<String>) {
+        *self
+            .producer_did
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = did;
+    }
+
+    pub fn producer_did(&self) -> Option<String> {
+        self.producer_did
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn remember_undo(&self, undo: BlockUndo) {
+        let mut log = self.undo_log.lock().unwrap_or_else(|p| p.into_inner());
+        log.push_back(undo);
+        while log.len() > MAX_REORG_DEPTH {
+            log.pop_front();
+        }
+    }
+
+    /// How many recent blocks can be rolled back.
+    pub fn undo_depth(&self) -> usize {
+        self.undo_log.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Roll back the head block (fork choice). Its state changes, reward
+    /// accounting, receipts and seals-to-be are undone, and its user and
+    /// consensus transactions go back to the pending pool. Callers hold the
+    /// mining lock.
+    async fn rollback_head_locked(&self) -> Result<SwtchvmBlock> {
+        let head = self.get_latest_block();
+        if head.number == 0 {
+            return Err(anyhow::anyhow!("cannot roll back the genesis block"));
+        }
+        let undo = {
+            let mut log = self.undo_log.lock().unwrap_or_else(|p| p.into_inner());
+            match log.back() {
+                Some(u) if u.number == head.number && u.hash == head.hash => log.pop_back(),
+                _ => None,
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("block {} is beyond the rollback window", head.number)
+        })?;
+        {
+            let mut state = self.runtime.state.write().await;
+            state.revert(undo.state);
+        }
+        if let (Some(sra), Some(before)) = (&self.sra_host, undo.sra) {
+            sra.restore(before, head.number).await;
+        }
+        let requeue: Vec<SwtchvmTransaction> = {
+            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+            chain.blockchain.pop();
+            let mut requeue = Vec::new();
+            for tx in &head.transactions {
+                if let Ok(bytes) = bincode::serialize(tx) {
+                    let hash: [u8; 32] = Keccak256::digest(bytes).into();
+                    chain.receipts_by_tx.remove(&hash);
+                    chain.transactions_by_tx.remove(&hash);
+                }
+                let system = self.sra_host.as_ref().is_some_and(|s| s.is_system_tx(tx));
+                if !system {
+                    requeue.push(tx.clone());
+                }
+            }
+            requeue
+        };
+        for tx in requeue {
+            // Re-admission re-checks nonces and signatures against the
+            // rolled-back state; anything no longer valid is dropped.
+            let _ = self.add_pending_transaction(tx).await;
+        }
+        self.runtime.persist_state_if_configured().await;
+        Ok(head)
+    }
+
+    /// Execute one protocol system transaction for a block being produced or
+    /// re-executed, returning its receipt. A failed system transaction still
+    /// yields a (failed) receipt so the block stays aligned with the plan.
+    async fn execute_block_system_tx(
+        &self,
+        tx: &SwtchvmTransaction,
+        block_number: u64,
+        block_timestamp: u64,
+        tx_index: u64,
+        total_gas_used: &mut u128,
+        cumulative_gas_used: &mut u128,
+    ) -> Result<SwtchvmReceipt> {
+        let context = SwtchvmContext {
+            caller: tx.from,
+            origin: tx.from,
+            gas_price: tx.gas_price,
+            gas_limit: tx.gas_limit,
+            gas_used: 0,
+            block_number,
+            block_timestamp,
+            value: tx.value,
+        };
+        let tx_hash = Keccak256::digest(bincode::serialize(tx)?);
+        // Rewards mint into native balances, executed by the node itself (see
+        // `native_rewards`): there is no second ledger in a contract.
+        if tx.to == Some(crate::native_rewards::rewards_address()) {
+            let outcome = {
+                let mut state = self.runtime.state.write().await;
+                state.get_account_mut(&tx.from).nonce += 1;
+                crate::native_rewards::execute(&mut state, &tx.data, block_timestamp)
+            };
+            if let Err(error) = &outcome {
+                tracing::warn!(block_number, %error, "reward system call refused");
+            }
+            return Ok(SwtchvmReceipt {
+                tx_hash: hex::encode(tx_hash),
+                tx_index,
+                block_number,
+                success: outcome.is_ok(),
+                gas_used: 0,
+                cumulative_gas_used: *cumulative_gas_used,
+                logs: Vec::new(),
+                logs_bloom: logs_bloom_hex(&[]),
+                return_data: outcome.err().unwrap_or_default().into_bytes(),
+                created_address: None,
+                tool_effects: Vec::new(),
+            });
+        }
+        let receipt = match self.runtime.execute_system_transaction(tx, context).await {
+            Ok(result) => {
+                *total_gas_used += result.gas_used;
+                *cumulative_gas_used += result.gas_used;
+                let logs = result.logs;
+                SwtchvmReceipt {
+                    tx_hash: hex::encode(tx_hash),
+                    tx_index,
+                    block_number,
+                    success: result.success,
+                    gas_used: result.gas_used,
+                    cumulative_gas_used: *cumulative_gas_used,
+                    logs_bloom: logs_bloom_hex(&logs),
+                    logs,
+                    return_data: result.return_data,
+                    created_address: result.created_address,
+                    tool_effects: result.tool_effects,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(block_number, %error, "SRA system transaction failed");
+                *total_gas_used += tx.gas_limit;
+                *cumulative_gas_used += tx.gas_limit;
+                SwtchvmReceipt {
+                    tx_hash: hex::encode(tx_hash),
+                    tx_index,
+                    block_number,
+                    success: false,
+                    gas_used: tx.gas_limit,
+                    cumulative_gas_used: *cumulative_gas_used,
+                    logs: Vec::new(),
+                    logs_bloom: logs_bloom_hex(&[]),
+                    return_data: Vec::new(),
+                    created_address: None,
+                    tool_effects: Vec::new(),
+                }
+            }
+        };
+        Ok(receipt)
+    }
+
     /// Validate and append a block received from a peer by deterministically re-executing every
     /// transaction against the local parent state. No peer-provided world state is trusted.
     pub async fn import_block(&self, chain_id: &str, proposed: SwtchvmBlock) -> Result<()> {
+        let _mining_guard = self.mining_lock.lock().await;
+        self.import_block_locked(chain_id, proposed).await
+    }
+
+    async fn import_block_locked(&self, chain_id: &str, proposed: SwtchvmBlock) -> Result<()> {
         if chain_id != self.chain_id {
             return Err(anyhow::anyhow!(
                 "chain id mismatch: local={} remote={}",
@@ -6238,7 +7260,6 @@ impl SwtchvmNode {
                 chain_id
             ));
         }
-        let _mining_guard = self.mining_lock.lock().await;
         let current = self.get_latest_block();
         if proposed.number <= current.number {
             if proposed.number == current.number && proposed.hash == current.hash {
@@ -6279,42 +7300,160 @@ impl SwtchvmNode {
             }
         }
 
-        let pre_state = self.runtime.state.read().await.clone();
+        // Start the block's journal and apply the time-based consensus
+        // transitions, exactly as the producer did. Every failure below undoes
+        // them.
+        {
+            let mut state = self.runtime.state.write().await;
+            let _ = state.checkpoint();
+            crate::chain_consensus::begin_block(&mut state, proposed.timestamp);
+        }
+        let sra_before = self.sra_host.as_ref().map(|s| s.snapshot());
         let digest_len = self
             .runtime
             .commit_tx_digests
             .lock()
             .map(|digests| digests.len())
             .unwrap_or(0);
-        let validation = self.reexecute_imported_block(&proposed).await;
-        if let Err(error) = validation {
-            *self.runtime.state.write().await = pre_state;
-            if let Ok(mut digests) = self.runtime.commit_tx_digests.lock() {
-                digests.truncate(digest_len);
+        match self.import_block_inner(&proposed).await {
+            Ok((sra_plan, undo)) => {
+                {
+                    let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
+                    for (tx, receipt) in proposed.transactions.iter().zip(&proposed.receipts) {
+                        let tx_hash: [u8; 32] = Keccak256::digest(bincode::serialize(tx)?).into();
+                        chain.receipts_by_tx.insert(tx_hash, receipt.clone());
+                        chain.transactions_by_tx.insert(tx_hash, tx.clone());
+                    }
+                    chain.blockchain.push(proposed.clone());
+                }
+                if let (Some(sra), Some(plan)) = (&self.sra_host, sra_plan) {
+                    sra.commit_block(
+                        plan,
+                        proposed.number,
+                        proposed.proposer_did.as_deref(),
+                        &proposed.transactions,
+                        &proposed.receipts,
+                    )
+                    .await;
+                }
+                self.remember_undo(BlockUndo {
+                    number: proposed.number,
+                    hash: proposed.hash,
+                    state: undo,
+                    sra: sra_before,
+                });
+                self.prune_pending_after_block(&proposed).await;
+                self.runtime.persist_state_if_configured().await;
+                Ok(())
             }
-            self.runtime.persist_state_if_configured().await;
-            return Err(error);
-        }
-
-        {
-            let mut chain = self.chain.write().expect("SwtchVM chain lock poisoned");
-            for (tx, receipt) in proposed.transactions.iter().zip(&proposed.receipts) {
-                let tx_hash: [u8; 32] = Keccak256::digest(bincode::serialize(tx)?).into();
-                chain.receipts_by_tx.insert(tx_hash, receipt.clone());
-                chain.transactions_by_tx.insert(tx_hash, tx.clone());
+            Err(error) => {
+                {
+                    let mut state = self.runtime.state.write().await;
+                    let (_, journal) = state.checkpoint();
+                    state.revert(journal);
+                }
+                if let Ok(mut digests) = self.runtime.commit_tx_digests.lock() {
+                    digests.truncate(digest_len);
+                }
+                Err(error)
             }
-            chain.blockchain.push(proposed);
         }
-        self.runtime.persist_state_if_configured().await;
-        Ok(())
     }
 
-    async fn reexecute_imported_block(&self, proposed: &SwtchvmBlock) -> Result<()> {
+    /// Validate and re-execute an imported block on top of the current head
+    /// (after `begin_block`). Returns the SRA plan and the block's undo
+    /// journal; on error the caller reverts.
+    async fn import_block_inner(
+        &self,
+        proposed: &SwtchvmBlock,
+    ) -> Result<(
+        Option<crate::service_reward_accumulator::SraBlockPlan>,
+        super::state_commitment::StateJournal,
+    )> {
+        // The block must start with exactly the system transactions this node
+        // derives from its own chain state (SRA reward settlement).
+        let sra_plan = match &self.sra_host {
+            Some(sra) => {
+                let world = self.runtime.state.read().await;
+                Some(sra.plan_block(&world, proposed.number, proposed.timestamp))
+            }
+            None => None,
+        };
+        let system_count = sra_plan.as_ref().map(|p| p.system_txs.len()).unwrap_or(0);
+        if let Some(plan) = &sra_plan {
+            let prefix = proposed.transactions.get(..system_count).unwrap_or(&[]);
+            let same = prefix.len() == system_count
+                && prefix
+                    .iter()
+                    .zip(&plan.system_txs)
+                    .all(|(a, b)| bincode::serialize(a).ok() == bincode::serialize(b).ok());
+            if !same {
+                return Err(anyhow::anyhow!(
+                    "block {} system transactions do not match the local reward settlement \
+                     (expected {}, got a different prefix); governance or SRA state differs",
+                    proposed.number,
+                    system_count
+                ));
+            }
+        }
+        if let Some(sra) = &self.sra_host {
+            if proposed.transactions[system_count..]
+                .iter()
+                .any(|tx| sra.is_system_tx(tx))
+            {
+                return Err(anyhow::anyhow!("unplanned system transaction in block"));
+            }
+        }
+
+        let consensus_txs = proposed.transactions[system_count..]
+            .iter()
+            .filter(|tx| crate::chain_consensus::is_consensus_tx(tx))
+            .count();
+        if consensus_txs > crate::chain_consensus::MAX_CONSENSUS_TXS_PER_BLOCK {
+            return Err(anyhow::anyhow!("too many consensus transactions in block"));
+        }
+        self.reexecute_imported_block(proposed, system_count).await?;
+        let undo = self.runtime.state.write().await.checkpoint().1;
+        Ok((sra_plan, undo))
+    }
+
+    async fn reexecute_imported_block(
+        &self,
+        proposed: &SwtchvmBlock,
+        system_count: usize,
+    ) -> Result<()> {
         let mut receipts = Vec::with_capacity(proposed.transactions.len());
         let mut total_gas_used = 0u128;
         let mut cumulative_gas_used = 0u128;
 
         for (index, tx) in proposed.transactions.iter().enumerate() {
+            if index < system_count {
+                let receipt = self
+                    .execute_block_system_tx(
+                        tx,
+                        proposed.number,
+                        proposed.timestamp,
+                        index as u64,
+                        &mut total_gas_used,
+                        &mut cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                continue;
+            }
+            if crate::chain_consensus::is_consensus_tx(tx) {
+                let receipt = self
+                    .execute_consensus_tx(
+                        tx,
+                        proposed.number,
+                        proposed.timestamp,
+                        index as u64,
+                        cumulative_gas_used,
+                    )
+                    .await?;
+                receipts.push(receipt);
+                continue;
+            }
             if total_gas_used.saturating_add(tx.gas_limit) > proposed.gas_limit {
                 return Err(anyhow::anyhow!("transaction exceeds block gas limit"));
             }
@@ -6469,6 +7608,15 @@ impl SwtchvmNode {
             .expect("SwtchVM genesis block missing")
     }
 
+    /// All blocks from genesis (used to rebuild derived state on restart).
+    pub fn blocks(&self) -> Vec<SwtchvmBlock> {
+        self.chain
+            .read()
+            .expect("SwtchVM chain lock poisoned")
+            .blockchain
+            .clone()
+    }
+
     pub fn get_block_by_number(&self, number: u64) -> Option<SwtchvmBlock> {
         self.chain
             .read()
@@ -6477,6 +7625,188 @@ impl SwtchvmNode {
             .get(number as usize)
             .cloned()
     }
+
+    /// Fork-choice weight of a block: 2 when its proposer produced it on its
+    /// own first turn, 1 otherwise (a fallback producer, or no proposer).
+    fn block_weight(set: &crate::chain_consensus::ProducerSet, block: &SwtchvmBlock) -> u64 {
+        match block.proposer_did.as_deref() {
+            Some(did) if set.in_turn(block.number, did) => 2,
+            _ => 1,
+        }
+    }
+
+    /// Offer a sealed block that does not extend the head (a competing block,
+    /// or part of a competing branch). Its seal must already be verified.
+    ///
+    /// Fork choice: the branch with more weight wins (in-turn blocks weigh 2,
+    /// others 1); on equal weight the longer branch, then the lower tip hash.
+    /// The node switches by rolling back to the fork point (at most
+    /// [`MAX_REORG_DEPTH`] blocks) and importing the other branch; if any of
+    /// its blocks fails to import, the original branch is restored.
+    pub async fn offer_side_block<S: Clone + Send + Sync + 'static>(
+        &self,
+        chain_id: &str,
+        block: SwtchvmBlock,
+        seal: S,
+    ) -> Result<ForkOutcome<S>> {
+        if chain_id != self.chain_id {
+            return Err(anyhow::anyhow!("chain id mismatch"));
+        }
+        let _guard = self.mining_lock.lock().await;
+        let head = self.get_latest_block();
+        if let Some(ours) = self.get_block_by_number(block.number) {
+            if ours.hash == block.hash {
+                return Ok(ForkOutcome::Known);
+            }
+        }
+        let floor = head.number.saturating_sub(MAX_REORG_DEPTH as u64);
+        if block.number <= floor {
+            return Ok(ForkOutcome::TooDeep);
+        }
+        // Keep the block until its branch is complete.
+        {
+            let mut side = self.side_blocks.lock().unwrap_or_else(|p| p.into_inner());
+            side.retain(|_, (b, _)| b.number > floor);
+            if side.len() >= MAX_SIDE_BLOCKS {
+                return Ok(ForkOutcome::Ignored);
+            }
+            side.insert(block.hash, (block.clone(), std::sync::Arc::new(seal) as SideSeal));
+        }
+        // Walk back to our chain.
+        let mut branch = vec![block.clone()];
+        loop {
+            let first = branch.last().expect("non-empty");
+            if first.number == 0 {
+                return Ok(ForkOutcome::Ignored);
+            }
+            let parent_number = first.number - 1;
+            if self
+                .get_block_by_number(parent_number)
+                .is_some_and(|b| b.hash == first.parent_hash)
+            {
+                break;
+            }
+            let parent = self
+                .side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&first.parent_hash)
+                .map(|(b, _)| b.clone());
+            match parent {
+                Some(p) => branch.push(p),
+                None => {
+                    return Ok(ForkOutcome::NeedParent {
+                        from: parent_number.max(floor + 1),
+                        to: block.number,
+                    })
+                }
+            }
+        }
+        branch.reverse();
+        let fork_point = branch[0].number - 1;
+        let depth = (head.number - fork_point) as usize;
+        if depth > self.undo_depth() {
+            return Ok(ForkOutcome::TooDeep);
+        }
+        let set = self.producer_set(head.timestamp).await;
+        let side_weight: u64 = branch.iter().map(|b| Self::block_weight(&set, b)).sum();
+        let ours: Vec<SwtchvmBlock> = ((fork_point + 1)..=head.number)
+            .filter_map(|n| self.get_block_by_number(n))
+            .collect();
+        let our_weight: u64 = ours.iter().map(|b| Self::block_weight(&set, b)).sum();
+        let side_tip = branch.last().expect("non-empty");
+        let switch = (side_weight, side_tip.number, std::cmp::Reverse(side_tip.hash))
+            > (our_weight, head.number, std::cmp::Reverse(head.hash));
+        if !switch {
+            return Ok(ForkOutcome::Kept {
+                our_weight,
+                side_weight,
+            });
+        }
+
+        tracing::warn!(
+            fork_point,
+            depth,
+            our_weight,
+            side_weight,
+            "Switching to a heavier branch"
+        );
+        // Roll back our blocks, keeping them as a side branch to return to.
+        for _ in 0..depth {
+            let rolled = self.rollback_head_locked().await?;
+            self.side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(rolled.hash)
+                .or_insert_with(|| (rolled.clone(), std::sync::Arc::new(()) as SideSeal));
+        }
+        let mut imported = Vec::new();
+        let mut failure = None;
+        for b in &branch {
+            match self.import_block_locked(chain_id, b.clone()).await {
+                Ok(()) => imported.push(b.clone()),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            tracing::warn!(%error, "Heavier branch failed to import; restoring ours");
+            for _ in 0..imported.len() {
+                self.rollback_head_locked().await?;
+            }
+            for b in ours {
+                self.import_block_locked(chain_id, b).await?;
+            }
+            self.side_blocks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|h, _| !branch.iter().any(|b| &b.hash == h));
+            return Ok(ForkOutcome::Invalid(error.to_string()));
+        }
+        let seals: Vec<(SwtchvmBlock, S)> = {
+            let side = self.side_blocks.lock().unwrap_or_else(|p| p.into_inner());
+            imported
+                .iter()
+                .filter_map(|b| {
+                    side.get(&b.hash)
+                        .and_then(|(_, s)| s.clone().downcast::<S>().ok())
+                        .map(|s| (b.clone(), (*s).clone()))
+                })
+                .collect()
+        };
+        self.side_blocks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|h, _| !imported.iter().any(|b| &b.hash == h));
+        Ok(ForkOutcome::Reorged {
+            depth,
+            imported: seals,
+        })
+    }
+}
+
+type SideSeal = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+const MAX_SIDE_BLOCKS: usize = 1_024;
+
+/// What fork choice did with an offered block.
+#[derive(Debug)]
+pub enum ForkOutcome<S> {
+    /// Already in our chain.
+    Known,
+    /// Below the rollback window.
+    TooDeep,
+    /// Not kept (buffer full or unrelated).
+    Ignored,
+    /// Its branch is incomplete; ask peers for these heights.
+    NeedParent { from: u64, to: u64 },
+    /// Our branch is at least as heavy.
+    Kept { our_weight: u64, side_weight: u64 },
+    /// Switched to the offered branch.
+    Reorged { depth: usize, imported: Vec<(SwtchvmBlock, S)> },
+    /// The heavier branch had an invalid block; ours was restored.
+    Invalid(String),
 }
 
 // Simplified networking layer
@@ -6566,6 +7896,55 @@ impl SwtchvmNode {
             .and(warp::body::json())
             .and(with_node(node.clone()))
             .and_then(deploy_contract_handler)
+            .map(Reply::into_response);
+
+        // POST /api/contracts/{address}/call — read-only call. The body is the
+        // raw call data; the reply is the contract's raw return data. Nothing
+        // is charged or persisted (storage and messaging nodes use this to
+        // check entitlements).
+        let view_contract = warp::path!("api" / "contracts" / String / "call")
+            .and(warp::post())
+            .and(warp::body::content_length_limit(MAX_VIEW_CALL_BYTES))
+            .and(warp::body::bytes())
+            .and(with_node(node.clone()))
+            .and_then(view_contract_handler)
+            .map(Reply::into_response);
+
+        // GET /v1/balance/{address} — the native ASTRA balance (wei, as a
+        // decimal string so JavaScript keeps full precision), the nonce, and
+        // any locked, not yet released rewards.
+        let balance = warp::path!("v1" / "balance" / String)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(balance_handler)
+            .map(Reply::into_response);
+
+        // GET /v1/tx/{hash} — a transaction in a block: sender, recipient,
+        // value (wei, decimal string) and whether it succeeded. This is how a
+        // payee checks an ASTRA payment.
+        let get_tx = warp::path!("v1" / "tx" / String)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(get_tx_handler)
+            .map(Reply::into_response);
+
+        // Explorer views (read-only).
+        let explorer_blocks = warp::path!("v1" / "blocks")
+            .and(warp::get())
+            .and(warp::query::<BlocksQuery>())
+            .and(with_node(node.clone()))
+            .and_then(explorer_blocks_handler)
+            .map(Reply::into_response);
+        let explorer_block = warp::path!("v1" / "blocks" / u64)
+            .and(warp::get())
+            .and(with_node(node.clone()))
+            .and_then(explorer_block_handler)
+            .map(Reply::into_response);
+        let explorer_address = warp::path!("v1" / "address" / String)
+            .and(warp::get())
+            .and(warp::query::<AddressQuery>())
+            .and(with_node(node.clone()))
+            .and_then(explorer_address_handler)
             .map(Reply::into_response);
 
         let call_contract = warp::path!("contract" / "call")
@@ -6713,6 +8092,18 @@ impl SwtchvmNode {
             .or(deploy_contract)
             .unify()
             .or(call_contract)
+            .unify()
+            .or(view_contract)
+            .unify()
+            .or(balance)
+            .unify()
+            .or(get_tx)
+            .unify()
+            .or(explorer_blocks)
+            .unify()
+            .or(explorer_block)
+            .unify()
+            .or(explorer_address)
             .unify()
             .or(get_receipt)
             .unify();
@@ -7165,6 +8556,80 @@ async fn call_contract_handler(
     .await)
 }
 
+async fn balance_handler(
+    address: String,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let hex_part = address.trim_start_matches("0x");
+    if hex_part.len() != 40 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": "address must be 20 bytes of hex" })),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    }
+    let Ok(addr) = SwtchvmAddress::from_hex(hex_part) else {
+        return Err(warp::reject::reject());
+    };
+    let state = node.runtime.state.read().await;
+    let (balance, nonce) = state
+        .get_account(&addr)
+        .map(|a| (a.balance, a.nonce))
+        .unwrap_or((0, 0));
+    let (locked, released) = crate::native_rewards::lock_position(&state, &addr);
+    Ok(warp::reply::json(&serde_json::json!({
+        "address": format!("0x{}", hex_part.to_ascii_lowercase()),
+        "balance_wei": balance.to_string(),
+        "locked_wei": locked.saturating_sub(released).to_string(),
+        "nonce": nonce,
+        "decimals": 18,
+        "symbol": "ASTRA",
+    }))
+    .into_response())
+}
+
+async fn view_contract_handler(
+    address: String,
+    body: bytes::Bytes,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let reply_error = |status: warp::http::StatusCode, message: String| {
+        warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": message })),
+            status,
+        )
+        .into_response()
+    };
+    let hex_part = address.trim_start_matches("0x");
+    if hex_part.len() != 40 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(reply_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "contract address must be 20 bytes of hex".into(),
+        ));
+    }
+    let contract = match SwtchvmAddress::from_hex(hex_part) {
+        Ok(a) => a,
+        Err(e) => return Ok(reply_error(warp::http::StatusCode::BAD_REQUEST, e.to_string())),
+    };
+    match node.view_contract(&contract, &body).await {
+        Ok(output) => Ok(warp::reply::with_header(
+            output,
+            "content-type",
+            "application/octet-stream",
+        )
+        .into_response()),
+        Err(e) if e.to_string().starts_with("no contract at") => {
+            Ok(reply_error(warp::http::StatusCode::NOT_FOUND, e.to_string()))
+        }
+        Err(e) => Ok(reply_error(
+            warp::http::StatusCode::UNPROCESSABLE_ENTITY,
+            e.to_string(),
+        )),
+    }
+}
+
 async fn get_block_handler(
     number: u64,
     node: Arc<SwtchvmNode>,
@@ -7195,6 +8660,239 @@ async fn get_block_header_handler(
     match node.get_block_by_number(number) {
         Some(block) => Ok(warp::reply::json(&block.header(&node.chain_id))),
         None => Err(warp::reject::not_found()),
+    }
+}
+
+async fn get_tx_handler(
+    hash: String,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(hash) = parse_hash32(&hash) else {
+        return Err(warp::reject::not_found());
+    };
+    let Some((tx, receipt, timestamp)) = node.find_transaction(&hash) else {
+        return Err(warp::reject::not_found());
+    };
+    let head = node.get_latest_block().number;
+    let mut body = explorer_tx_json(receipt.tx_index as usize, &tx, Some(&receipt));
+    let obj = body.as_object_mut().expect("object");
+    // `tx_hash` kept for clients written against the earlier response shape.
+    if let Some(h) = obj.get("hash").cloned() {
+        obj.insert("tx_hash".into(), h);
+    }
+    obj.insert("block_number".into(), receipt.block_number.into());
+    obj.insert("block_timestamp".into(), (timestamp as i64).into());
+    obj.insert(
+        "confirmations".into(),
+        (head.saturating_sub(receipt.block_number) + 1).into(),
+    );
+    Ok(warp::reply::json(&body).into_response())
+}
+
+// ── Explorer endpoints ──
+//
+// Normalized, read-only views for block explorers: hashes and addresses as
+// 0x-hex, wei amounts as decimal strings (JavaScript-safe), transaction data
+// reported by size only.
+
+const EXPLORER_MAX_BLOCKS: u64 = 100;
+const EXPLORER_MAX_SCAN: u64 = 1_000;
+
+fn parse_hash32(raw: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(raw.trim().trim_start_matches("0x")).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
+fn hex0x(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn tx_kind(tx: &SwtchvmTransaction) -> &'static str {
+    let rewards = crate::native_rewards::rewards_address();
+    match tx.to {
+        None => "deploy",
+        Some(to) if to == rewards => "system",
+        Some(_) if tx.data.is_empty() => "transfer",
+        Some(_) => "call",
+    }
+}
+
+fn explorer_tx_json(index: usize, tx: &SwtchvmTransaction, receipt: Option<&SwtchvmReceipt>) -> serde_json::Value {
+    let hash = receipt.map(|r| {
+        let h = r.tx_hash.trim_start_matches("0x");
+        format!("0x{h}")
+    });
+    serde_json::json!({
+        "index": index,
+        "hash": hash,
+        "kind": tx_kind(tx),
+        "from": hex0x(tx.from.as_bytes()),
+        "to": tx.to.map(|a| hex0x(a.as_bytes())),
+        "value_wei": tx.value.to_string(),
+        "nonce": tx.nonce,
+        "gas_limit": tx.gas_limit.to_string(),
+        "gas_price": tx.gas_price.to_string(),
+        "data_bytes": tx.data.len(),
+        "success": receipt.map(|r| r.success),
+        "gas_used": receipt.map(|r| r.gas_used.to_string()),
+        "logs": receipt.map(|r| r.logs.len()),
+        "created_address": receipt.and_then(|r| r.created_address).map(|a| hex0x(a.as_bytes())),
+    })
+}
+
+fn explorer_block_summary(block: &SwtchvmBlock) -> serde_json::Value {
+    serde_json::json!({
+        "number": block.number,
+        "hash": hex0x(&block.hash),
+        "parent_hash": hex0x(&block.parent_hash),
+        "state_root": hex0x(&block.state_root),
+        "timestamp": block.timestamp,
+        "tx_count": block.transactions.len(),
+        "gas_used": block.gas_used.to_string(),
+        "gas_limit": block.gas_limit.to_string(),
+        "proposer_did": block.proposer_did,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BlocksQuery {
+    limit: Option<u64>,
+    before: Option<u64>,
+}
+
+/// GET /v1/blocks?limit=20&before=N — newest blocks first.
+async fn explorer_blocks_handler(
+    q: BlocksQuery,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let head = node.get_latest_block().number;
+    let limit = q.limit.unwrap_or(20).clamp(1, EXPLORER_MAX_BLOCKS);
+    let top = q.before.map(|b| b.saturating_sub(1)).unwrap_or(head).min(head);
+    let blocks: Vec<serde_json::Value> = (0..limit)
+        .filter_map(|i| top.checked_sub(i))
+        .filter_map(|n| node.get_block_by_number(n))
+        .map(|b| explorer_block_summary(&b))
+        .collect();
+    Ok(warp::reply::json(&serde_json::json!({ "head": head, "blocks": blocks })).into_response())
+}
+
+/// GET /v1/blocks/{number} — one block with its transactions.
+async fn explorer_block_handler(
+    number: u64,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(block) = node.get_block_by_number(number) else {
+        return Err(warp::reject::not_found());
+    };
+    let mut body = explorer_block_summary(&block);
+    let txs: Vec<serde_json::Value> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| explorer_tx_json(i, tx, block.receipts.get(i)))
+        .collect();
+    body["transactions"] = serde_json::Value::Array(txs);
+    body["head"] = node.get_latest_block().number.into();
+    Ok(warp::reply::json(&body).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct AddressQuery {
+    scan: Option<u64>,
+}
+
+/// GET /v1/address/{address}?scan=200 — balance, nonce, locked rewards,
+/// whether it is a contract, and its transactions in the last `scan` blocks
+/// (the node keeps no per-address index).
+async fn explorer_address_handler(
+    address: String,
+    q: AddressQuery,
+    node: Arc<SwtchvmNode>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+    let Some(addr) = crate::native_rewards::did_address(&address) else {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({ "error": "expected a 0x address or did:spacekit:<address>" })),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    };
+    let (balance, nonce, code_bytes) = {
+        let state = node.runtime.state.read().await;
+        state
+            .get_account(&addr)
+            .map(|a| (a.balance, a.nonce, a.code.as_ref().map(|c| c.len()).unwrap_or(0)))
+            .unwrap_or((0, 0, 0))
+    };
+    let (_, locked) = node.native_holdings(&addr).await;
+    let head = node.get_latest_block().number;
+    let scan = q.scan.unwrap_or(200).clamp(1, EXPLORER_MAX_SCAN);
+    let mut activity = Vec::new();
+    for n in (head.saturating_sub(scan - 1)..=head).rev() {
+        let Some(block) = node.get_block_by_number(n) else { continue };
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let receipt = block.receipts.get(i);
+            let created = receipt.and_then(|r| r.created_address);
+            let outgoing = tx.from == addr;
+            let incoming = tx.to == Some(addr) || created == Some(addr);
+            if !(outgoing || incoming) {
+                continue;
+            }
+            let mut entry = explorer_tx_json(i, tx, receipt);
+            entry["block_number"] = n.into();
+            entry["timestamp"] = block.timestamp.into();
+            entry["direction"] = (if outgoing && incoming { "self" } else if outgoing { "out" } else { "in" }).into();
+            activity.push(entry);
+            if activity.len() >= 100 {
+                break;
+            }
+        }
+        if activity.len() >= 100 {
+            break;
+        }
+    }
+    Ok(warp::reply::json(&serde_json::json!({
+        "address": hex0x(addr.as_bytes()),
+        "did": format!("did:spacekit:{}", hex::encode(addr.as_bytes())),
+        "balance_wei": balance.to_string(),
+        "locked_wei": locked.to_string(),
+        "nonce": nonce,
+        "is_contract": code_bytes > 0,
+        "code_bytes": code_bytes,
+        "decimals": 18,
+        "symbol": "ASTRA",
+        "scanned_blocks": scan.min(head + 1),
+        "head": head,
+        "activity": activity,
+    }))
+    .into_response())
+}
+
+/// Payment verification (`spacekit_payments::PaymentVerifier`) reads ASTRA
+/// transfers straight from this node's chain.
+impl spacekit_payments::ChainLookup for SwtchvmNode {
+    fn transfer(&self, tx_hash: &str) -> Option<spacekit_payments::ChainTransfer> {
+        let bytes = hex::decode(tx_hash.trim().trim_start_matches("0x")).ok()?;
+        let hash = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+        let (tx, receipt, timestamp) = self.find_transaction(&hash)?;
+        // A contract creation pays the created contract.
+        let to = tx.to.or(receipt.created_address)?;
+        Some(spacekit_payments::ChainTransfer {
+            tx_hash: format!("0x{}", hex::encode(hash)),
+            from: format!("0x{}", hex::encode(tx.from.as_bytes())),
+            to: format!("0x{}", hex::encode(to.as_bytes())),
+            value_wei: tx.value,
+            success: receipt.success,
+            block_number: receipt.block_number,
+            block_timestamp: timestamp as i64,
+        })
+    }
+
+    fn head(&self) -> u64 {
+        self.get_latest_block().number
     }
 }
 
@@ -8552,14 +10250,18 @@ mod tests {
         nonce: u64,
     ) -> serde_json::Value {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
-        let canonical = format!(
-            "{}|{}|{}|{}|{}",
-            hex::encode(from.as_bytes()),
-            to.map(|address| hex::encode(address.as_bytes()))
-                .unwrap_or_default(),
-            0u128,
-            nonce,
-            hex::encode(data),
+        let canonical = transaction_signing_payload(
+            1337,
+            &SwtchvmTransaction {
+                from,
+                to,
+                data: data.to_vec(),
+                gas_limit: 1_000_000,
+                gas_price: 1,
+                value: 0,
+                nonce,
+                signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+            },
         );
         let digest: [u8; 32] = Sha256::digest(canonical.as_bytes()).into();
         let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
@@ -8680,17 +10382,672 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_swtchvm_basic_execution() -> Result<()> {
-        let mut node = SwtchvmNode::new(false, false).await?;
+    /// A k256 key and its address, for tests that need several senders.
+    struct TestAccount {
+        key: k256::ecdsa::SigningKey,
+        address: SwtchvmAddress,
+    }
 
-        // Create test account
-        let addr = SwtchvmAddress::new([1u8; 20]);
+    impl TestAccount {
+        fn new() -> Self {
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            use sha3::{Digest, Keccak256};
+            let key = k256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+            let point = key.verifying_key().to_encoded_point(false);
+            let full: [u8; 32] = Keccak256::digest(&point.as_bytes()[1..]).into();
+            let mut a = [0u8; 20];
+            a.copy_from_slice(&full[12..]);
+            Self { key, address: SwtchvmAddress::new(a) }
+        }
+
+        fn did(&self) -> String {
+            format!("did:spacekit:{}", hex::encode(self.address.as_bytes()))
+        }
+
+        fn tx(&self, to: Option<SwtchvmAddress>, data: Vec<u8>, value: u128, nonce: u64) -> SwtchvmTransaction {
+            use k256::ecdsa::signature::hazmat::PrehashSigner;
+            use sha2::{Digest, Sha256};
+            let mut tx = SwtchvmTransaction {
+                from: self.address,
+                to,
+                data,
+                gas_limit: 2_000_000,
+                gas_price: 1,
+                value,
+                nonce,
+                signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+            };
+            let hash: [u8; 32] = Sha256::digest(transaction_signing_payload(1337, &tx).as_bytes()).into();
+            let (sig, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+                self.key.sign_prehash(&hash).unwrap();
+            let bytes = sig.to_bytes();
+            tx.signature.r.copy_from_slice(&bytes[..32]);
+            tx.signature.s.copy_from_slice(&bytes[32..]);
+            tx.signature.v = recid.to_byte() + 27;
+            tx
+        }
+    }
+
+    const WEI: u128 = 1_000_000_000_000_000_000;
+
+    /// Value moves with the transaction and only if it succeeds; a plain
+    /// transfer needs no contract; a contract cannot spend its caller's
+    /// balance; nothing is created.
+    #[tokio::test]
+    async fn value_is_conserved_and_reverted_with_failed_transactions() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let alice = TestAccount::new();
+        let bob = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        node.runtime.state.write().await.checkpoint();
+        let supply = |state: &SwtchvmState| state.accounts.values().map(|a| a.balance).sum::<u128>();
+        let before = supply(&*node.runtime.state.read().await);
+
+        // Plain transfer to an address without code.
+        node.submit_transaction(alice.tx(Some(bob.address), Vec::new(), 3 * WEI, 0)).await?;
+        let block = node.mine_block().await?;
+        assert!(block.receipts[0].success);
+        let gas = block.receipts[0].gas_used;
+        assert_eq!(gas, PLAIN_TRANSFER_GAS);
+        assert_eq!(node.runtime.get_account_balance(&bob.address).await?, 3 * WEI);
+        assert_eq!(node.runtime.get_account_balance(&alice.address).await?, 7 * WEI - gas);
+
+        // A contract that tries to spend its caller's money: `transfer` pays
+        // from the contract, which has nothing, so the call fails and the
+        // value Alice attached comes back.
+        let thief = wat::parse_str(
+            r#"(module
+                (import "env" "transfer" (func $transfer (param i32 i64) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "main") (param i32 i32) (result i32)
+                    ;; send 5 ASTRA to the address at offset 64 (zeros) and
+                    ;; fail if that did not work
+                    (if (call $transfer (i32.const 64) (i64.const 5000000000000000000))
+                        (then (return (i32.const -1))))
+                    i32.const 0))"#,
+        )?;
+        let contract = SwtchvmAddress::new([0x44; 20]);
         {
             let mut state = node.runtime.state.write().await;
-            let account = state.get_account_mut(&addr);
-            account.balance = 1_000_000;
+            state.get_account_mut(&contract).code = Some(thief);
+            state.checkpoint();
         }
+        let alice_before = node.runtime.get_account_balance(&alice.address).await?;
+        node.submit_transaction(alice.tx(Some(contract), b"x".to_vec(), WEI, 1)).await?;
+        let block = node.mine_block().await?;
+        assert!(!block.receipts[0].success);
+        let spent = node.runtime.get_account_balance(&alice.address).await?;
+        assert_eq!(alice_before - spent, block.receipts[0].gas_used, "only gas is charged");
+        assert_eq!(node.runtime.get_account_balance(&contract).await?, 0);
+        assert_eq!(node.runtime.get_account_balance(&SwtchvmAddress::new([0; 20])).await?, 0);
+
+        // Insufficient balance: refused, nothing created, no account touched.
+        let carol = TestAccount::new();
+        node.submit_transaction(carol.tx(Some(bob.address), Vec::new(), WEI, 0)).await.ok();
+        node.mine_block().await?;
+        assert!(node.runtime.state.read().await.get_account(&carol.address).is_none());
+
+        // Gas is burned at the gas price of 1 used by these transactions.
+        let burned: u128 = node.chain.read().unwrap().blockchain.iter()
+            .flat_map(|b| b.receipts.iter())
+            .map(|r| r.gas_used)
+            .sum();
+        assert_eq!(supply(&*node.runtime.state.read().await) + burned, before, "no value created");
+        Ok(())
+    }
+
+    /// A payment is checked against the chain by transaction hash: the right
+    /// payee, enough value, success, and only once.
+    #[tokio::test]
+    async fn astra_payments_verify_against_the_chain() -> Result<()> {
+        use spacekit_payments::{ChainLookup, PaymentAsset, PaymentRequirement, PaymentVerifier};
+        let node = Arc::new(SwtchvmNode::new(false, false).await?);
+        let alice = TestAccount::new();
+        let shop = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        node.runtime.state.write().await.checkpoint();
+
+        node.submit_transaction(alice.tx(Some(shop.address), Vec::new(), 2 * WEI, 0)).await?;
+        let block = node.mine_block().await?;
+        let tx_hash = block.receipts[0].tx_hash.clone();
+
+        let found = ChainLookup::transfer(node.as_ref(), &tx_hash).expect("transaction is on the chain");
+        assert_eq!(found.value_wei, 2 * WEI);
+        assert!(found.success);
+        assert_eq!(found.to, format!("0x{}", hex::encode(shop.address.as_bytes())));
+        assert_eq!(found.from, format!("0x{}", hex::encode(alice.address.as_bytes())));
+
+        let verifier = PaymentVerifier::new(node.clone() as Arc<dyn ChainLookup>);
+        let req = |amount: u128, to: &SwtchvmAddress| PaymentRequirement {
+            amount_wei: amount.to_string(),
+            asset: PaymentAsset::ASTRA,
+            pay_to: format!("0x{}", hex::encode(to.as_bytes())),
+            chain_id: None,
+            description: None,
+        };
+        assert!(verifier.verify(&tx_hash, &req(3 * WEI, &shop.address)).is_err(), "too little");
+        assert!(verifier.verify(&tx_hash, &req(WEI, &alice.address)).is_err(), "wrong payee");
+        let receipt = verifier.verify(&tx_hash, &req(2 * WEI, &shop.address))?;
+        assert_eq!(receipt.amount_wei, 2 * WEI);
+        assert!(verifier.verify(&tx_hash, &req(2 * WEI, &shop.address)).is_err(), "used twice");
+        assert!(ChainLookup::transfer(node.as_ref(), &format!("0x{}", "ab".repeat(32))).is_none());
+
+        // Explorer views of the same transfer.
+        let routes = SwtchvmNode::http_dev_api_routes(node.clone());
+        let get = |path: String| {
+            let routes = routes.clone();
+            async move {
+                let r = warp::test::request().path(&path).reply(&routes).await;
+                assert_eq!(r.status(), warp::http::StatusCode::OK, "{path}");
+                serde_json::from_slice::<serde_json::Value>(r.body()).unwrap()
+            }
+        };
+        let shop_hex = format!("0x{}", hex::encode(shop.address.as_bytes()));
+        let blocks = get("/v1/blocks?limit=5".into()).await;
+        assert_eq!(blocks["blocks"][0]["number"], block.number);
+        assert_eq!(blocks["blocks"][0]["tx_count"], 1);
+        let detail = get(format!("/v1/blocks/{}", block.number)).await;
+        let tx = &detail["transactions"][0];
+        assert_eq!(tx["kind"], "transfer");
+        assert_eq!(tx["to"], shop_hex);
+        assert_eq!(tx["value_wei"], (2 * WEI).to_string());
+        assert_eq!(tx["success"], true);
+        let one = get(format!("/v1/tx/{tx_hash}")).await;
+        assert_eq!(one["hash"], tx["hash"]);
+        assert_eq!(one["confirmations"], 1);
+        let addr = get(format!("/v1/address/did:spacekit:{}", hex::encode(shop.address.as_bytes()))).await;
+        assert_eq!(addr["balance_wei"], (2 * WEI).to_string());
+        assert_eq!(addr["activity"][0]["direction"], "in");
+        assert_eq!(addr["is_contract"], false);
+        Ok(())
+    }
+
+    /// `payment_transfer` pays ASTRA from the contract's own balance and
+    /// refuses any other asset; `payment_vault_charge` is always refused.
+    #[tokio::test]
+    async fn contract_payments_are_astra_only() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let alice = TestAccount::new();
+        node.set_account_balance(&alice.address, 10 * WEI).await?;
+        // Pays 1 ASTRA (as asset "ASTRA") to the DID at offset 0, then tries
+        // "USDC" and a vault charge; returns -1 unless the first succeeded and
+        // the others were refused with -22.
+        let payee = TestAccount::new();
+        let payee_did = payee.did();
+        let wat_src = format!(
+            r#"(module
+                (import "spacekit_payments" "payment_transfer"
+                    (func $pay (param i32 i32 i32 i32 i64) (result i32)))
+                (import "spacekit_payments" "payment_vault_charge"
+                    (func $vault (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{did}")
+                (data (i32.const 200) "ASTRA")
+                (data (i32.const 220) "USDC")
+                (func (export "main") (param i32 i32) (result i32)
+                    (if (i32.ne (call $pay (i32.const 0) (i32.const {len}) (i32.const 200) (i32.const 5)
+                                  (i64.const 1000000000000000000)) (i32.const 1))
+                        (then (return (i32.const -1))))
+                    (if (i32.ne (call $pay (i32.const 0) (i32.const {len}) (i32.const 220) (i32.const 4)
+                                  (i64.const 1)) (i32.const -22))
+                        (then (return (i32.const -1))))
+                    (if (i32.ne (call $vault (i32.const 220) (i32.const 1) (i32.const 0) (i32.const {len}))
+                                  (i32.const -22))
+                        (then (return (i32.const -1))))
+                    i32.const 0))"#,
+            did = payee_did,
+            len = payee_did.len()
+        );
+        let code = wat::parse_str(&wat_src)?;
+        let contract = SwtchvmAddress::new([0x55; 20]);
+        {
+            let mut state = node.runtime.state.write().await;
+            let acct = state.get_account_mut(&contract);
+            acct.code = Some(code);
+            acct.balance = 3 * WEI;
+            state.checkpoint();
+        }
+        node.submit_transaction(alice.tx(Some(contract), b"x".to_vec(), 0, 0)).await?;
+        let block = node.mine_block().await?;
+        assert!(block.receipts[0].success, "{:?}", block.receipts[0]);
+        assert_eq!(node.runtime.get_account_balance(&payee.address).await?, WEI);
+        assert_eq!(node.runtime.get_account_balance(&contract).await?, 2 * WEI);
+        Ok(())
+    }
+
+    fn paymaster_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_PAYMASTER_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_paymaster.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    /// The paymaster holds real ASTRA: deposits arrive as value, sponsored
+    /// draws and withdrawals are paid out on the chain, and policy limits hold.
+    #[tokio::test]
+    async fn paymaster_pays_out_native_astra() -> Result<()> {
+        let Some(wasm) = paymaster_wasm() else {
+            eprintln!("skipped: build spacekit-paymaster for wasm32 or set SPACEKIT_PAYMASTER_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let paymaster = SwtchvmAddress::new([0x9a; 20]);
+        let sponsor = TestAccount::new();
+        let user = TestAccount::new();
+        let stranger = TestAccount::new();
+        for a in [&sponsor, &user, &stranger] {
+            node.set_account_balance(&a.address, 100 * WEI).await?;
+        }
+        {
+            let mut state = node.runtime.state.write().await;
+            state.get_account_mut(&paymaster).code = Some(wasm);
+            state.checkpoint();
+        }
+        let s = |out: &mut Vec<u8>, v: &str| {
+            out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            out.extend_from_slice(v.as_bytes());
+        };
+        let charge = |amount: u128| {
+            let mut d = vec![0x04];
+            s(&mut d, &sponsor.did());
+            d.extend_from_slice(&amount.to_le_bytes());
+            s(&mut d, "gas");
+            d
+        };
+        let mut policy = vec![0x03];
+        s(&mut policy, &format!(
+            r#"{{"allowed_dids":["{}"],"allowed_ops":["gas"],"per_call_max":"{}","daily_max":"{}"}}"#,
+            user.did(), 2 * WEI, 3 * WEI
+        ));
+        let mut withdraw = vec![0x02];
+        withdraw.extend_from_slice(&(WEI).to_le_bytes());
+
+        let mut n = HashMap::<SwtchvmAddress, u64>::new();
+        let mut tx = |who: &TestAccount, data: Vec<u8>, value: u128| {
+            let k = n.entry(who.address).or_insert(0);
+            let t = who.tx(Some(paymaster), data, value, *k);
+            *k += 1;
+            t
+        };
+        let txs = vec![
+            tx(&sponsor, vec![0x01], 10 * WEI), // deposit
+            tx(&sponsor, policy, 0),
+            tx(&user, charge(2 * WEI), 0),      // ok
+            tx(&user, charge(3 * WEI), 0),      // over per-call max
+            tx(&user, charge(WEI), 0),          // ok: 3 today
+            tx(&user, charge(WEI), 0),          // over the daily max
+            tx(&stranger, charge(WEI), 0),      // not allowed
+            tx(&user, vec![0x05], WEI),         // value on a non-deposit op
+            tx(&sponsor, withdraw, 0),
+        ];
+        let user_before = node.runtime.get_account_balance(&user.address).await?;
+        for t in txs {
+            node.submit_transaction(t).await?;
+        }
+        let block = node.mine_block().await?;
+        let ok: Vec<bool> = block.receipts.iter().map(|r| r.success).collect();
+        assert_eq!(ok, vec![true, true, true, false, true, false, false, false, true]);
+
+        let user_gas: u128 = block.receipts[2..8]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 4)
+            .map(|(_, r)| r.gas_used)
+            .sum();
+        assert_eq!(
+            node.runtime.get_account_balance(&user.address).await?,
+            user_before + 3 * WEI - user_gas,
+            "the user received exactly the sponsored 3 ASTRA"
+        );
+        // 10 deposited − 3 drawn − 1 withdrawn.
+        assert_eq!(node.runtime.get_account_balance(&paymaster).await?, 6 * WEI);
+        let budget = node.view_contract(&paymaster, &{
+            let mut d = vec![0x05];
+            s(&mut d, &sponsor.did());
+            d
+        }).await?;
+        assert_eq!(budget[0], 1);
+        assert_eq!(u128::from_le_bytes(budget[1..17].try_into().unwrap()), 6 * WEI);
+        Ok(())
+    }
+
+    fn ledger_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_ENTITLEMENT_LEDGER_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/astra_entitlement_ledger.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    fn ledger_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn create_listing(listing: &str, file: &str, price: u128, pricing: u8, period: u64) -> Vec<u8> {
+        let mut d = vec![0x01];
+        ledger_string(&mut d, listing);
+        ledger_string(&mut d, file);
+        d.extend_from_slice(&price.to_le_bytes());
+        ledger_string(&mut d, "ASTRA");
+        d.push(pricing);
+        d.extend_from_slice(&period.to_le_bytes());
+        d
+    }
+
+    fn purchase(listing: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x02];
+        ledger_string(&mut d, listing);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    fn verify_listing(ent: &[u8], buyer: &str, listing: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x08];
+        d.extend_from_slice(ent);
+        ledger_string(&mut d, buyer);
+        ledger_string(&mut d, listing);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    fn verify_file(ent: &[u8], buyer: &str, file: &str, pk_hash: [u8; 32]) -> Vec<u8> {
+        let mut d = vec![0x03];
+        d.extend_from_slice(ent);
+        ledger_string(&mut d, buyer);
+        ledger_string(&mut d, file);
+        d.extend_from_slice(&pk_hash);
+        d
+    }
+
+    /// The entitlement ledger, built from `sdks/.../astra-entitlement-ledger`,
+    /// running on the chain: payments reach the publisher, a squatted listing
+    /// does not pass `OP_VERIFY_LISTING`, renewals keep the id, amounts above
+    /// u64 work, and a second node replays the blocks to the same state.
+    #[tokio::test]
+    async fn entitlement_ledger_end_to_end() -> Result<()> {
+        let Some(wasm) = ledger_wasm() else {
+            eprintln!("skipped: build astra-entitlement-ledger for wasm32 or set SPACEKIT_ENTITLEMENT_LEDGER_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let replica = SwtchvmNode::new(false, false).await?;
+        let ledger = SwtchvmAddress::new([0x1e; 20]);
+        let publisher = TestAccount::new();
+        let buyer = TestAccount::new();
+        let squatter = TestAccount::new();
+        for n in [&node, &replica] {
+            for a in [&publisher, &buyer, &squatter] {
+                n.set_account_balance(&a.address, 1_000 * WEI).await?;
+            }
+            let mut state = n.runtime.state.write().await;
+            state.get_account_mut(&ledger).code = Some(wasm.clone());
+            state.checkpoint();
+        }
+        let mut nonces: HashMap<SwtchvmAddress, u64> = HashMap::new();
+        let mut send = |who: &TestAccount, data: Vec<u8>, value: u128| {
+            let n = nonces.entry(who.address).or_insert(0);
+            let tx = who.tx(Some(ledger), data, value, *n);
+            *n += 1;
+            tx
+        };
+        async fn run(node: &SwtchvmNode, txs: Vec<SwtchvmTransaction>) -> Result<SwtchvmBlock> {
+            for tx in txs {
+                node.submit_transaction(tx).await?;
+            }
+            node.mine_block().await
+        }
+        let pk = [0x5a; 32];
+        let price = 5 * WEI;
+        let period = 30 * 86_400u64;
+
+        // Publisher lists the channel; the squatter cannot take the listing id.
+        let b = run(&node, vec![
+            send(&publisher, create_listing("channel:grp1", "grp:1", price, 2, period), 0),
+            send(&squatter, create_listing("channel:grp1", "grp:other", 0, 2, period), 0),
+        ]).await?;
+        assert!(b.receipts[0].success);
+        assert!(!b.receipts[1].success, "listing ids belong to their publisher");
+
+        // The squatter makes a free listing for the same group and buys it.
+        let b = run(&node, vec![
+            send(&squatter, create_listing("squat", "grp:1", 0, 2, period), 0),
+            send(&squatter, purchase("squat", pk), 0),
+        ]).await?;
+        assert!(b.receipts.iter().all(|r| r.success));
+        let squat_ent = b.receipts[1].return_data[1..33].to_vec();
+        // Legacy OP_VERIFY by file id is fooled; OP_VERIFY_LISTING is not.
+        assert_eq!(node.view_contract(&ledger, &verify_file(&squat_ent, &squatter.did(), "grp:1", pk)).await?, vec![1, 1]);
+        assert_eq!(node.view_contract(&ledger, &verify_listing(&squat_ent, &squatter.did(), "channel:grp1", pk)).await?, vec![1, 6]);
+
+        // Underpaying fails and the value comes back; paying works and the
+        // publisher receives exactly the price; the ledger keeps nothing.
+        let publisher_before = node.runtime.get_account_balance(&publisher.address).await?;
+        let buyer_before = node.runtime.get_account_balance(&buyer.address).await?;
+        let b = run(&node, vec![
+            send(&buyer, purchase("channel:grp1", pk), price - 1),
+            send(&buyer, purchase("channel:grp1", pk), price),
+            send(&buyer, purchase("channel:grp1", pk), price),
+        ]).await?;
+        assert!(!b.receipts[0].success);
+        assert!(b.receipts[1].success && b.receipts[2].success);
+        let gas: u128 = b.receipts.iter().map(|r| r.gas_used).sum();
+        assert_eq!(node.runtime.get_account_balance(&buyer.address).await?, buyer_before - 2 * price - gas);
+        assert_eq!(node.runtime.get_account_balance(&publisher.address).await?, publisher_before + 2 * price);
+        assert_eq!(node.runtime.get_account_balance(&ledger).await?, 0);
+        let ent = b.receipts[1].return_data[1..33].to_vec();
+        let ent2 = b.receipts[2].return_data[1..33].to_vec();
+        assert_ne!(ent, ent2, "two purchases in one block get distinct ids");
+
+        let check = |e: &[u8], pk_hash| verify_listing(e, &buyer.did(), "channel:grp1", pk_hash);
+        assert_eq!(node.view_contract(&ledger, &check(&ent, pk)).await?, vec![1, 1]);
+        assert_eq!(node.view_contract(&ledger, &check(&ent, [9; 32])).await?, vec![1, 5]);
+
+        // Expiry follows the block's clock: one period after the block.
+        let mut get = vec![0x06];
+        get.extend_from_slice(&ent);
+        let record = node.view_contract(&ledger, &get).await?;
+        let expires = |rec: &[u8]| {
+            let mut pos = 1;
+            for _ in 0..2 {
+                let len = u16::from_le_bytes([rec[pos], rec[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+            u64::from_le_bytes(rec[pos + 8..pos + 16].try_into().unwrap())
+        };
+        assert_eq!(expires(&record), b.timestamp + period);
+
+        // Renewal pays the publisher and extends the same entitlement.
+        let old_expiry = expires(&record);
+        let mut renew = vec![0x09];
+        renew.extend_from_slice(&ent);
+        let b = run(&node, vec![send(&buyer, renew, price)]).await?;
+        assert!(b.receipts[0].success);
+        let new_expiry = u64::from_le_bytes(b.receipts[0].return_data[1..9].try_into().unwrap());
+        assert_eq!(new_expiry, old_expiry + period);
+        let record = node.view_contract(&ledger, &get).await?;
+        assert_eq!(expires(&record), new_expiry);
+        assert_eq!(node.runtime.get_account_balance(&publisher.address).await?, publisher_before + 3 * price);
+
+        // Value sent with an operation that takes none is refused (and returned).
+        let buyer_before = node.runtime.get_account_balance(&buyer.address).await?;
+        let b = run(&node, vec![send(&buyer, create_listing("mine", "f", 0, 1, 0), WEI)]).await?;
+        assert!(!b.receipts[0].success);
+        assert_eq!(node.runtime.get_account_balance(&buyer.address).await?, buyer_before - b.receipts[0].gas_used);
+
+        // Prices above u64 (18.4 ASTRA) work end to end.
+        let big = 100 * WEI;
+        let b = run(&node, vec![
+            send(&publisher, create_listing("vip", "grp:vip", big, 1, 0), 0),
+            send(&buyer, purchase("vip", pk), big),
+        ]).await?;
+        assert!(b.receipts.iter().all(|r| r.success));
+
+        // Another node replays every block to the same state.
+        let blocks: Vec<SwtchvmBlock> =
+            node.chain.read().unwrap().blockchain.iter().skip(1).cloned().collect();
+        for block in blocks {
+            replica.import_block("spacekitvm-rs", block).await?;
+        }
+        assert_eq!(
+            replica.runtime.state.read().await.state_root(),
+            node.runtime.state.read().await.state_root()
+        );
+        Ok(())
+    }
+
+    fn treasury_wasm() -> Option<Vec<u8>> {
+        let path = std::env::var("SPACEKIT_TREASURY_WASM").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sdks/spacekit-standard-library/target/wasm32-unknown-unknown/release/spacekit_treasury.wasm"
+            )
+            .to_string()
+        });
+        std::fs::read(path).ok()
+    }
+
+    /// The treasury holds native ASTRA (minted to it by the rewards INIT) and
+    /// pays it out from its own balance once M of N signers approve.
+    #[tokio::test]
+    async fn treasury_pays_from_its_native_balance() -> Result<()> {
+        let Some(wasm) = treasury_wasm() else {
+            eprintln!("skipped: build spacekit-treasury for wasm32 or set SPACEKIT_TREASURY_WASM");
+            return Ok(());
+        };
+        let node = SwtchvmNode::new(false, false).await?;
+        let s1 = TestAccount::new();
+        let s2 = TestAccount::new();
+        let outsider = TestAccount::new();
+        let recipient = SwtchvmAddress::new([0x77; 20]);
+        let treasury = crate::native_rewards::treasury_address();
+        {
+            let mut state = node.runtime.state.write().await;
+            for a in [&s1, &s2, &outsider] {
+                state.get_account_mut(&a.address).balance = 10 * WEI;
+            }
+            state.get_account_mut(&treasury).code = Some(wasm);
+            crate::chain_consensus::init_treasury(
+                &mut state,
+                &crate::validator_governance::TreasuryGenesis {
+                    threshold: 2,
+                    signer_dids: vec![s1.did(), s2.did()],
+                },
+            );
+            crate::native_rewards::execute(&mut state, &[0x01, 0], 1).unwrap();
+            state.checkpoint();
+        }
+        let pool = crate::native_rewards::GENESIS_TREASURY_WEI;
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool);
+
+        let spend = |id: u8, amount: u128| {
+            let mut d = vec![0x10];
+            d.extend_from_slice(&[id; 32]);
+            d.extend_from_slice(recipient.as_bytes());
+            d.extend_from_slice(&amount.to_le_bytes());
+            d.extend_from_slice(&[0u8; 32]);
+            d
+        };
+        let mut approve = vec![0x11];
+        approve.extend_from_slice(&[1u8; 32]);
+
+        node.submit_transaction(outsider.tx(Some(treasury), spend(9, WEI), 0, 0)).await?;
+        node.submit_transaction(s1.tx(Some(treasury), spend(1, 25 * WEI), 0, 0)).await?;
+        let b = node.mine_block().await?;
+        assert!(!b.receipts[0].success, "not a signer");
+        assert!(b.receipts[1].success);
+        assert_eq!(node.runtime.get_account_balance(&recipient).await?, 0, "one approval of two");
+
+        node.submit_transaction(s2.tx(Some(treasury), approve.clone(), 0, 0)).await?;
+        let b = node.mine_block().await?;
+        assert!(b.receipts[0].success);
+        assert_eq!(node.runtime.get_account_balance(&recipient).await?, 25 * WEI);
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool - 25 * WEI);
+
+        // Value with a signer operation is refused; DEPOSIT accepts it.
+        node.submit_transaction(s1.tx(Some(treasury), approve, WEI, 1)).await?;
+        node.submit_transaction(outsider.tx(Some(treasury), vec![0x20], WEI, 1)).await?;
+        let b = node.mine_block().await?;
+        assert!(!b.receipts[0].success);
+        assert!(b.receipts[1].success);
+        assert_eq!(node.runtime.get_account_balance(&treasury).await?, pool - 24 * WEI);
+        Ok(())
+    }
+
+    /// A read-only call returns the contract's output and leaves no trace: the
+    /// contract's own write is undone, nothing is charged, and changes pending
+    /// in the current block are still pending afterwards.
+    #[tokio::test]
+    async fn view_call_returns_output_and_changes_nothing() -> Result<()> {
+        let node = Arc::new(SwtchvmNode::new(false, false).await?);
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "storage_write" (func $write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "k")
+                (data (i32.const 8) "v")
+                (data (i32.const 16) "okay")
+                (func (export "main") (param i32 i32) (result i32)
+                    (drop (call $write (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 1)))
+                    i32.const 4)
+                (func (export "get_result") (param $ptr i32) (param $len i32) (result i32)
+                    (memory.copy (local.get $ptr) (i32.const 16) (i32.const 4))
+                    i32.const 4)
+            )"#,
+        )?;
+        let contract = SwtchvmAddress::new([7u8; 20]);
+        let other = SwtchvmAddress::new([9u8; 20]);
+        {
+            let mut state = node.runtime.state.write().await;
+            state.get_account_mut(&contract).code = Some(wasm);
+            state.checkpoint();
+            // A change made by a block in progress.
+            state.get_account_mut(&other).balance = 5;
+        }
+        let root_before = node.runtime.state.read().await.state_root();
+
+        let output = node.view_contract(&contract, b"input").await?;
+        assert_eq!(output, b"okay");
+
+        let mut state = node.runtime.state.write().await;
+        assert_eq!(state.state_root(), root_before);
+        assert!(state.kv_get(&contract, b"k").is_none());
+        assert_eq!(state.get_account(&contract).unwrap().nonce, 0);
+        let (_, pending) = state.checkpoint();
+        assert!(pending.accounts.contains_key(&other));
+        assert_eq!(pending.len(), 1);
+        drop(state);
+
+        // Over HTTP: raw bytes in, raw bytes out; unknown contracts are 404.
+        let routes = SwtchvmNode::http_dev_api_routes(node.clone());
+        let reply = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/contracts/0x{}/call", hex::encode(contract.as_bytes())))
+            .body(b"input".to_vec())
+            .reply(&routes)
+            .await;
+        assert_eq!(reply.status(), warp::http::StatusCode::OK);
+        assert_eq!(reply.body().as_ref(), b"okay");
+        let missing = warp::test::request()
+            .method("POST")
+            .path(&format!("/api/contracts/0x{}/call", hex::encode([1u8; 20])))
+            .body(Vec::new())
+            .reply(&routes)
+            .await;
+        assert_eq!(missing.status(), warp::http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_swtchvm_basic_execution() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
 
         // Simple WASM that returns 42
         let code = wat::parse_str(
@@ -8703,20 +11060,13 @@ mod tests {
         "#,
         )?;
 
-        let tx = SwtchvmTransaction {
-            from: addr,
-            to: None,
-            data: code,
-            gas_limit: 100_000,
-            gas_price: 1,
-            value: 0,
-            nonce: 0,
-            signature: TransactionSignature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            },
-        };
+        // Unsigned transactions are refused at submission; sign this one.
+        let tx = signed_tx(code, 100_000, 0);
+        {
+            let mut state = node.runtime.state.write().await;
+            let account = state.get_account_mut(&tx.from);
+            account.balance = 10_000_000;
+        }
 
         let _hash = node.submit_transaction(tx).await?;
         let block = node.mine_block().await?;
@@ -8725,6 +11075,94 @@ mod tests {
         assert!(block.gas_used > 0);
 
         Ok(())
+    }
+
+    /// Two nodes produce competing blocks; the lighter one switches to the
+    /// heavier branch by rolling back, and ends up with the same state.
+    #[tokio::test]
+    async fn fork_choice_switches_to_the_heavier_branch() -> Result<()> {
+        let a = SwtchvmNode::new(false, false).await?;
+        let b = SwtchvmNode::new(false, false).await?;
+        let tx_a = signed_tx(b"on-a".to_vec(), 50_000, 0);
+        let tx_b = signed_tx(b"on-b".to_vec(), 50_000, 0);
+        for node in [&a, &b] {
+            node.set_account_balance(&tx_a.from, 10_000_000).await?;
+            node.set_account_balance(&tx_b.from, 10_000_000).await?;
+            // Balances set outside blocks: checkpoint them into the genesis state.
+            node.runtime.state.write().await.checkpoint();
+        }
+        a.submit_transaction(tx_a.clone()).await?;
+        let a1 = a.mine_block().await?;
+        b.submit_transaction(tx_b.clone()).await?;
+        let b1 = b.mine_block().await?;
+        let b2 = b.mine_block().await?;
+        assert_ne!(a1.hash, b1.hash);
+
+        // Height 1 alone: equal weight and length, lower hash decides.
+        let first = a.offer_side_block("spacekitvm-rs", b1.clone(), ()).await?;
+        let a_kept = matches!(first, ForkOutcome::Kept { .. });
+        assert!(a_kept || matches!(first, ForkOutcome::Reorged { .. }));
+        // The longer branch wins.
+        let second = a.offer_side_block("spacekitvm-rs", b2.clone(), ()).await?;
+        if a_kept {
+            match second {
+                ForkOutcome::Reorged { depth, imported } => {
+                    assert_eq!(depth, 1);
+                    assert_eq!(imported.len(), 2);
+                }
+                other => panic!("expected a reorg, got {other:?}"),
+            }
+        } else {
+            // Already on b's branch after the first offer; b2 extends it.
+            a.import_block("spacekitvm-rs", b2.clone()).await?;
+        }
+        assert_eq!(a.get_latest_block().hash, b2.hash);
+        assert_eq!(
+            a.runtime.state.read().await.state_root(),
+            b.runtime.state.read().await.state_root()
+        );
+        // a's own transaction went back to the pool.
+        assert_eq!(a.pending_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submitted_transactions_are_deduplicated_relayed_and_pruned() -> Result<()> {
+        let node = SwtchvmNode::new(false, false).await?;
+        let mut relayed = node.subscribe_new_transactions();
+        let tx = signed_tx(b"noop".to_vec(), 50_000, 0);
+        node.set_account_balance(&tx.from, 10_000_000_000).await?;
+
+        // An unsigned copy is refused before it reaches the pool.
+        let mut unsigned = tx.clone();
+        unsigned.signature.r = [0u8; 32];
+        unsigned.signature.s = [0u8; 32];
+        assert!(node.submit_transaction(unsigned).await.is_err());
+
+        assert!(node.pending_since_ms().is_none());
+        node.submit_transaction(tx.clone()).await?;
+        assert!(node.pending_since_ms().is_some());
+        assert_eq!(relayed.try_recv()?.nonce, 0);
+        // The same transaction from a peer is not new and not relayed again.
+        assert!(!node.accept_gossiped_transaction(tx.clone()).await?);
+        assert!(relayed.try_recv().is_err());
+        assert_eq!(node.pending_count(), 1);
+
+        node.mine_block().await?;
+        assert_eq!(node.pending_count(), 0);
+        assert!(node.pending_since_ms().is_none());
+        // Once included, it is neither pending nor accepted again.
+        assert!(node.accept_gossiped_transaction(tx).await.is_err_or_false());
+        Ok(())
+    }
+
+    trait IsErrOrFalse {
+        fn is_err_or_false(&self) -> bool;
+    }
+    impl IsErrOrFalse for Result<bool> {
+        fn is_err_or_false(&self) -> bool {
+            !matches!(self, Ok(true))
+        }
     }
 
     #[tokio::test]
@@ -8741,23 +11179,9 @@ mod tests {
             ..SraHostConfig::default()
         }));
 
-        let addr = SwtchvmAddress::from_hex("0x1111111111111111111111111111111111111111")?;
-        node.set_account_balance(&addr, 10_000_000_000).await?;
-
-        let tx = SwtchvmTransaction {
-            from: addr,
-            to: None,
-            data: b"noop".to_vec(),
-            gas_limit: 50_000,
-            gas_price: 1,
-            value: 0,
-            nonce: 0,
-            signature: TransactionSignature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            },
-        };
+        // Unsigned transactions are refused at submission; sign this one.
+        let tx = signed_tx(b"noop".to_vec(), 50_000, 0);
+        node.set_account_balance(&tx.from, 10_000_000_000).await?;
         node.submit_transaction(tx).await?;
         let block = node.mine_block().await?;
         assert_eq!(block.transactions.len(), 1);
@@ -8798,14 +11222,18 @@ mod tests {
             SwtchvmAddress::new(a)
         };
 
-        // `to` is None (contract creation), which canonicalises to an empty string.
-        let canonical = format!(
-            "{}||{}|{}|{}",
-            hex::encode(from.as_bytes()),
-            0u128,
+        let unsigned = SwtchvmTransaction {
+            from,
+            to: None,
+            data: data.clone(),
+            gas_limit,
+            gas_price: 10,
+            value: 0,
             nonce,
-            hex::encode(&data),
-        );
+            signature: TransactionSignature { v: 0, r: [0u8; 32], s: [0u8; 32] },
+        };
+        // SwtchvmNode::new uses chain id 1337 until set_chain_id.
+        let canonical = transaction_signing_payload(1337, &unsigned);
         let message_hash: [u8; 32] = {
             let mut h = Sha256::new();
             h.update(canonical.as_bytes());

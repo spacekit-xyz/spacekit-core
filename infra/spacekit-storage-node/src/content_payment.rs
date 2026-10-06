@@ -246,10 +246,22 @@ pub async fn verify_content_payment(
 ) -> Result<(), PaymentVerifyError> {
     if reference.len() == 64 && reference.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Ok(ent_id) = parse_entitlement_id_hex(reference) {
-            let file_id = content_id_hex.unwrap_or("");
             if let Some(client) = EntitlementClient::from_env() {
-                let pk_hash = [0u8; 32];
-                let status = client.verify(&ent_id, payer_did, file_id, &pk_hash).await;
+                // The listing for this content or channel, made by the payee.
+                let listing_id = match content_id_hex {
+                    Some(cid) => content_listing_id(cid),
+                    None => channel_listing_id(recipient_did),
+                };
+                let status = client
+                    .verify_for_publisher(
+                        &ent_id,
+                        payer_did,
+                        &listing_id,
+                        recipient_did,
+                        content_id_hex,
+                        &[0u8; 32],
+                    )
+                    .await;
                 if status.is_valid() {
                     return Ok(());
                 }

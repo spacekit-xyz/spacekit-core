@@ -9722,7 +9722,6 @@ dependencies = [
 name = "routekit"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "anyhow",
  "axum",
  "bytes",
@@ -11009,6 +11008,7 @@ dependencies = [
  "ecies",
  "futures",
  "hex",
+ "k256",
  "libp2p 0.53.2",
  "moka",
  "oqs",
@@ -11019,6 +11019,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha3 0.10.9",
  "spacekit-compressor",
  "spacekit-primitives",
  "tempfile",
@@ -11039,7 +11040,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",

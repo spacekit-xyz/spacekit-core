@@ -45,7 +45,7 @@ Other ecosystems (Render-style GPU rental, io.net-style aggregators, privacy-foc
 | **WASM runtime + host functions** | Substantial code landed; **compare with [`documentation/VM_PARITY.md`](documentation/VM_PARITY.md)** vs `spacekit-js` before relying on cross-language behavior. |
 | **GPU** | Feature-gated; performance is **deployment-specific**—benchmark your kernels; no audited multipliers are claimed in this README. |
 | **Network consensus (PBFT + spacetime)** | **As-built:** `ConsensusCoordinator` + [`spacekit-unified-consensus`](../../consensus/spacekit-unified-consensus/README.md) via `UnifiedConsensusHost` (feature `spacetime-consensus`). **Aspirational narrative:** [`documentation/SPACEKIT_CONSENSUS_UNIFIED.md`](documentation/SPACEKIT_CONSENSUS_UNIFIED.md) (GPU committees, reputation on hot path, etc. — not all shipped). No substitute for a formal BFT audit. |
-| **Payments (x402 / SpaceKit Pay / ASTRA)** | Multiple rails appear in code and docs; they are **not interchangeable**. Canonical economics: [`spacekit-tokenomics`](../../economics/spacekit-tokenomics/). Operator rewards: [`SPACEKIT_BLOCKCHAIN_REWARDS.md`](documentation/SPACEKIT_BLOCKCHAIN_REWARDS.md). |
+| **Payments (ASTRA only)** | ASTRA, held as native balances on this chain, is the only currency: no USD balances, stablecoin rails or exchange rates. See [`ASTRA_LEDGER.md`](ASTRA_LEDGER.md). Canonical economics: [`spacekit-tokenomics`](../../economics/spacekit-tokenomics/). Operator rewards: [`SPACEKIT_BLOCKCHAIN_REWARDS.md`](documentation/SPACEKIT_BLOCKCHAIN_REWARDS.md). |
 | **Standalone HTTP API** | **`spacekit-compute-node`** serves selected routes (health, status, onboarding helper, DID helpers, payments, execute intent, etc.). Authoritative wiring: **[`documentation/BINARY_STANDALONE.md`](documentation/BINARY_STANDALONE.md)** (links through to `src/bin/standalone.rs`). |
 | **Operator probes** | `GET /health`, `GET /status`, `GET /v1/node/identity` for non-secret snapshots. |
 
@@ -186,8 +186,10 @@ Example:
 | GET | `/v1/node/identity` | Same snapshot for tooling |
 | GET | `/v1/onboarding/balance?did=` | **Website onboarding helper:** returns a placeholder balance JSON for reachability checks; **not** a canonical ledger balance until wired to your backend. |
 | POST | `/v1/did/register` | **Development helper:** validates posted keys and returns a synthesized DID document in-process; **does not** replace an on-chain or production DID registry—wire [`SwtchvmRuntime`](src/spacekitvm/) / your registry before relying on it. |
-| POST | `/v1/payments/*` | Payment rails (see `spacekit-payments`) |
-| POST | `/v1/execute` | Execution intent (payments-aware) |
+| GET | `/v1/payments/config` | How payments are accepted (ASTRA, 18 decimals) |
+| POST | `/v1/payments/verify` | Check an ASTRA payment by transaction hash (payee, amount, success, used once) |
+| GET | `/v1/tx/{hash}` | A transaction in a block: from, to, `value_wei`, success, confirmations |
+| POST | `/v1/execute` | Validate a signed intent (ASTRA amounts only); lists the chain transactions it needs, moves nothing |
 | GET | `/v1/chain/status` | Head block, consensus mode, validator set, peers (public) |
 | GET/POST | `/v1/governance/*` | PoA authorities, proposals, and signed votes ([`GOVERNANCE.md`](GOVERNANCE.md)) |
 

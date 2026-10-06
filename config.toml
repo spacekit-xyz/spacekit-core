@@ -55,30 +55,24 @@ Arbitrum = "0xabcdef1234567890abcdef1234567890abcdef12"
 [compute.layerzero_bridge_config.token_mappings.Ethereum]
 astra_token = "0xASTRA_ETH_ADDRESS"
 wrapped_astra = "0xWASTRA_ETH_ADDRESS"
-usdc_token = "0xA0b86a33E6441B8C8A4C6a62Bd2f1b6B5C4D4E5F"
 
 [compute.layerzero_bridge_config.token_mappings.Ethereum.supported_tokens]
-DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
-USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 
 [compute.layerzero_bridge_config.token_mappings.Arbitrum]
 astra_token = "0xASTRA_ARB_ADDRESS"
 wrapped_astra = "0xWASTRA_ARB_ADDRESS"
-usdc_token = "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
 [compute.layerzero_bridge_config.token_mappings.Arbitrum.supported_tokens]
 
 [compute.layerzero_bridge_config.token_mappings.Polygon]
 astra_token = "0xASTRA_POLY_ADDRESS"
 wrapped_astra = "0xWASTRA_POLY_ADDRESS"
-usdc_token = "0x3c499c542cEF5E3811e1192ce70d8cC03e5B963c"
 
 [compute.layerzero_bridge_config.token_mappings.Polygon.supported_tokens]
 
 [compute.layerzero_bridge_config.token_mappings.Avalanche]
 astra_token = "0xASTRA_AVAX_ADDRESS"
 wrapped_astra = "0xWASTRA_AVAX_ADDRESS"
-usdc_token = "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"
 
 [compute.layerzero_bridge_config.token_mappings.Avalanche.supported_tokens]
 

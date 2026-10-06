@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use warp;
 
@@ -333,6 +333,8 @@ pub struct SwtchComputeNode {
     consensus_host: Arc<spacekit_compute_node::UnifiedConsensusHost>,
     /// Proof-of-authority bootstrap and validator-set governance.
     governance: Arc<spacekit_compute_node::ValidatorGovernance>,
+    /// Block seals: this node's authority key (if any), seal store, governance.
+    sealing: Arc<spacekit_compute_node::block_seal::BlockSealing>,
 }
 
 fn kem_sizes_for_config_algorithm(alg: &str) -> Option<(usize, usize)> {
@@ -423,17 +425,198 @@ fn build_runtime_identity(
     Ok((wallet, kem))
 }
 
-/// Point the Service Reward Accumulator at the current authority set: while
-/// the network is in proof of authority, authorities' (and affiliated
-/// operators') credits go to locked AstraRewards balances (Tokenomics §1.11).
-async fn sync_reward_lock_policy(
+/// Only members of the chain's producer set (authorities in PoA, staked
+/// validators in PoS) may produce blocks; anything else would be rejected by
+/// every peer and fork this node.
+async fn sync_mining_gate(
     governance: &spacekit_compute_node::ValidatorGovernance,
+    sealing: &spacekit_compute_node::block_seal::BlockSealing,
     vm: &SwtchvmNode,
 ) {
-    if let Some(sra) = vm.sra_host() {
-        let state = governance.snapshot().await;
-        sra.set_lock_policy(state.is_poa(), state.authorities.keys().map(String::as_str));
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let producers = vm.producer_set(now).await;
+    let reason = if producers.is_empty() {
+        None
+    } else {
+        match &sealing.signer {
+            None => Some(
+                "this network has block producers and this node has no producer key \
+                 (set SPACEKIT_AUTHORITY_WALLET)"
+                    .to_string(),
+            ),
+            Some(signer) if !producers.contains(&signer.did) => Some(format!(
+                "{} is not a current authority or active validator",
+                signer.did
+            )),
+            Some(_) => None,
+        }
+    };
+    vm.set_mining_blocked(reason);
+    let consensus_network = governance.has_genesis();
+    vm.set_faucet_blocked(consensus_network.then(|| {
+        "the faucet is disabled on proof-of-authority networks: it writes balances \
+         outside blocks. Fund accounts with SPACEKIT_GENESIS_ALLOC_FILE or a transfer."
+            .to_string()
+    }));
+    // Contracts may not read outside the chain where nodes must agree.
+    vm.set_external_reads(!consensus_network);
+}
+
+/// Block production for a node on a network without authorities, from the
+/// environment. Such a node produces on its own only with
+/// `SPACEKIT_BLOCK_PRODUCER=solo` (single-node development); otherwise blocks
+/// come from `POST /mine`, as before.
+///
+/// - `SPACEKIT_BLOCK_PRODUCTION`: `on_demand` (default) or `interval`
+/// - `SPACEKIT_BLOCK_TIME_MS`: minimum gap / block time (default 2000)
+/// - `SPACEKIT_BLOCK_BATCH_WINDOW_MS` (default 500)
+/// - `SPACEKIT_BLOCK_HEARTBEAT_SECS` (default 300, 0 = never)
+///
+/// On a PoA network these are ignored: the setting comes from the genesis
+/// file and governance, so every authority uses the same one.
+fn solo_block_production() -> Option<spacekit_compute_node::block_production::BlockProduction> {
+    use spacekit_compute_node::block_production::{BlockProduction, ProductionMode};
+    let solo = std::env::var("SPACEKIT_BLOCK_PRODUCER")
+        .map(|v| v.trim().eq_ignore_ascii_case("solo"))
+        .unwrap_or(false);
+    if !solo {
+        return None;
     }
+    let num = |key: &str| std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let mut config = BlockProduction::default();
+    if let Ok(mode) = std::env::var("SPACEKIT_BLOCK_PRODUCTION") {
+        config.mode = match mode.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "interval" => ProductionMode::Interval,
+            _ => ProductionMode::OnDemand,
+        };
+    }
+    if let Some(ms) = num("SPACEKIT_BLOCK_TIME_MS") {
+        config.block_time_ms = ms.max(spacekit_compute_node::block_production::MIN_BLOCK_TIME_MS);
+    }
+    if let Some(ms) = num("SPACEKIT_BLOCK_BATCH_WINDOW_MS") {
+        config.batch_window_ms = ms;
+    }
+    if let Some(secs) = num("SPACEKIT_BLOCK_HEARTBEAT_SECS") {
+        config.heartbeat_secs = secs;
+    }
+    match config.validate() {
+        Ok(()) => Some(config),
+        Err(e) => {
+            warn!("ignoring solo block production settings: {e}");
+            Some(BlockProduction::default())
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Produce blocks when they are due (see `block_production`).
+///
+/// With authorities, producers take turns: the authority at `height mod n`
+/// produces once the block is due; if it has not done so a grace period
+/// later, the next authority may, and so on. A fallback producer stands down
+/// while a peer reports a longer chain.
+fn start_block_producer(
+    vm: Arc<SwtchvmNode>,
+    sealing: Arc<spacekit_compute_node::block_seal::BlockSealing>,
+) {
+    use spacekit_compute_node::block_production::{BlockProduction, PendingWork};
+    let solo = solo_block_production();
+    let started_ms = unix_ms();
+    info!(
+        solo = solo.as_ref().map(|c| c.canonical()).unwrap_or_else(|| "off".into()),
+        authority = sealing.signer.as_ref().map(|s| s.did.as_str()).unwrap_or("none"),
+        "Block producer started"
+    );
+    tokio::spawn(async move {
+        let tick = std::time::Duration::from_millis(100);
+        // Governance and reward planning are re-read once a second.
+        let mut last_refresh: Option<std::time::Instant> = None;
+        let mut producers = spacekit_compute_node::chain_consensus::ProducerSet::default();
+        let mut config: Option<BlockProduction> = None;
+        let mut system_since_ms: Option<u64> = None;
+        let mut system_fingerprint: Option<[u8; 32]> = None;
+        let mut attempted_fingerprint: Option<[u8; 32]> = None;
+        loop {
+            tokio::time::sleep(tick).await;
+            let head = vm.get_latest_block();
+            if last_refresh.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                last_refresh = Some(std::time::Instant::now());
+                // Authorities (PoA) or staked validators (PoS), from the chain.
+                producers = vm.producer_set(unix_ms() / 1_000).await;
+                config = if producers.is_empty() {
+                    solo.clone()
+                } else {
+                    Some(producers.block_production.clone())
+                };
+                // Reward settlement (and END_POA) that is due counts as work.
+                let fingerprint = match vm.sra_host() {
+                    Some(sra) => {
+                        let world = vm.runtime_state();
+                        let world = world.read().await;
+                        let plan = sra.plan_block(&world, head.number + 1, unix_ms() / 1_000);
+                        (!plan.system_txs.is_empty()).then(|| {
+                            use sha2::Digest as _;
+                            let mut h = sha2::Sha256::new();
+                            for tx in &plan.system_txs {
+                                h.update(&tx.data);
+                            }
+                            <[u8; 32]>::from(h.finalize())
+                        })
+                    }
+                    None => None,
+                };
+                if fingerprint != system_fingerprint {
+                    system_fingerprint = fingerprint;
+                    system_since_ms = fingerprint.map(|_| unix_ms());
+                }
+            }
+            let Some(config) = &config else { continue };
+            // The same system work only triggers one block: if it keeps
+            // failing, it waits for the next transaction or heartbeat instead
+            // of producing a block every block time.
+            let system_work = system_fingerprint.is_some() && system_fingerprint != attempted_fingerprint;
+            let work = PendingWork {
+                parent_ms: if head.number == 0 { started_ms } else { head.timestamp * 1_000 },
+                transactions_since_ms: vm.pending_since_ms(),
+                system_since_ms: if system_work { system_since_ms } else { None },
+            };
+            let now = unix_ms();
+            let Some(due) = config.due_at_ms(&work) else { continue };
+            if now < due {
+                continue;
+            }
+            let height = head.number + 1;
+            let my_turn = if producers.is_empty() {
+                true
+            } else {
+                let Some(signer) = &sealing.signer else { continue };
+                let me = Some(signer.did.as_str());
+                let primary = producers.scheduled(height, 0) == me;
+                let scheduled = producers.scheduled(height, now - due) == me;
+                scheduled && (primary || vm.peer_head_hint() <= head.number)
+            };
+            if !my_turn {
+                continue;
+            }
+            match vm.mine_block().await {
+                Ok(block) => {
+                    if system_work {
+                        attempted_fingerprint = system_fingerprint;
+                    }
+                    // Re-plan against the new head right away.
+                    last_refresh = None;
+                    debug!(number = block.number, txs = block.transactions.len(), "produced block");
+                }
+                Err(e) => debug!("block production skipped: {e}"),
+            }
+        }
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,6 +959,16 @@ impl SwtchComputeNode {
             )
             .map_err(|e| anyhow::anyhow!("validator governance init failed: {e}"))?,
         );
+        let authority_signer = spacekit_compute_node::block_seal::AuthoritySigner::from_env()
+            .map_err(|e| anyhow::anyhow!("authority wallet: {e}"))?
+            .map(Arc::new);
+        if let Some(signer) = &authority_signer {
+            info!("Authority key loaded for {}", signer.did);
+        }
+        let sealing = Arc::new(spacekit_compute_node::block_seal::BlockSealing {
+            signer: authority_signer,
+            store: spacekit_compute_node::block_seal::SealStore::from_env(),
+        });
 
         #[cfg(feature = "spacetime-consensus")]
         let consensus_host = Arc::new(spacekit_compute_node::UnifiedConsensusHost::new(
@@ -826,6 +1019,11 @@ impl SwtchComputeNode {
             ));
             tracing::info!("Service Reward Accumulator (SRA) enabled on SwtchVM");
         }
+        match swtchvm_node.apply_genesis_alloc_from_env().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(accounts = n, "Applied genesis allocation"),
+            Err(e) => return Err(e.context("SPACEKIT_GENESIS_ALLOC_FILE")),
+        }
         if config.compute.potw_config.enabled {
             match spacekit_compute_node::PoTWHost::new(config.compute.potw_config.clone()) {
                 Ok(host) => {
@@ -853,9 +1051,18 @@ impl SwtchComputeNode {
                 Err(e) => tracing::warn!(error = %e, "Treasury bridge init failed; disabled"),
             }
         }
+        swtchvm_node.set_producer_did(sealing.signer.as_ref().map(|s| s.did.clone()));
         let swtchvm_node = Arc::new(swtchvm_node);
-        // Lock authorities' PoA-phase rewards before the first block is mined.
-        sync_reward_lock_policy(&governance, &swtchvm_node).await;
+        // Governance and staking live in the chain; install the genesis state
+        // at height 0.
+        governance.attach_vm(swtchvm_node.clone()).await?;
+        // Rewards are settled from chain history; rebuild the SRA's epoch
+        // accumulator from stored blocks so a restarted node agrees with peers.
+        if let Some(sra) = swtchvm_node.sra_host() {
+            let blocks = swtchvm_node.blocks();
+            sra.rebuild_from_blocks(blocks.iter());
+        }
+        sync_mining_gate(&governance, &sealing, &swtchvm_node).await;
 
         #[cfg(feature = "spacetime-consensus")]
         let pq_keys = Arc::new(
@@ -881,6 +1088,7 @@ impl SwtchComputeNode {
             #[cfg(feature = "spacetime-consensus")]
             consensus_host,
             governance,
+            sealing,
         })
     }
 
@@ -890,9 +1098,10 @@ impl SwtchComputeNode {
         self.compute_node.start().await?;
         self.register_with_network().await?;
         self.network_service.start().await?;
-        spacekit_compute_node::network::start_swtchvm_bridge(
+        spacekit_compute_node::network::start_swtchvm_bridge_sealed(
             self.swtchvm_node.clone(),
             self.network_service.clone(),
+            Some(self.sealing.clone()),
         );
 
         // Register ourselves as a validator and start the consensus listener
@@ -909,25 +1118,24 @@ impl SwtchComputeNode {
                 self.pq_keys.dilithium_secret_key.clone(),
             )
             .await;
-        // Proof-of-authority validators (genesis or admitted by governance)
-        // join the set without stake; governance gossip keeps nodes in step.
+        // The coordinator mirrors the chain's producer set.
         self.governance.sync_coordinator().await;
-        self.governance
-            .start_p2p_listener(self.network_service.clone());
-        self.governance.start_ticker();
         {
-            // Governance can admit or remove authorities, or lift PoA, at any
-            // time; keep the SRA's reward lock in step.
+            // Blocks change who may produce (admissions, the lift, stake);
+            // keep the mining gate and the coordinator in step.
             let governance = self.governance.clone();
             let vm = self.swtchvm_node.clone();
+            let sealing = self.sealing.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
                 loop {
                     interval.tick().await;
-                    sync_reward_lock_policy(&governance, &vm).await;
+                    sync_mining_gate(&governance, &sealing, &vm).await;
+                    governance.sync_coordinator().await;
                 }
             });
         }
+        start_block_producer(self.swtchvm_node.clone(), self.sealing.clone());
         info!(
             "Consensus mode: {}",
             if self.governance.is_poa().await {
@@ -1053,21 +1261,11 @@ impl SwtchComputeNode {
             );
         }
 
-        // ── On-chain entitlements ──
-        // Replaces the aUSD vault: balances originate from DAI/USDC deposits
-        // into the Ethereum entitlement contract and are only ever read here.
-        let entitlement_config = spacekit_compute_node::EntitlementConfig::from_env();
-        let entitlement_reader =
-            match spacekit_compute_node::EntitlementReader::new(entitlement_config.clone()) {
-                Ok(reader) => Some(Arc::new(reader)),
-                Err(e) => {
-                    warn!(
-                    "Entitlement reader unavailable ({e}); paid endpoints will refuse requests. \
-                     Set SPACEKIT_ENTITLEMENT_CONTRACT and SPACEKIT_ENTITLEMENT_RPC_URLS."
-                );
-                    None
-                }
-            };
+        // Payments are ASTRA transfers on this chain, checked by transaction
+        // hash. One verifier, so a transaction is accepted once per process.
+        let payment_verifier = Arc::new(spacekit_payments::PaymentVerifier::new(
+            self.swtchvm_node.clone() as Arc<dyn spacekit_payments::ChainLookup>,
+        ));
 
         // Health check endpoint
         let health_route = warp::path("health")
@@ -1642,11 +1840,11 @@ impl SwtchComputeNode {
             sphincs_pk_hex: String,
             /// SPHINCS+ signature over the validator registration payload.
             proof_hex: String,
-            /// Stake backing this validator, in micro-USD.
-            stake_units: u128,
+            /// Native ASTRA backing this validator, in wei (decimal string).
+            stake_wei: String,
         }
         let cc_reg = self.consensus_coordinator.clone();
-        let vr_entitlements = entitlement_reader.clone();
+        let vr_vm = self.swtchvm_node.clone();
         let vr_governance = self.governance.clone();
         let register_validator_route = warp::path!("v1" / "consensus" / "register-validator")
             .and(warp::post())
@@ -1658,7 +1856,7 @@ impl SwtchComputeNode {
                 RegisterValidatorBody,
             )| {
                 let cc = cc_reg.clone();
-                let entitlements = vr_entitlements.clone();
+                let vm = vr_vm.clone();
                 let governance = vr_governance.clone();
                 async move {
                     // During the proof-of-authority bootstrap the validator set
@@ -1671,6 +1869,17 @@ impl SwtchComputeNode {
                                           governance proposal (see /v1/governance)",
                             })),
                             warp::http::StatusCode::FORBIDDEN,
+                        ));
+                    }
+                    // On a governed network, stake is kept in the chain.
+                    if governance.has_genesis() {
+                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "validators register by staking on chain: sign a \
+                                          SPACEKIT-STAKE-v1 message and POST it to /v1/staking \
+                                          (spacekit stake bond)",
+                            })),
+                            warp::http::StatusCode::GONE,
                         ));
                     }
                     let (pk, proof) = match (
@@ -1688,36 +1897,35 @@ impl SwtchComputeNode {
                         }
                     };
 
-                    // The claimed stake must actually be backed on chain.
-                    if let Some(reader) = entitlements {
-                        match reader.view(&caller.did).await {
-                            Ok(view) if view.available_units >= body.stake_units => {}
-                            Ok(view) => {
-                                return Ok(warp::reply::with_status(
-                                    warp::reply::json(&serde_json::json!({
-                                        "error": "claimed stake exceeds on-chain entitlement",
-                                        "claimed_units": body.stake_units,
-                                        "available_units": view.available_units,
-                                    })),
-                                    warp::http::StatusCode::PAYMENT_REQUIRED,
-                                ))
-                            }
-                            Err(e) => {
-                                return Ok(warp::reply::with_status(
-                                    warp::reply::json(&serde_json::json!({
-                                        "error": format!("could not verify stake on chain: {e}"),
-                                    })),
-                                    warp::http::StatusCode::BAD_GATEWAY,
-                                ))
-                            }
-                        }
-                    } else {
+                    // The claimed stake must be backed by the DID's native
+                    // ASTRA on this chain (balance plus locked rewards).
+                    let Ok(stake_wei) = body.stake_wei.trim().parse::<u128>() else {
                         return Ok(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({
-                                "error": "stake cannot be verified: entitlement contract is not \
-                                          configured on this node",
+                                "error": "stake_wei must be a decimal integer (ASTRA wei)",
                             })),
-                            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
+                    };
+                    let Some(address) = spacekit_compute_node::native_rewards::did_address(&caller.did)
+                    else {
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "the caller's DID does not name a chain address",
+                            })),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
+                    };
+                    let (balance, locked) = vm.native_holdings(&address).await;
+                    let holdings = balance.saturating_add(locked);
+                    if holdings < stake_wei {
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "claimed stake exceeds the DID's ASTRA holdings",
+                                "claimed_wei": stake_wei.to_string(),
+                                "holdings_wei": holdings.to_string(),
+                            })),
+                            warp::http::StatusCode::PAYMENT_REQUIRED,
                         ));
                     }
 
@@ -1725,7 +1933,7 @@ impl SwtchComputeNode {
                         .register_validator_with_key(
                             caller.did.clone(),
                             pk,
-                            body.stake_units,
+                            stake_wei,
                             &proof,
                         )
                         .await
@@ -1734,7 +1942,7 @@ impl SwtchComputeNode {
                             warp::reply::json(&serde_json::json!({
                                 "status": "registered",
                                 "did": caller.did,
-                                "stake_units": body.stake_units,
+                                "stake_wei": stake_wei.to_string(),
                                 "validator_count": cc.validator_count().await,
                             })),
                             warp::http::StatusCode::OK,
@@ -2089,29 +2297,20 @@ impl SwtchComputeNode {
                 }
             });
 
-        // ── Payment configuration endpoint ──
-        // GET /v1/payments/config — returns the node's payment configuration
-        // so clients know what payment methods are accepted.
+        // ── Payments: ASTRA only ──
+        //
+        // SpaceKit has one currency, ASTRA, held as native balances on this
+        // chain. There are no USD balances, stablecoin rails or exchange
+        // rates. A payment is an ASTRA transfer on the chain.
+
+        // GET /v1/payments/config — how this node accepts payments.
         let pay_config = spacekit_payments::PaymentConfig::default();
         let pay_config_json = serde_json::json!({
-            "x402": {
-                "enabled": true,
-                "facilitator_url": pay_config.facilitator_url,
-                "network": if pay_config.testnet { "base-sepolia" } else { "base" },
-                "asset": "USDC",
-            },
-            "astra": {
-                "enabled": true,
-                "network_fee_bps": pay_config.network_fee_bps,
-            },
-            "entitlements": {
-                "enabled": entitlement_config.enabled,
-                "chain_id": entitlement_config.chain_id,
-                "contract": entitlement_config.contract_address,
-                "confirmations": entitlement_config.confirmations,
-                "assets": ["ETH", "DAI", "USDC"],
-                "unit": "micro-USD",
-            },
+            "asset": "ASTRA",
+            "decimals": 18,
+            "chain_id": self.config.compute.chain_id.clone(),
+            "network_fee_bps": pay_config.network_fee_bps,
+            "proof": "the hash of an ASTRA transfer on this chain (GET /v1/tx/{hash})",
         });
         let payment_config_route = warp::path!("v1" / "payments" / "config")
             .and(warp::get())
@@ -2120,226 +2319,129 @@ impl SwtchComputeNode {
                 async move { Ok::<_, warp::Rejection>(warp::reply::json(&cfg)) }
             });
 
-        // ── Entitlements (on-chain) ──
-        //
-        // The aUSD vault used to live here with `credit-ausd`, an
-        // unauthenticated endpoint that minted balance from a JSON body. It is
-        // gone. Balance now originates only from DAI/USDC deposits into the
-        // Ethereum entitlement contract, which this node reads but cannot write.
-
-        // Internal settlement ledger used by the payments crate. It is credited
-        // only from a successful on-chain entitlement reservation in
-        // /v1/execute — never from a request body.
-        let settlement_vault = std::sync::Arc::new(spacekit_payments::AusdVault::new());
-
-        // GET /v1/entitlements?did=... — read the caller's entitlement.
+        // POST /v1/payments/verify — check that a transaction on this chain
+        // paid at least `amount_wei` ASTRA to `pay_to`, and that it has not
+        // been presented here before. For content and channel scopes, the
+        // verified payment is forwarded to the storage node's settlement inbox.
         #[derive(Deserialize)]
-        struct EntitlementQuery {
-            did: String,
+        struct VerifyPaymentBody {
+            tx_hash: String,
+            pay_to: String,
+            amount_wei: String,
+            #[serde(default)]
+            scope: Option<String>,
+            #[serde(default)]
+            beneficiary_did: Option<String>,
         }
-        let ent_view = entitlement_reader.clone();
-        let entitlement_view_route = warp::path!("v1" / "entitlements")
-            .and(warp::get())
-            .and(warp::query::<EntitlementQuery>())
-            .and_then(move |q: EntitlementQuery| {
-                let reader = ent_view.clone();
-                async move {
-                    let Some(reader) = reader else {
-                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "error": "entitlement contract is not configured on this node",
-                            })),
-                            warp::http::StatusCode::SERVICE_UNAVAILABLE,
-                        ));
-                    };
-                    match reader.view(&q.did).await {
-                        Ok(view) => Ok(warp::reply::with_status(
-                            warp::reply::json(&view),
-                            warp::http::StatusCode::OK,
-                        )),
-                        Err(e) => Ok(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                            warp::http::StatusCode::BAD_GATEWAY,
-                        )),
-                    }
-                }
-            });
-
-        // POST /v1/entitlements/reserve — hold allowance against on-chain
-        // deposits before performing paid work. Authenticated: a caller may
-        // only reserve against their own DID.
-        #[derive(Deserialize)]
-        struct ReserveBody {
-            units: u128,
-            reservation_id: String,
-        }
-        let ent_reserve = entitlement_reader.clone();
-        let entitlement_reserve_route = warp::path!("v1" / "entitlements" / "reserve")
-            .and(warp::post())
-            .and(spacekit_compute_node::api_auth::signed_json::<ReserveBody>(
-                authenticator.clone(),
-            ))
-            .and_then(
-                move |(caller, body): (spacekit_compute_node::AuthenticatedCaller, ReserveBody)| {
-                    let reader = ent_reserve.clone();
-                    async move {
-                        let Some(reader) = reader else {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "entitlement contract is not configured on this node",
-                                })),
-                                warp::http::StatusCode::SERVICE_UNAVAILABLE,
-                            ));
-                        };
-                        match reader
-                            .reserve(&caller.did, body.units, body.reservation_id)
-                            .await
-                        {
-                            Ok(reservation) => Ok(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "success": true,
-                                    "reservation": reservation,
-                                })),
-                                warp::http::StatusCode::OK,
-                            )),
-                            Err(e) => Ok(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "success": false,
-                                    "error": e.to_string(),
-                                })),
-                                warp::http::StatusCode::PAYMENT_REQUIRED,
-                            )),
-                        }
-                    }
-                },
-            );
-
-        // POST /v1/entitlements/release — release an unused reservation.
-        #[derive(Deserialize)]
-        struct ReleaseBody {
-            reservation_id: String,
-        }
-        let ent_release = entitlement_reader.clone();
-        let entitlement_release_route = warp::path!("v1" / "entitlements" / "release")
-            .and(warp::post())
-            .and(spacekit_compute_node::api_auth::signed_json::<ReleaseBody>(
-                authenticator.clone(),
-            ))
-            .and_then(
-                move |(caller, body): (spacekit_compute_node::AuthenticatedCaller, ReleaseBody)| {
-                    let reader = ent_release.clone();
-                    async move {
-                        let released = match reader {
-                            Some(r) => r.release(&caller.did, &body.reservation_id).await,
-                            None => false,
-                        };
-                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                            "released": released,
-                        })))
-                    }
-                },
-            );
-
-        // ── Payment receipt verification ──
-        // POST /v1/payments/verify — verify an x402 receipt and credit the beneficiary
+        let verify_verifier = payment_verifier.clone();
         let payment_verify_route = warp::path!("v1" / "payments" / "verify")
             .and(warp::post())
             .and(warp::body::json())
-            .and_then(|body: serde_json::Value| async move {
-                let receipt = spacekit_payments::PaymentReceipt {
-                    tx_hash: body["tx_hash"].as_str().unwrap_or("").to_string(),
-                    amount: body["amount"].as_str().unwrap_or("0").to_string(),
-                    asset: match body["asset"].as_str() {
-                        Some("USDC") => spacekit_payments::PaymentAsset::USDC,
-                        Some("aUSD") | Some("AUSD") => spacekit_payments::PaymentAsset::AUSD,
-                        _ => spacekit_payments::PaymentAsset::ASTRA,
-                    },
-                    network: body["network"].as_str().and_then(|n| match n {
-                        "base" => Some(spacekit_payments::PaymentNetwork::Base),
-                        "base-sepolia" => Some(spacekit_payments::PaymentNetwork::BaseSepolia),
-                        _ => None,
-                    }),
-                    settled_at: chrono::Utc::now().timestamp(),
-                };
+            .and_then(move |body: VerifyPaymentBody| {
+                let verifier = verify_verifier.clone();
+                async move {
+                    let requirement = spacekit_payments::PaymentRequirement {
+                        amount_wei: body.amount_wei.clone(),
+                        asset: spacekit_payments::PaymentAsset::ASTRA,
+                        pay_to: body.pay_to.clone(),
+                        chain_id: None,
+                        description: None,
+                    };
+                    let receipt = match verifier.verify(&body.tx_hash, &requirement) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "verified": false,
+                                    "error": e.to_string(),
+                                })),
+                                warp::http::StatusCode::PAYMENT_REQUIRED,
+                            ))
+                        }
+                    };
+                    let beneficiary = body
+                        .beneficiary_did
+                        .clone()
+                        .unwrap_or_else(|| format!("did:spacekit:{}", receipt.to.trim_start_matches("0x")));
 
-                let beneficiary = body["beneficiary_did"]
-                    .as_str()
-                    .unwrap_or("did:spacekit:treasury")
-                    .to_string();
-
-                // Forward content/channel payments to storage settlement inbox (listener completes grants).
-                if let (Some(storage_base), Some(scope)) = (
-                    std::env::var("SPACEKIT_STORAGE_NODE_URL")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty()),
-                    body["scope"].as_str().map(str::to_string),
-                ) {
-                    if scope.starts_with("content:") || scope.starts_with("channel:") {
-                        let webhook = serde_json::json!({
-                            "tx_hash": receipt.tx_hash,
-                            "amount": receipt.amount,
-                            "asset": body["asset"].as_str().unwrap_or("ASTRA"),
-                            "payer_did": body["payer_did"].as_str().unwrap_or(""),
-                            "beneficiary_did": beneficiary,
-                            "scope": scope,
-                            "settled_at": receipt.settled_at,
-                        });
-                        let secret = std::env::var("SPACEKIT_CONTENT_SETTLEMENT_SECRET").ok();
-                        let url = format!(
-                            "{}/api/content/settlements",
-                            storage_base.trim_end_matches('/')
-                        );
-                        tokio::spawn(async move {
-                            let client = reqwest::Client::new();
-                            let mut req = client.post(url).json(&webhook);
-                            if let Some(s) = secret {
-                                if !s.trim().is_empty() {
-                                    req = req.header("X-SpaceKit-Settlement-Secret", s);
+                    // Forward content/channel payments to the storage settlement
+                    // inbox (its listener completes the grant; it must record
+                    // tx_hash so a payment is never granted twice).
+                    if let (Some(storage_base), Some(scope)) = (
+                        std::env::var("SPACEKIT_STORAGE_NODE_URL")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty()),
+                        body.scope.clone(),
+                    ) {
+                        if scope.starts_with("content:") || scope.starts_with("channel:") {
+                            let webhook = serde_json::json!({
+                                "tx_hash": receipt.tx_hash,
+                                // The settlement inbox compares `amount` (decimal ASTRA) with the
+                                // listing price; `amount_wei` is exact.
+                                "amount": spacekit_payments::format_astra(receipt.amount_wei),
+                                "amount_wei": receipt.amount_wei.to_string(),
+                                "asset": "ASTRA",
+                                "payer_did": format!("did:spacekit:{}", receipt.from.trim_start_matches("0x")),
+                                "beneficiary_did": beneficiary,
+                                "scope": scope,
+                                "settled_at": receipt.settled_at,
+                            });
+                            let secret = std::env::var("SPACEKIT_CONTENT_SETTLEMENT_SECRET").ok();
+                            let url = format!(
+                                "{}/api/content/settlements",
+                                storage_base.trim_end_matches('/')
+                            );
+                            tokio::spawn(async move {
+                                let client = reqwest::Client::new();
+                                let mut req = client.post(url).json(&webhook);
+                                if let Some(s) = secret {
+                                    if !s.trim().is_empty() {
+                                        req = req.header("X-SpaceKit-Settlement-Secret", s);
+                                    }
                                 }
-                            }
-                            if let Err(e) = req.send().await {
-                                tracing::warn!("content settlement webhook failed: {e}");
-                            }
-                        });
+                                if let Err(e) = req.send().await {
+                                    tracing::warn!("content settlement webhook failed: {e}");
+                                }
+                            });
+                        }
                     }
-                }
 
-                Ok::<_, warp::Rejection>(warp::reply::with_status(
-                    warp::reply::json(&serde_json::json!({
-                        "status": "recorded",
-                        "receipt": {
-                            "tx_hash": receipt.tx_hash,
-                            "amount": receipt.amount,
-                            "asset": format!("{:?}", receipt.asset),
-                        },
-                        "beneficiary": beneficiary,
-                        "explorer_url": receipt.explorer_url(),
-                    })),
-                    warp::http::StatusCode::OK,
-                ))
+                    Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "verified": true,
+                            "receipt": {
+                                "tx_hash": receipt.tx_hash,
+                                "from": receipt.from,
+                                "to": receipt.to,
+                                "amount_wei": receipt.amount_wei.to_string(),
+                                "asset": "ASTRA",
+                                "block_number": receipt.block_number,
+                                "settled_at": receipt.settled_at,
+                            },
+                            "beneficiary": beneficiary,
+                        })),
+                        warp::http::StatusCode::OK,
+                    ))
+                }
             });
 
-        // ── Intent-based execution ──
-        // POST /v1/execute — accepts a SignedIntent from the relay, processes
-        // payment actions atomically, and executes contract actions.
+        // ── Intent validation ──
+        // POST /v1/execute — accepts a SignedIntent from the relay, verifies the
+        // actor's signature over the whole intent, and checks its payment
+        // actions: every amount is ASTRA wei, transfers must be in ASTRA, and
+        // the total must fit the intent's `max_value_wei`.
         //
-        // The intent's own signature is what authorizes spending here: the
-        // relay is not trusted, so the actor's signature must cover the whole
-        // intent (see `intent_auth`). Previously nothing was verified at all
-        // and any caller could post an intent naming any actor.
-        let exec_vault = settlement_vault.clone();
+        // It does not move value. ASTRA moves only in chain transactions the
+        // actor signs (POST /transaction), so the reply lists the transactions
+        // the intent needs instead of claiming they happened. Vault charges
+        // (the former aUSD) are refused.
         let exec_registry = did_registry.clone();
-        let exec_entitlements = entitlement_reader.clone();
         let execute_intent_route = warp::path!("v1" / "execute")
             .and(warp::post())
             .and(warp::body::json())
             .and_then(move |body: serde_json::Value| {
-                let vault = exec_vault.clone();
                 let registry = exec_registry.clone();
-                let entitlements = exec_entitlements.clone();
                 async move {
-                    // The relay sends routekit's SignedIntent shape where actions is raw JSON.
-                    // Extract fields manually for maximum compatibility.
                     let intent_val = match body.get("intent") {
                         Some(v) => v,
                         None => return Ok::<_, warp::Rejection>(warp::reply::with_status(
@@ -2361,7 +2463,7 @@ impl SwtchComputeNode {
                         .await
                         .and_then(|k| hex::decode(k.sphincs_pk_hex).ok());
 
-                    let verified_actor = match spacekit_compute_node::intent_auth::verify_signed_intent(
+                    let actor = match spacekit_compute_node::intent_auth::verify_signed_intent(
                         intent_val,
                         signature_hex,
                         sig_type,
@@ -2380,150 +2482,124 @@ impl SwtchComputeNode {
                         }
                     };
 
-                    let intent_id = intent_val["intent_id"].as_str().unwrap_or("").to_string();
-                    let actor = verified_actor;
-                    let chain = intent_val["chain"].as_str().unwrap_or("").to_string();
-                    let nonce = intent_val["nonce"].as_str().unwrap_or("0").to_string();
-                    let version = intent_val["version"].as_str().unwrap_or("1.0").to_string();
-                    let expiry = intent_val["expiry"].as_i64().unwrap_or(0);
-
-                    // Parse typed actions from the raw actions JSON
-                    let typed_actions: Vec<spacekit_payments::IntentAction> =
-                        serde_json::from_value(intent_val["actions"].clone()).unwrap_or_default();
-
-                    // Build the IntentPaymentProcessor
-                    use spacekit_payments::fee_router::CreditApplier;
-                    struct LogApplier;
-                    impl CreditApplier for LogApplier {
-                        fn apply_credit(&self, credit: &spacekit_payments::Credit) -> anyhow::Result<()> {
-                            tracing::info!(
-                                "Intent credit applied: {} ASTRA to {}",
-                                credit.amount_astra,
-                                credit.beneficiary_did
-                            );
-                            Ok(())
-                        }
-                    }
-
-                    let pay_config = spacekit_payments::PaymentConfig::default();
-                    let fee_router = std::sync::Arc::new(
-                        spacekit_payments::FeeRouter::new(pay_config, std::sync::Arc::new(LogApplier))
-                    );
-                    let processor = spacekit_payments::IntentPaymentProcessor::new(
-                        fee_router,
-                        vault.clone(),
-                    );
-
-                    let payment_intent = spacekit_payments::intent::Intent {
-                        intent_id: intent_id.clone(),
-                        version,
-                        actor: actor.clone(),
-                        agent: intent_val["agent"].as_str().map(|s| s.to_string()),
-                        chain: chain.clone(),
-                        constraints: intent_val["constraints"].clone(),
-                        actions: typed_actions,
-                        nonce: nonce.clone(),
-                        expiry,
-                        meta: intent_val.get("meta").cloned(),
+                    let refuse = |error: String| {
+                        Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({ "success": false, "error": error })),
+                            warp::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        ))
                     };
 
-                    let plan = processor.extract_plan(&payment_intent);
-
-                    // ── Fund the settlement ledger from on-chain entitlement ──
-                    //
-                    // The ledger is an internal accounting mirror, not a source
-                    // of value. Before charging it we reserve the exact amount
-                    // against the actor's on-chain deposits, so the node can
-                    // never settle more than was actually paid in.
-                    let required_usd: f64 = plan
-                        .vault_charges
+                    // Refuse action types that would settle in anything but ASTRA.
+                    let raw_actions = intent_val["actions"].as_array().cloned().unwrap_or_default();
+                    if raw_actions
                         .iter()
-                        .filter_map(|vc| vc.amount_ausd.parse::<f64>().ok())
-                        .sum();
-
-                    let mut reservation_id: Option<String> = None;
-                    if required_usd > 0.0 {
-                        let Some(reader) = entitlements.as_ref() else {
-                            return Ok(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "success": false,
-                                    "error": "entitlement contract is not configured on this node",
-                                })),
-                                warp::http::StatusCode::SERVICE_UNAVAILABLE,
-                            ));
+                        .any(|a| a["type"].as_str() == Some("vault_charge"))
+                    {
+                        return refuse(
+                            "vault_charge actions were removed: SpaceKit settles only in ASTRA \
+                             (use a transfer or execute_contract with value_astra)"
+                                .into(),
+                        );
+                    }
+                    let typed_actions: Vec<spacekit_payments::IntentAction> =
+                        match serde_json::from_value(intent_val["actions"].clone()) {
+                            Ok(a) => a,
+                            Err(e) => return refuse(format!("invalid actions: {e}")),
                         };
 
-                        // Round up so fractional micro-USD is never given away.
-                        let units = (required_usd * 1_000_000.0).ceil() as u128;
-                        let rid = format!("intent:{intent_id}");
-                        match reader.reserve(&actor, units, rid.clone()).await {
-                            Ok(_) => {
-                                reservation_id = Some(rid);
-                                vault.credit(&actor, required_usd).await;
-                            }
-                            Err(e) => {
-                                return Ok(warp::reply::with_status(
-                                    warp::reply::json(&serde_json::json!({
-                                        "success": false,
-                                        "error": format!("Entitlement check failed: {e}"),
-                                    })),
-                                    warp::http::StatusCode::PAYMENT_REQUIRED,
-                                ));
-                            }
+                    let intent_id = intent_val["intent_id"].as_str().unwrap_or("").to_string();
+                    let payment_intent = spacekit_payments::intent::Intent {
+                        intent_id: intent_id.clone(),
+                        version: intent_val["version"].as_str().unwrap_or("1.0").to_string(),
+                        actor: actor.clone(),
+                        agent: intent_val["agent"].as_str().map(|s| s.to_string()),
+                        chain: intent_val["chain"].as_str().unwrap_or("").to_string(),
+                        constraints: intent_val["constraints"].clone(),
+                        actions: typed_actions,
+                        nonce: intent_val["nonce"].as_str().unwrap_or("0").to_string(),
+                        expiry: intent_val["expiry"].as_i64().unwrap_or(0),
+                        meta: intent_val.get("meta").cloned(),
+                    };
+                    let plan = spacekit_payments::intent::IntentPaymentPlan::from_intent(&payment_intent);
+
+                    if let Some(t) = plan
+                        .transfers
+                        .iter()
+                        .find(|t| !spacekit_payments::intent::is_astra_asset(&t.asset))
+                    {
+                        return refuse(format!(
+                            "transfer asset {} is not ASTRA; SpaceKit settles only in ASTRA",
+                            t.asset
+                        ));
+                    }
+                    let total_wei = match plan.total_value_wei() {
+                        Ok(v) => v,
+                        Err(e) => return refuse(e.to_string()),
+                    };
+                    if let Some(max) = plan.max_value_wei {
+                        if total_wei > max {
+                            return refuse(format!(
+                                "intent moves {total_wei} wei, more than its max_value_wei {max}"
+                            ));
                         }
                     }
 
-                    // Process payments
-                    let payment_result = match processor.process_plan(&plan, &nonce).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // Give the allowance back; the work never happened.
-                            if let (Some(reader), Some(rid)) =
-                                (entitlements.as_ref(), reservation_id.as_ref())
-                            {
-                                reader.release(&actor, rid).await;
-                            }
-                            return Ok(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "success": false,
-                                    "error": format!("Payment processing failed: {}", e),
-                                })),
-                                warp::http::StatusCode::PAYMENT_REQUIRED,
-                            ));
-                        }
-                    };
-
-                    // Collect contract execution results
-                    let mut execution_results = Vec::new();
+                    let mut required = Vec::new();
+                    for t in &plan.transfers {
+                        required.push(serde_json::json!({
+                            "kind": "transfer",
+                            "to": t.to,
+                            "value_wei": t.amount,
+                        }));
+                    }
                     for ec in &plan.contract_executions {
-                        let value: u128 = ec.value_astra.as_deref()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0);
-
-                        execution_results.push(serde_json::json!({
-                            "contract_id": ec.contract_id,
-                            "input_len": ec.input.len() / 2,
-                            "value_astra": value,
-                            "status": "executed",
+                        required.push(serde_json::json!({
+                            "kind": "contract_call",
+                            "to": ec.contract_id,
+                            "input": ec.input,
+                            "value_wei": ec.value_astra.clone().unwrap_or_else(|| "0".into()),
                         }));
                     }
 
                     Ok(warp::reply::with_status(
                         warp::reply::json(&serde_json::json!({
                             "success": true,
+                            "executed": false,
                             "intent_id": intent_id,
                             "actor": actor,
-                            "chain": chain,
-                            "payment": {
-                                "total_astra_credited": payment_result.total_astra_credited,
-                                "receipts": payment_result.receipts.len(),
-                                "credits": payment_result.credits.len(),
-                            },
-                            "executions": execution_results,
+                            "asset": "ASTRA",
+                            "total_value_wei": total_wei.to_string(),
+                            "required_transactions": required,
+                            "note": "sign each transaction with the actor's key and POST it to /transaction",
                         })),
                         warp::http::StatusCode::OK,
                     ))
                 }
+            });
+
+        // GET /v1/chain/seals/{number} — the block at that height on this node
+        // and the authority seal it was accepted with.
+        let seals_vm = self.swtchvm_node.clone();
+        let seals_store = self.sealing.clone();
+        let chain_seal_route = warp::path!("v1" / "chain" / "seals" / u64)
+            .and(warp::get())
+            .map(move |number: u64| {
+                let Some(block) = seals_vm.get_block_by_number(number) else {
+                    return warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({ "error": "no such block" })),
+                        warp::http::StatusCode::NOT_FOUND,
+                    );
+                };
+                let seal = seals_store.store.get(number, &block.hash);
+                warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "number": number,
+                        "hash": format!("0x{}", hex::encode(block.hash)),
+                        "proposer_did": seal.as_ref().map(|s| s.proposer_did.clone()),
+                        "seal": seal,
+                    })),
+                    warp::http::StatusCode::OK,
+                )
             });
 
         // GET /v1/chain/status — public chain summary for explorers and the
@@ -2531,6 +2607,7 @@ impl SwtchComputeNode {
         let status_vm = self.swtchvm_node.clone();
         let status_cc = self.consensus_coordinator.clone();
         let status_gov = self.governance.clone();
+        let status_sealing = self.sealing.clone();
         let status_net = self.network_service.clone();
         let status_chain_id = self.config.compute.chain_id.clone();
         let status_node_did = quantum_did_utils::get_did(&self.identity);
@@ -2540,11 +2617,21 @@ impl SwtchComputeNode {
                 let vm = status_vm.clone();
                 let cc = status_cc.clone();
                 let gov = status_gov.clone();
+                let sealing = status_sealing.clone();
                 let net = status_net.clone();
                 let chain_id = status_chain_id.clone();
                 let node_did = status_node_did.clone();
                 async move {
                     let head = vm.get_latest_block();
+                    let head_seal = sealing.store.get(head.number, &head.hash);
+                    let rewards = match vm.sra_host() {
+                        Some(sra) => {
+                            let world = vm.runtime_state();
+                            let world = world.read().await;
+                            sra.status_json(&world).await
+                        }
+                        None => serde_json::json!({ "enabled": false }),
+                    };
                     let governance = gov.snapshot().await;
                     let validators = cc.validator_entries().await;
                     let network = net.get_status().await.ok();
@@ -2557,6 +2644,9 @@ impl SwtchComputeNode {
                         })
                         .count();
                     let authorities = governance.authorities.len();
+                    let producers = vm
+                        .producer_set(chrono::Utc::now().timestamp().max(0) as u64)
+                        .await;
                     Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                         "network": governance.network,
                         "chain_id": chain_id,
@@ -2572,7 +2662,27 @@ impl SwtchComputeNode {
                             "tx_count": head.transactions.len(),
                             "gas_used": head.gas_used.to_string(),
                             "gas_limit": head.gas_limit.to_string(),
+                            "proposer_did": head.proposer_did.clone(),
+                            "sealed": head_seal.is_some(),
                         },
+                        "sealing": {
+                            "authority_did": sealing.signer.as_ref().map(|s| s.did.clone()),
+                            "seals_stored": sealing.store.len(),
+                            "producer_schedule": producers.dids(),
+                            "producers": producers.members,
+                            "stake_weighted": producers.weighted,
+                            "authority_fallback": producers.fallback,
+                            "reorg_window": vm.undo_depth(),
+                        },
+                        "block_production": {
+                            "setting": if producers.is_empty() {
+                                serde_json::to_value(solo_block_production()).unwrap_or_default()
+                            } else {
+                                serde_json::to_value(&producers.block_production).unwrap_or_default()
+                            },
+                            "pending_transactions": vm.pending_count(),
+                        },
+                        "rewards": rewards,
                         "consensus": {
                             "mode": if governance.is_poa() { "proof_of_authority" } else { "proof_of_stake" },
                             "state_hash": governance.state_hash(),
@@ -2586,7 +2696,7 @@ impl SwtchComputeNode {
                         "validators": validators.iter().map(|v| serde_json::json!({
                             "did": v.did,
                             "admission": v.admission,
-                            "stake_units": v.stake_units.to_string(),
+                            "stake_wei": v.stake_wei.to_string(),
                             "joined_at": v.joined_at.timestamp(),
                             "has_key": v.sphincs_public_key.is_some(),
                         })).collect::<Vec<_>>(),
@@ -2619,6 +2729,7 @@ impl SwtchComputeNode {
             .or(register_validator_route)
             .or(propose_consensus_route)
             .or(chain_status_route)
+            .or(chain_seal_route)
             .or(governance_routes);
         #[cfg(feature = "spacetime-consensus")]
         let routes = routes.or(finalize_consensus_route);
@@ -2808,9 +2919,6 @@ impl SwtchComputeNode {
             .or(finality_route)
             .or(payment_config_route)
             .or(payment_verify_route)
-            .or(entitlement_view_route)
-            .or(entitlement_reserve_route)
-            .or(entitlement_release_route)
             .or(execute_intent_route)
             .or(swtchvm_http)
             .recover(spacekit_compute_node::api_auth::handle_rejection)

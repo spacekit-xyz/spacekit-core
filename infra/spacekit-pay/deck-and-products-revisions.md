@@ -1,3 +1,5 @@
+> **Retired (October 2026).** SpaceKit Pay is no longer part of SpaceKit. The network has one currency, ASTRA; marketplace sales are paid in ASTRA through the entitlement ledger. This deck revision is kept for history only; do not use it. See [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 # Deck Slide 10 Revision
 
 ## Replace the current "ECONOMICS" slide content with this

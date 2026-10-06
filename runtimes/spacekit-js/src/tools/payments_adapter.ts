@@ -12,8 +12,8 @@ export interface PaymentAdapterOptions {
 }
 
 /**
- * Payment adapter that submits transfer and vault-charge intents
- * to a SpaceKit payment API.
+ * Payment adapter that forwards ASTRA transfer requests to a payment API,
+ * which must settle them as chain transactions.
  */
 export class HttpPaymentAdapter implements PaymentAdapter {
   private endpoint: string;
@@ -32,7 +32,8 @@ export class HttpPaymentAdapter implements PaymentAdapter {
     this.timeoutMs = options.timeoutMs ?? 10_000;
   }
 
-  async transfer(to: string, asset: string, amount: bigint): Promise<boolean> {
+  async transfer(to: string, asset: "ASTRA", amountWei: bigint): Promise<boolean> {
+    if (asset !== "ASTRA") return false;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -40,55 +41,10 @@ export class HttpPaymentAdapter implements PaymentAdapter {
       const res = await fetch(`${this.endpoint}/transfer`, {
         method: "POST",
         headers: this.headers,
-        body: JSON.stringify({ to, asset, amount: amount.toString() }),
+        body: JSON.stringify({ to, asset: "ASTRA", amount_wei: amountWei.toString() }),
         signal: controller.signal,
       });
       return res.ok;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async vaultCharge(amount: string, beneficiary: string): Promise<boolean> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    try {
-      const res = await fetch(`${this.endpoint}/vault-charge`, {
-        method: "POST",
-        headers: this.headers,
-        body: JSON.stringify({ amount, beneficiary }),
-        signal: controller.signal,
-      });
-      return res.ok;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async sponsorVaultCharge(
-    sponsorDid: string,
-    amount: string,
-    beneficiaryDid: string,
-    operation: string,
-  ): Promise<boolean> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const res = await fetch(`${this.endpoint}/sponsor-vault-charge`, {
-        method: "POST",
-        headers: this.headers,
-        body: JSON.stringify({
-          sponsor: sponsorDid,
-          amount,
-          beneficiary: beneficiaryDid,
-          operation,
-        }),
-        signal: controller.signal,
-      });
-      return res.ok;
-    } catch {
-      return false;
     } finally {
       clearTimeout(timer);
     }
@@ -96,22 +52,11 @@ export class HttpPaymentAdapter implements PaymentAdapter {
 }
 
 /**
- * Noop payment adapter for local/dev environments.
- * All operations succeed without performing real transfers.
+ * Payment adapter for local/dev environments. It moves nothing, so it reports
+ * every transfer as failed rather than pretending a payment happened.
  */
 export class NoopPaymentAdapter implements PaymentAdapter {
-  async transfer(_to: string, _asset: string, _amount: bigint): Promise<boolean> {
-    return true;
-  }
-  async vaultCharge(_amount: string, _beneficiary: string): Promise<boolean> {
-    return true;
-  }
-  async sponsorVaultCharge(
-    _sponsorDid: string,
-    _amount: string,
-    _beneficiaryDid: string,
-    _operation: string,
-  ): Promise<boolean> {
-    return true;
+  async transfer(_to: string, _asset: "ASTRA", _amountWei: bigint): Promise<boolean> {
+    return false;
   }
 }

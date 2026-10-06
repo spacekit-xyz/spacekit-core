@@ -9,9 +9,9 @@ mod events;
 mod log_topics;
 
 pub use astra_rewards::{
-    encode_credit, encode_end_poa, encode_get_locked, encode_get_total_emitted, encode_init,
+    encode_credit, encode_credit_locked, encode_end_poa, encode_get_locked, encode_get_total_emitted, encode_init,
     encode_release, encode_set_locked_recipient, hash_did_bytes, lock_recipient_hashes,
-    topic_label_bytes, treasury_did_hash, OP_CREDIT, OP_END_POA, OP_GET_LOCKED, OP_GET_PHASE,
+    topic_label_bytes, treasury_did_hash, OP_CREDIT, OP_CREDIT_LOCKED, OP_END_POA, OP_GET_LOCKED, OP_GET_PHASE,
     OP_INIT, OP_RELEASE, OP_SET_LOCKED_RECIPIENT, TREASURY_DID,
 };
 pub use emission::{
@@ -65,6 +65,9 @@ pub struct CategoryEpochState {
 #[derive(Debug, Clone)]
 pub struct SraState {
     pub genesis_timestamp_secs: u64,
+    /// Epoch length (default one day). Shorter epochs are for test networks:
+    /// each epoch still releases one day's budget.
+    pub epoch_secs: u64,
     pub epoch_index: u64,
     pub total_credited_wei: u128,
     pub categories: [CategoryEpochState; 4],
@@ -76,8 +79,13 @@ const MAX_UNITS_BITS: u32 = 47;
 
 impl SraState {
     pub fn new(genesis_timestamp_secs: u64) -> Self {
+        Self::with_epoch_secs(genesis_timestamp_secs, 86_400)
+    }
+
+    pub fn with_epoch_secs(genesis_timestamp_secs: u64, epoch_secs: u64) -> Self {
         let mut s = Self {
             genesis_timestamp_secs,
+            epoch_secs: epoch_secs.max(1),
             epoch_index: 0,
             total_credited_wei: 0,
             categories: Default::default(),
@@ -90,7 +98,7 @@ impl SraState {
     /// credits for them. Call before [`record_events`](Self::record_events)
     /// for a block, so the block's events land in its own epoch.
     pub fn maybe_advance_epoch(&mut self, block_timestamp_secs: u64) -> Vec<CreditInstruction> {
-        let epoch = block_timestamp_secs.saturating_sub(self.genesis_timestamp_secs) / 86_400;
+        let epoch = block_timestamp_secs.saturating_sub(self.genesis_timestamp_secs) / self.epoch_secs;
         let mut credits = Vec::new();
         while self.epoch_index < epoch {
             credits.extend(self.settle_epoch());

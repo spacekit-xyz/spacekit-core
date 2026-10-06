@@ -119,9 +119,6 @@ pub struct TokenBridgeMapping {
     /// Wrapped ASTRA token address on destination chain (optional for OFT mode)
     pub wrapped_astra: Option<String>,
 
-    /// USDC token address (for payments)
-    pub usdc_token: String,
-
     /// Other supported tokens
     pub supported_tokens: HashMap<String, String>, // original -> wrapped
 }
@@ -1522,7 +1519,6 @@ impl Default for LayerZeroBridgeConfig {
             TokenBridgeMapping {
                 astra_token: "0xASTRA_ETH_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_ETH_ADDRESS".to_string()),
-                usdc_token: "0xA0b86a33E6441B8C8A4C6a62Bd2f1b6B5C4D4E5F".to_string(),
                 supported_tokens: eth_tokens,
             },
         );
@@ -1531,7 +1527,6 @@ impl Default for LayerZeroBridgeConfig {
             TokenBridgeMapping {
                 astra_token: "0xASTRA_ARB_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_ARB_ADDRESS".to_string()),
-                usdc_token: "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
                 supported_tokens: HashMap::new(),
             },
         );
@@ -1540,7 +1535,6 @@ impl Default for LayerZeroBridgeConfig {
             TokenBridgeMapping {
                 astra_token: "0xASTRA_AVAX_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_AVAX_ADDRESS".to_string()),
-                usdc_token: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E".to_string(),
                 supported_tokens: HashMap::new(),
             },
         );
@@ -1549,7 +1543,6 @@ impl Default for LayerZeroBridgeConfig {
             TokenBridgeMapping {
                 astra_token: "0xASTRA_POLY_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_POLY_ADDRESS".to_string()),
-                usdc_token: "0x3c499c542cEF5E3811e1192ce70d8cC03e5B963c".to_string(),
                 supported_tokens: HashMap::new(),
             },
         );

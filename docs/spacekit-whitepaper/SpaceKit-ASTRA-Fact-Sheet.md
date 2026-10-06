@@ -6,6 +6,11 @@
 > 2026 economics specify a 2B cap, operator service emission, and no public
 > sale. See
 > [`../../economics/spacekit-tokenomics/`](../../economics/spacekit-tokenomics/).
+> The pre-sale pricing, valuation and investor-highlight content has been
+> withdrawn: ASTRA has no set price and this document makes no claim about its
+> price or value. ASTRA is the network's only currency, held as native balances
+> on the SpaceKit chain; it is not a stablecoin and is not pegged. See
+> [`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md).
 
 ## Overview
 - **Token Name:** ASTRA  
@@ -21,8 +26,8 @@
 ASTRA is the **native currency of the agent economy**, powering:
 
 - **Gas Fees** - Smart contract execution, AI inference, storage, messaging  
-- **Staking** - Secure consensus, validator rewards, Sybil resistance  
-- **Marketplace Currency** - Buy/sell agent bundles, datasets, CDN content  
+- **Staking** - Secure consensus, Sybil resistance (native stake; stake itself pays no yield)  
+- **Marketplace Currency** - Buy/sell agent bundles, datasets, CDN content (paid in ASTRA straight to the publisher via the `astra-entitlement-ledger` contract)  
 - **Governance** - Vote on protocol upgrades, cryptographic standards, treasury allocation  
 - **Incentives** - Rewards for node operators and developers  
 
@@ -52,33 +57,13 @@ ASTRA is the **native currency of the agent economy**, powering:
 
 ### Pricing Tiers
 
-| Round | Price (USD) | Allocation | Notes |
-|-------|-------------|------------|-------|
-| **Seed (Private)** | $0.50 | 30M ASTRA | Strategic partners, node operators |
-| **Pre-Sale Round 1** | $0.65 | 30M ASTRA | Early community + developer grants |
-| **Pre-Sale Round 2** | $0.70 | 30M ASTRA | Broader retail participants |
-| **Final Pre-Sale** | $0.75 | 30M ASTRA | Limited allocation before listing |
-
-**Target Listing Price:** $1.00+
-
-### Valuation Implied by Pre-Sale
-
-| Round | Token Price | Fully Diluted Valuation |
-|-------|-------------|-------------------------|
-| Seed | $0.50 | $600M |
-| Round 1 | $0.65 | $780M |
-| Round 2 | $0.70 | $840M |
-| Final | $0.75 | $900M |
-| **Listing** | **$1.00+** | **$1.2B+** |
+*Withdrawn from this document. Any token distribution plan needs separate legal review.*
 
 \newpage
 
 ## Investor Highlights
 
-- **Discounted Entry** - Early rounds offer significant discount with lockups to align long-term incentives
-- **Urgency & Scarcity** - Tiered pricing rewards early believers with better entry points
-- **Value Anchor** - Public listing aims to anchor ASTRA's value perception above $1.00
-- **Equity Alignment** - Combined with equity raise ($20M for 20%), positions SpaceKit for $100M+ valuation at launch
+*Withdrawn. ASTRA is a utility for using the network; no returns, price or investment value are claimed.*
 
 ---
 
@@ -86,7 +71,7 @@ ASTRA is the **native currency of the agent economy**, powering:
 
 1. **Developers** publish agent bundles -> earn ASTRA  
 2. **Users** consume AI services, storage, CDN -> pay ASTRA  
-3. **Node Operators** stake ASTRA -> secure network + earn rewards  
+3. **Node Operators** stake ASTRA and provide measured service -> secure network + earn service rewards  
 4. **DAO Governance** allocates treasury -> funds ecosystem expansion  
 
 ---

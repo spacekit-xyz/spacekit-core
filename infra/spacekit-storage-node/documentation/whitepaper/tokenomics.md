@@ -5,7 +5,7 @@
 **Version:** 1.1.0  
 **Published By:** SpaceKit Labs LLC
 
-> **Canonical economics:** [`spacekit-tokenomics`](../../../spacekit-tokenomics/) — production: **SRA → AstraRewards** ([`Service_Reward_Accumulator_Spec.md`](../../../spacekit-tokenomics/Service_Reward_Accumulator_Spec.md)); storage earns **20%** of annual operator emission. This file covers **legacy testnet** storage reward formulas until SRA ships.
+> **Canonical economics:** [`spacekit-tokenomics`](../../../../economics/spacekit-tokenomics/) — production: **SRA → native rewards** (CREDIT system calls to `0x…0003`, minted straight into the operator's native balance; [`SERVICE_REWARD_ACCUMULATOR_SPEC.md`](../../../../economics/spacekit-tokenomics/SERVICE_REWARD_ACCUMULATOR_SPEC.md)); storage earns **20%** of annual operator emission. This file covers **legacy testnet** storage reward formulas until SRA ships.
 
 ---
 
@@ -116,7 +116,7 @@ Calculation:
 - Base: 500GB × 0.01 × 30 days = 150 ASTRA/month
 - No bonuses applied
 
-Monthly Income: 150 ASTRA (~$150 at $1/token)
+Monthly Income: 150 ASTRA
 ```
 
 ### Example 2: Optimized Storage Node
@@ -140,7 +140,7 @@ Bonuses:
 - Fact verification (+5%): 9 ASTRA
 
 Total Bonuses: 198 ASTRA
-Monthly Income: 378 ASTRA (~$378 at $1/token)
+Monthly Income: 378 ASTRA
 ```
 
 ### Example 3: Premium NFT Storage Node
@@ -167,7 +167,7 @@ Bonuses:
 - Fact verification (+5%): 23.25 ASTRA
 
 Total Bonuses: 720.75 ASTRA
-Monthly Income: 1,185.75 ASTRA (~$1,186 at $1/token)
+Monthly Income: 1,185.75 ASTRA
 ```
 
 ---
@@ -371,12 +371,7 @@ NFTs pay premium rates (2.5x) but require:
 - Low latency
 - Premium hardware
 
-**ROI Calculation:**
-```
-Hardware: $500 (1TB NVMe SSD)
-Monthly NFT income: 768 ASTRA × $1 = $768
-ROI: < 1 month
-```
+**Example:** 1TB of NFT storage at the base NFT rate earns about 768 ASTRA per month (before bonuses), on a 1TB NVMe SSD.
 
 ### Fact Package Verification
 

@@ -10,7 +10,7 @@ hashed client-key records and durable completion receipts.
 - **spacekit-js** — SpaceKit JavaScript, Node.js, and Bun VM (blockchain execution)
 - **spacekit-sdk** — SpaceKit SDK for React, TypeScript, and other frameworks
 
-**Status:** P0 completion-only production candidate. Intent, vault, charge, activity,
+**Status:** P0 completion-only production candidate. Intent,
 compute-forwarding, and public metrics routes are not mounted.
 
 ---
@@ -200,7 +200,6 @@ routekit/
 │   ├── auth.rs             # Hashed API-key verification and per-key limits
 │   ├── storage_client.rs   # Durable Storage Node key/receipt records
 │   ├── intent.rs           # Feature-gated future signed-intent implementation
-│   ├── vault_relay.rs      # Feature-gated future financial implementation
 │   └── api.rs              # P0 HTTP: health, readiness, authenticated completion
 ├── config/
 │   ├── providers.example.yaml
@@ -240,30 +239,15 @@ ROUTEKIT_PORT=3002 cargo run -p routekit
 - **POST /v1/complete** — Authenticated streaming completion. A supported `task` or `task_hint` is required.
 - **GET /internal/metrics** — Prometheus text on the private metrics listener only.
 
-### SpaceKit vault relay (future; not mounted in P0)
+### Billing
 
-When SpaceKit.xyz Agent Hub bills against an on-chain vault, **RouteKit** is the HTTP relay that verifies the user’s EIP-191 signature and submits `vault.charge`. This replaces any standalone Node “deposit relayer” service.
+RouteKit does not hold or charge balances. The former Ethereum vault relay
+(USDC and aUSD `vault.charge`) was removed: SpaceKit's only currency is ASTRA,
+held as native balances on the SpaceKit chain, and paid work is paid with an
+ASTRA transfer verified by transaction hash (see
+`infra/spacekit-compute-node/ASTRA_LEDGER.md`).
 
-The historical implementation is retained behind non-default Cargo features for
-future hardening. Environment variables do not expose these routes in the P0 binary.
-Canonical intent hashing, durable replay protection, relayer key custody, and a
-separate testnet gate must land before this surface can return.
-
-The future configuration is expected to include:
-
-| Env | Purpose |
-|-----|---------|
-| `ROUTEKIT_RPC_URL` | JSON-RPC for the vault’s chain |
-| `ROUTEKIT_CHAIN_ID` | Chain id (e.g. `1`) |
-| `ROUTEKIT_VAULT_ADDRESS` | Deployed vault contract |
-| `ROUTEKIT_RELAYER_PRIVATE_KEY` | Hot wallet allowed as `relayer` on the vault |
-| `ROUTEKIT_VAULT_KIND` | Omit or `legacy` = `SpaceKitDepositVault` (USDC units). Set **`multi`** for `SpaceKitMultiAssetVault` (18-decimal **aUSD** `charge` + multi event layout for activity). |
-
-**`POST /v1/charge`** — JSON body (camelCase): `user`, `amountAUsd`, `agentId`, `nonce`, `signature`. The signed UTF-8 message lines must match the website’s `buildAgentHubChargeMessage` (including `amountAUsd:` as a **decimal integer string** in 18-decimal aUSD wei). Returns `{ ok, transactionHash }` on success.
-
-**`GET /v1/activity/:user`** — Optional `?fromBlock=<u64>`. Returns recent vault logs for that user (`deposited` / `withdrawn` / `charged`); shape differs for legacy vs `multi` vault (multi includes ERC20/ETH variants and `aUsdAmount` / `payoutAmount` on charges).
-
-All intent, charge, and activity paths return **404** in P0.
+All intent and compute-forwarding paths return **404** in P0.
 
 ### SDK usage (when using RouteKit from an app)
 
@@ -288,7 +272,7 @@ const stream = await rk.complete({
 
 - **P1:** Independently certify and shadow a dedicated RouteKit task-classification brain.
 - **P2:** Canonical signed intents with durable replay protection, testnet only.
-- **P3:** Audited vault execution with hardware-backed relayer custody.
+- **P3:** Paid routing settled in ASTRA on the SpaceKit chain (payment verified by transaction hash).
 
 See [docs/NEXT.md](docs/NEXT.md) for the full list and priorities.
 

@@ -19,8 +19,11 @@ pub const SKTCS_RATE_LIMIT_EXCEEDED: i32 = -16;
 pub const SKTCS_MAX_EFFECTS_EXCEEDED: i32 = -17;
 pub const SKTCS_RECIPIENT_BLOCKED: i32 = -18;
 pub const SKTCS_BENEFICIARY_MISMATCH: i32 = -19;
-pub const SKTCS_VAULT_CHARGE_FAILED: i32 = -20;
+/// A payment could not be made (e.g. the payer's ASTRA does not cover it).
+pub const SKTCS_PAYMENT_FAILED: i32 = -20;
 pub const SKTCS_SIZE_LIMIT_EXCEEDED: i32 = -21;
+/// The asset is not ASTRA (SpaceKit settles only in ASTRA).
+pub const SKTCS_UNSUPPORTED_ASSET: i32 = -22;
 
 // ── Manifest types ──────────────────────────────────────────────────────
 

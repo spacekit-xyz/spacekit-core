@@ -1,128 +1,89 @@
-//! Warp middleware for x402 payment gating.
+//! Warp middleware for pay-per-request routes, priced in ASTRA.
 //!
-//! Wraps warp routes so that requests without a valid `X-PAYMENT` header
-//! receive a 402 response with payment requirements. Requests with a valid
-//! header are verified via the facilitator and the resulting credit is
-//! injected into the request context.
+//! A request without an `X-PAYMENT` header gets `402 Payment Required` with
+//! the price as a `PaymentRequirement`. The client pays with an ASTRA
+//! transfer on the SpaceKit chain and retries with `X-PAYMENT: <tx hash>`.
+//! The gate checks that transaction on the chain (`PaymentVerifier`) and
+//! hands the receipt to the route. Each transaction pays for one request.
 
-use crate::fee_router::FeeRouter;
 use crate::types::*;
-use crate::x402::build_402_body;
+use crate::verify::PaymentVerifier;
 use std::sync::Arc;
 use tracing::warn;
 use warp::http::StatusCode;
 use warp::{Filter, Rejection, Reply};
 
-/// Payment gate configuration for a specific route.
+/// Price and payee of a gated route.
 #[derive(Debug, Clone)]
 pub struct PaymentGate {
-    /// Price in USDC for this endpoint.
-    pub price_usdc: String,
-    /// Human-readable description of what's being purchased.
+    /// Price in ASTRA wei.
+    pub price_wei: u128,
+    /// Address that must receive the payment.
+    pub pay_to: String,
+    /// Chain id the payment must be made on.
+    pub chain_id: Option<String>,
+    /// Human-readable description of what is being bought.
     pub description: String,
-    /// DID of the contract/service that receives the credit.
-    pub beneficiary_did: String,
 }
 
-/// Create a warp filter that enforces x402 payment on a route.
-///
-/// If the `X-PAYMENT` header is missing, returns 402 with payment requirements.
-/// If present, verifies via the facilitator and injects a `Credit` into the
-/// request for downstream handlers to use.
+impl PaymentGate {
+    pub fn requirement(&self) -> PaymentRequirement {
+        PaymentRequirement {
+            amount_wei: self.price_wei.to_string(),
+            asset: PaymentAsset::ASTRA,
+            pay_to: self.pay_to.clone(),
+            chain_id: self.chain_id.clone(),
+            description: Some(self.description.clone()),
+        }
+    }
+}
+
+/// A warp filter that serves the route only to requests that paid.
 pub fn require_payment(
     gate: PaymentGate,
-    config: PaymentConfig,
-    fee_router: Arc<FeeRouter>,
-) -> impl Filter<Extract = (Credit,), Error = Rejection> + Clone {
-    let gate = Arc::new(gate);
-    let config = Arc::new(config);
-
-    warp::header::optional::<String>("x-payment").and_then(move |payment_header: Option<String>| {
-        let gate = gate.clone();
-        let config = config.clone();
-        let fee_router = fee_router.clone();
-
+    verifier: Arc<PaymentVerifier>,
+) -> impl Filter<Extract = (PaymentReceipt,), Error = Rejection> + Clone {
+    let requirement = Arc::new(gate.requirement());
+    warp::header::optional::<String>("x-payment").and_then(move |header: Option<String>| {
+        let requirement = requirement.clone();
+        let verifier = verifier.clone();
         async move {
-            match payment_header {
-                None => {
-                    // No payment header → return 402
-                    Err(warp::reject::custom(PaymentRequired {
-                        body: build_402_body(&config, &gate.price_usdc, Some(&gate.description)),
-                    }))
-                }
-                Some(header) => {
-                    // Verify payment via facilitator
-                    let requirement = PaymentRequirement {
-                        amount: gate.price_usdc.clone(),
-                        asset: PaymentAsset::USDC,
-                        pay_to: config.pay_to_address.clone(),
-                        network: Some(PaymentNetwork::select(config.testnet)),
-                        description: Some(gate.description.clone()),
-                    };
-
-                    #[cfg(feature = "x402")]
-                    {
-                        match crate::x402::verify_payment(
-                            &config.facilitator_url,
-                            &header,
-                            &requirement,
-                        )
-                        .await
-                        {
-                            Ok(receipt) => {
-                                match fee_router
-                                    .process_payment(receipt, &gate.beneficiary_did)
-                                    .await
-                                {
-                                    Ok(credit) => Ok(credit),
-                                    Err(e) => {
-                                        warn!("Fee routing failed: {}", e);
-                                        Err(warp::reject::custom(PaymentFailed {
-                                            reason: format!("Credit application failed: {}", e),
-                                        }))
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Payment verification failed: {}", e);
-                                Err(warp::reject::custom(PaymentFailed {
-                                    reason: format!("Verification failed: {}", e),
-                                }))
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "x402"))]
-                    {
-                        Err(warp::reject::custom(PaymentFailed {
-                            reason: "x402 feature not enabled".to_string(),
-                        }))
-                    }
-                }
-            }
+            let Some(tx_hash) = header else {
+                return Err(warp::reject::custom(PaymentRequired {
+                    requirement: (*requirement).clone(),
+                }));
+            };
+            verifier.verify(tx_hash.trim(), &requirement).map_err(|e| {
+                warn!("payment {tx_hash} refused: {e}");
+                warp::reject::custom(PaymentFailed {
+                    reason: e.to_string(),
+                })
+            })
         }
     })
 }
 
-/// Rejection type: 402 Payment Required.
+/// Rejection: no payment was offered.
 #[derive(Debug)]
 pub struct PaymentRequired {
-    pub body: String,
+    pub requirement: PaymentRequirement,
 }
 impl warp::reject::Reject for PaymentRequired {}
 
-/// Rejection type: payment verification or credit application failed.
+/// Rejection: the offered payment does not check out.
 #[derive(Debug)]
 pub struct PaymentFailed {
     pub reason: String,
 }
 impl warp::reject::Reject for PaymentFailed {}
 
-/// Recovery handler that converts payment rejections into proper HTTP responses.
+/// Turns payment rejections into `402` responses.
 pub async fn handle_payment_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
     if let Some(pr) = err.find::<PaymentRequired>() {
-        let json = warp::reply::json(
-            &serde_json::from_str::<serde_json::Value>(&pr.body).unwrap_or_default(),
-        );
+        let json = warp::reply::json(&serde_json::json!({
+            "error": "payment required",
+            "accepts": [pr.requirement],
+        }));
         return Ok(warp::reply::with_status(json, StatusCode::PAYMENT_REQUIRED));
     }
     if let Some(pf) = err.find::<PaymentFailed>() {

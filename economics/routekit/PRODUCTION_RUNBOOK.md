@@ -1,7 +1,9 @@
 # RouteKit P0 Production Runbook
 
-P0 is an authenticated completion relay. It does not expose intent, vault, charge,
-activity, compute-forwarding, or public metrics routes.
+P0 is an authenticated completion relay. It does not expose intent, activity,
+compute-forwarding, or public metrics routes. The vault and charge relay routes
+were removed: ASTRA is the only currency on SpaceKit, and payments are on-chain
+ASTRA transfers, not relay charges.
 
 ## Required services and secrets
 

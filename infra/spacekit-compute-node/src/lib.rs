@@ -251,18 +251,8 @@ pub mod ml_operations;
 // Pricing and economics
 pub mod pricing;
 
-// Exchange rate oracle for aUSD marketplace stablecoin
-pub mod exchange_rate;
-pub use exchange_rate::ExchangeRateOracle;
-
 // Verkle state root anchoring to EVM
 pub mod state_anchor;
-
-// On-chain entitlement reader — reads the Ethereum DAI/USDC entitlement
-// contract. Replaces the former in-memory aUSD vault; the node has no
-// authority to create balance locally.
-pub mod entitlements;
-pub use entitlements::{EntitlementConfig, EntitlementError, EntitlementReader, EntitlementView};
 
 // Canonical intent signing — the actor's signature must cover the whole intent
 pub mod intent_auth;
@@ -284,6 +274,13 @@ pub use consensus_coordinator::{ConsensusCoordinator, FinalityStatus, ValidatorA
 
 // Proof-of-authority bootstrap: authority set, signed proposals and votes
 pub mod validator_governance;
+
+// Authority seals and producer schedule for proof-of-authority blocks
+pub mod block_production;
+pub mod chain_consensus;
+pub mod native_rewards;
+pub mod staking;
+pub mod block_seal;
 pub use validator_governance::{ConsensusMode, ValidatorGovernance};
 
 /// Subscriber sync bundle + L1 manifest merge for operator HTTP / proposals.
@@ -2233,6 +2230,7 @@ impl ComputeNode {
         owner_did: &str,
         amount: u128,
     ) -> Result<u128, anyhow::Error> {
+        require_local_ledger("funding an account")?;
         let rt = self
             .swtchvm_runtime
             .as_ref()
@@ -2388,6 +2386,9 @@ impl ComputeNode {
         value: u128,
         gas_limit: u64,
     ) -> Result<Vec<u8>, anyhow::Error> {
+        if value > 0 {
+            require_local_ledger("a contract call that carries value")?;
+        }
         if let Some(swtchvm) = &self.swtchvm_runtime {
             let contract_addr =
                 SwtchvmAddress::from_hex(contract_id).unwrap_or_else(|_| SwtchvmAddress::zero());
@@ -3425,6 +3426,24 @@ impl ComputeNode {
         // Deduct fees from reward amount - USER PAYS THE FEES
         let net_reward_amount = reward_amount - fee_result.total_fees;
 
+        if require_local_ledger("crediting a task reward").is_err() {
+            // Compute providers are paid in consensus by the Service Reward
+            // Accumulator (native ASTRA minted in blocks), not by this worker.
+            tracing::info!(
+                task_id,
+                provider_did,
+                "task reward accounted by the chain's service rewards; no local credit"
+            );
+            return Ok(TokenMintResult {
+                transaction_hash: format!("sra:{task_id}"),
+                block_number: 0,
+                amount_minted: 0,
+                recipient: provider_did.to_string(),
+                task_id: task_id.to_string(),
+                fees_deducted: 0,
+                net_amount: 0,
+            });
+        }
         if let Some(swtchvm) = &self.swtchvm_runtime {
             // Create recipient address
             let recipient_address = self.did_to_address(provider_did)?;
@@ -3744,8 +3763,11 @@ impl ComputeNode {
             Utc::now().timestamp()
         );
 
+        // Compute providers are paid by the chain's service rewards; the
+        // worker's sandbox VM credits nothing outside local development.
+        let local_ledger = require_local_ledger("a batch reward payout").is_ok();
         // Try to distribute via SpaceKitVM first
-        let distribution_result = if let Some(swtchvm) = &self.swtchvm_runtime {
+        let distribution_result = if let (true, Some(swtchvm)) = (local_ledger, &self.swtchvm_runtime) {
             let recipient_address = self.did_to_address(&pending_reward.provider_did)?;
 
             match swtchvm
@@ -3797,8 +3819,9 @@ impl ComputeNode {
             }
         };
 
-        // If enabled, try cross-chain distribution
-        if self.config.quarterly_reward_config.auto_distribute {
+        // Cross-chain payout mints on another chain without locking native
+        // ASTRA, which would create supply outside the chain: local dev only.
+        if self.config.quarterly_reward_config.auto_distribute && local_ledger {
             if let Some(bridge) = &self.layerzero_bridge {
                 match bridge
                     .distribute_cross_chain_reward(
@@ -5322,7 +5345,6 @@ mod tests {
             crate::layerzero_bridge::TokenBridgeMapping {
                 astra_token: "0xASTRA_ARB_ADDRESS".to_string(),
                 wrapped_astra: Some("0xWASTRA_ARB_ADDRESS".to_string()),
-                usdc_token: "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
                 supported_tokens: std::collections::HashMap::new(),
             },
         );
@@ -5687,7 +5709,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_sandbox_credits_nothing_outside_dev_mode() {
+        let mut config = ComputeConfig::default();
+        config.token_reward_config.enable_token_minting = true;
+        let mut node = ComputeNode::new(config).await.unwrap();
+        node.initialize().await.unwrap();
+        let metrics = ResourceMetrics {
+            execution_time_ms: 1,
+            cpu_time_ms: 1,
+            memory_peak_mb: 1,
+            compute_units_used: 1,
+            energy_consumed_kwh: 0.0,
+            cpu_usage_percent: 1.0,
+            memory_usage_mb: 1,
+        };
+        let r = node
+            .mint_task_reward("t", "did:spacekit:provider:x", 1_000_000_000_000_000_000, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(r.amount_minted, 0, "rewards are minted by the chain, not the worker");
+        assert!(node.swtchvm_fund_owner("0x00000000000000000000000000000000000000aa", 1).await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_fee_aware_reward_distribution() {
+        TEST_LOCAL_LEDGER.with(|f| f.set(true));
         let mut config = ComputeConfig::default();
         config.token_reward_config.enable_token_minting = true;
 
@@ -5857,6 +5903,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_chain_quarterly_distribution() {
+        TEST_LOCAL_LEDGER.with(|f| f.set(true));
         let mut config = ComputeConfig::default();
         config.quarterly_reward_config.enabled = true;
         config.quarterly_reward_config.auto_distribute = true;
@@ -6581,5 +6628,29 @@ mod toml_default_config_tests {
     fn compute_config_default_serializes_to_toml() {
         toml::to_string_pretty(&ComputeConfig::default())
             .expect("ComputeConfig must serialize to TOML for standalone default config.toml");
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests of the local-dev ledger turn it on for their own thread only.
+    static TEST_LOCAL_LEDGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The compute worker's in-process SwtchVM is a metering sandbox, not a
+/// ledger: ASTRA exists only on the chain. Creating or moving value in it is
+/// allowed only for local development (`SPACEKIT_DEV_MODE`).
+fn require_local_ledger(what: &str) -> Result<(), anyhow::Error> {
+    #[cfg(test)]
+    if TEST_LOCAL_LEDGER.with(|f| f.get()) {
+        return Ok(());
+    }
+    if spacekitvm::swtchvm_node::dev_mode_enabled() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{what} needs the chain: ASTRA balances live only on the chain \
+             (the worker's local VM holds none outside SPACEKIT_DEV_MODE)"
+        ))
     }
 }

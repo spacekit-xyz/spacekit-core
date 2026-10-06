@@ -49,7 +49,7 @@ Publisher and buyer need distinct DIDs (`spacekit init` in separate data dirs or
 
 ### Incremental (not in v1 script)
 
-- Payment fails (insufficient funds / wrong network) — SpaceKit Pay router
+- Payment fails (insufficient ASTRA / failed transaction) — `/v1/payments/verify` refuses it
 - Settlement timeout + retry — pending remains `awaiting_payment`
 - Publisher access without pay — automated H3
 - Concurrent purchases — load test
@@ -68,7 +68,7 @@ spacekit content publish --channel did:spacekit:channel:soak:pub \
 # Buyer
 spacekit content view --content-id <CONTENT_ID>
 spacekit content pay --content-id <CONTENT_ID>
-# record-payment (simulates SpaceKit Pay → inbox)
+# record-payment (simulates a verified ASTRA payment → inbox)
 spacekit content record-payment \
   --reference tx-soak-1 --recipient <PUBLISHER_DID> \
   --scope content:<CONTENT_ID> --amount 10
@@ -88,15 +88,16 @@ spacekit content listen-settlements --once
 
 `content pay --await-settlement` polls the same inbox (500ms default, 120s timeout).
 
-**Production path:** compute `POST /v1/payments/verify` with `scope` (`content:{hex}` or `channel:{did}`)
-forwards to storage `POST /api/content/settlements` when `SPACEKIT_STORAGE_NODE_URL` is set on compute.
+**Production path:** the buyer pays in ASTRA (the only currency) through `astra-entitlement-ledger`, which pays the publisher directly.
+Compute `POST /v1/payments/verify` checks the ASTRA transaction by hash and, with `scope` (`content:{hex}` or `channel:{did}`),
+forwards to storage `POST /api/content/settlements` (with `amount_wei`, asset `ASTRA`, `payer_did`) when `SPACEKIT_STORAGE_NODE_URL` is set on compute.
 Run `content listen-settlements` (or `--await-settlement`) to complete pending purchases.
 
 ## Live soak flow (H2)
 
 ```bash
-spacekit content pay --content-id <CONTENT_ID> --tx-hash <real-tx> --amount 10
-# or: pay → pay externally → settle --pending-id ... --tx-hash ... --amount 10
+spacekit content pay --content-id <CONTENT_ID> --tx-hash <real-astra-tx> --amount 10
+# or: pay → send the ASTRA transaction → settle --pending-id ... --tx-hash ... --amount 10
 spacekit content view --content-id <CONTENT_ID> --output /tmp/soak-out.txt
 ```
 

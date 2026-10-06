@@ -1,6 +1,6 @@
 # Operator earning guides
 
-These documents describe **legacy testnet reward calculators** in each node crate. **Production economics** use the **Service Reward Accumulator (SRA)** + **AstraRewards** contract per **[`../Service_Reward_Accumulator_Spec.md`](../Service_Reward_Accumulator_Spec.md)** and **[`../AstraRewards_Contract_Spec.md`](../AstraRewards_Contract_Spec.md)**.
+These documents describe **legacy testnet reward calculators** in each node crate. **Production economics** use the **Service Reward Accumulator (SRA)** + the node's **native rewards** system calls (`0x…0003`) per **[`../SERVICE_REWARD_ACCUMULATOR_SPEC.md`](../SERVICE_REWARD_ACCUMULATOR_SPEC.md)** and **[`../ASTRA_REWARDS_CONTRACT_SPEC.md`](../ASTRA_REWARDS_CONTRACT_SPEC.md)**.
 
 Macro emission (halving curve, 350M treasury, 40/30/20/10 category split): **[`../ASTRA_EMISSION.md`](../ASTRA_EMISSION.md)**.
 
@@ -13,10 +13,6 @@ Macro emission (halving curve, 350M treasury, 40/30/20/10 category split): **[`.
 
 When implementation defaults change, update both the node guide **and** [`ASTRA_EMISSION.md`](../ASTRA_EMISSION.md) §4.
 
-**Enable SRA on compute-node:** set `[compute.sra_config] enabled = true` in `config.toml` and disable legacy `[compute.token_reward_config] enable_token_minting = false`. Build the on-chain contract:
+**Enable SRA on compute-node:** set `[compute.sra_config] enabled = true` in `config.toml` and disable legacy `[compute.token_reward_config] enable_token_minting = false`. No contract build is needed.
 
-```bash
-cargo build -p astra-rewards --release --target wasm32-unknown-unknown
-```
-
-The node loads `astra_rewards.wasm` at system address `0x…0003` and submits `OP_CREDIT` from the faucet/admin account (`0x…0001`) after each mined block.
+The SRA places the rewards system calls to `0x…0003` (INIT, CREDIT, CREDIT_LOCKED, END_POA) at the start of a block, and the node executes them itself (`native_rewards.rs`). CREDIT mints straight into the recipient address's native balance. Every importer re-derives and checks these calls.

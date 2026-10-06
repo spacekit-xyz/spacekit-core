@@ -80,9 +80,9 @@ Absolutely, Astor. Let’s build a **SpaceKit.xyz Pitch Deck** using the latest 
 
 ### 8. Business Model
 - **Content:**  
-  - Transaction fees on blockchain  
-  - Marketplace fees for agent bundles/data/media  
-  - Node incentives for compute/storage/messaging  
+  - Network usage paid in ASTRA (gas is burned; it is not company revenue)  
+  - Agent bundle/data/media marketplace: sales in ASTRA via the `astra-entitlement-ledger` contract, paid straight to the publisher (no marketplace cut)  
+  - Node incentives for compute/storage/messaging (protocol emission for measured service)  
   - Enterprise licensing for secure quantum-safe infra  
 - **Visuals:** Revenue streams funnel diagram
 
@@ -111,10 +111,11 @@ Absolutely, Astor. Let’s build a **SpaceKit.xyz Pitch Deck** using the latest 
 ### 11. ASTRA Tokenomics
 - **Content (revised — see [`SpaceKit_Tokenomics.md`](../../economics/spacekit-tokenomics/SpaceKit_Tokenomics.md)):**  
   - **Total Supply:** 2B ASTRA hard cap (no inflation, no public sale)  
-  - **Utility:** Gas, validator stake (not yield), governance  
+  - **Utility:** Gas, validator stake (not yield), governance, paying for services  
+  - **Currency:** ASTRA is the only currency (native balances on the SpaceKit chain; no stablecoin rails, SpaceKit Pay retired) — see [`PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md)  
   - **Earning:** Operators earn through measured service (compute, storage, messaging, validation)  
   - **Emission:** [`ASTRA_EMISSION.md`](../../economics/spacekit-tokenomics/ASTRA_EMISSION.md)  
-- **Visuals:** Three-rail economics (align with slide 10); operator-earned model — **not** pre-sale tiers
+- **Visuals:** One-currency economics (ASTRA only); operator-earned model — **not** pre-sale tiers
 
 ---
 
@@ -157,6 +158,6 @@ Absolutely, Astor. Let’s build a **SpaceKit.xyz Pitch Deck** using the latest 
 
 ---
 
-⚡ This deck integrates the **latest data**: 2.2B ASTRA supply, pre-sale pricing tiers, testnet status, and your $20M raise.  
+⚡ This deck integrates: 2B ASTRA hard cap (no pre-sale or public sale), ASTRA-only payments, testnet status, and your $20M equity raise.  
 
 Would you like me to **draft the actual slide text + visual mockups** (bullet points formatted for slides, with suggested graphics) so you can copy-paste directly into your presentation software?

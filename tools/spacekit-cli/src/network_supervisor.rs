@@ -959,6 +959,59 @@ fn compute_bootstrap_socket(address: &str) -> Result<String, Box<dyn std::error:
     Err(format!("unsupported compute bootstrap multiaddr `{address}`").into())
 }
 
+/// Environment for the compute sidecar's block producer, PoA governance and
+/// rewards, from `[blockchain]` and `[blockchain.poa]`.
+pub(crate) fn compute_chain_env(net: &SpacekitNetworkFile) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    let poa = &net.blockchain.poa;
+    let path = |p: &std::path::Path| p.display().to_string();
+    if net.blockchain.enabled {
+        env.push((
+            "SPACEKIT_BLOCK_TIME_MS",
+            network_profile::resolve_block_time_ms(net).to_string(),
+        ));
+        // Without authorities a single local node produces alone; a private
+        // or public network without PoA keeps producing on demand (`POST /mine`).
+        if !poa.enabled() && net.profile == network_profile::NetworkPreset::Local {
+            env.push(("SPACEKIT_BLOCK_PRODUCER", "solo".to_string()));
+            if let Some(mode) = &net.blockchain.production {
+                env.push(("SPACEKIT_BLOCK_PRODUCTION", mode.clone()));
+            }
+            if let Some(ms) = net.blockchain.batch_window_ms {
+                env.push(("SPACEKIT_BLOCK_BATCH_WINDOW_MS", ms.to_string()));
+            }
+            if let Some(secs) = net.blockchain.heartbeat_secs {
+                env.push(("SPACEKIT_BLOCK_HEARTBEAT_SECS", secs.to_string()));
+            }
+        }
+    }
+    if let Some(p) = &poa.genesis_file {
+        env.push(("SPACEKIT_POA_GENESIS_FILE", path(p)));
+    }
+    if let Some(p) = &poa.authority_wallet {
+        env.push(("SPACEKIT_AUTHORITY_WALLET", path(p)));
+    }
+    if let Some(p) = &poa.genesis_alloc_file {
+        env.push(("SPACEKIT_GENESIS_ALLOC_FILE", path(p)));
+    }
+    if let Some(secs) = poa.reward_epoch_secs {
+        env.push(("SPACEKIT_SRA_EPOCH_SECS", secs.to_string()));
+    }
+    if let Some(ts) = poa.rewards_genesis_ts {
+        env.push(("SPACEKIT_SRA_GENESIS_TS", ts.to_string()));
+    }
+    if !poa.affiliated_operator_dids.is_empty() {
+        env.push((
+            "SPACEKIT_AFFILIATED_OPERATOR_DIDS",
+            poa.affiliated_operator_dids.join(","),
+        ));
+    }
+    if let Some(p) = &poa.astra_rewards_wasm {
+        env.push(("SPACEKIT_ASTRA_REWARDS_WASM", path(p)));
+    }
+    env
+}
+
 fn write_compute_config(
     net: &SpacekitNetworkFile,
     did: &str,
@@ -980,6 +1033,9 @@ fn write_compute_config(
     config.layerzero_bridge_config.enabled = false;
     config.swtchvm_state_path = Some(state_path);
     config.chain_id = net.blockchain.chain_id.to_string();
+    if net.blockchain.poa.rewards {
+        config.sra_config.enabled = true;
+    }
     // Storage remains a separately managed service. The standalone node must not create a
     // second storage database just because the profile omitted storage.
     config.storage_config.enable_storage_integration = false;
@@ -1145,6 +1201,13 @@ fn spawn_compute_process(
             data_dir.join("did_registry.json"),
         )
         .env("SPACEKIT_STORAGE_NODE_URL", net.resolved_storage_url())
+        // Seals live with this node's data, so several nodes can share a
+        // working directory. (Governance and staking are in the chain.)
+        .env("SPACEKIT_SEAL_STORE_PATH", data_dir.join("block_seals.jsonl"));
+    for (key, value) in compute_chain_env(net) {
+        command.env(key, value);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))

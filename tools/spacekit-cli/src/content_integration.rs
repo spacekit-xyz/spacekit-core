@@ -1149,7 +1149,7 @@ pub async fn view_content_fact(
         })
     {
         if let Some(ref ent) = grant.entitlement_id_hex {
-            if on_chain_content_grant(requester_did, content_id, Some(ent.as_str()))
+            if on_chain_content_grant(requester_did, content_id, fact.author.as_str(), Some(ent.as_str()))
                 .await
                 .is_some()
             {

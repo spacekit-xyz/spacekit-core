@@ -1,3 +1,5 @@
+> **Retired (October 2026).** SpaceKit Pay is no longer part of SpaceKit. The network has one currency, ASTRA; marketplace sales are paid in ASTRA through the entitlement ledger. Kept for history only; do not deploy or follow this setup. Any `SpaceKitPayRouter` contracts already deployed should be paused and decommissioned. See [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 # SpaceKit Marketplace Pay — setup & deployment guide
 
 This guide is for **SpaceKit operators** (people running `spacekit.xyz-website-api` + contracts) and **game/app publishers** (developers selling paid listings).

@@ -1,6 +1,6 @@
 # routekit-agent
 
-**RouteKit** is a SpaceKit WASM smart contract that wires **Growformer** inference, **web search**, **vault billing**, **cross-DID messaging**, and **remote transcript storage** into one deterministic agent. Each operation is charged via `payment_vault_charge` before work runs, and the VM emits structured events for receipts and indexers.
+**RouteKit** is a SpaceKit WASM smart contract that wires **Growformer** inference, **web search**, **ASTRA fees**, **cross-DID messaging**, and **remote transcript storage** into one deterministic agent. Each paid operation requires its fee in ASTRA attached to the call before work runs, and the VM emits structured events for receipts and indexers.
 
 This crate is the **reference integration** for the agent host surface in
 [`spacekit-contract-sdk`](../../../spacekit-contract-sdk/) (`spacekit_agent`,
@@ -15,7 +15,7 @@ This crate is the **reference integration** for the agent host surface in
 - [Build](#build)
 - [Wire format](#wire-format)
 - [Opcodes](#opcodes)
-- [Vault costs](#vault-costs)
+- [Fees (ASTRA)](#fees-astra)
 - [Growformer brain key](#growformer-brain-key)
 - [Events](#events)
 - [Host imports](#host-imports)
@@ -32,8 +32,8 @@ This crate is the **reference integration** for the agent host surface in
 | **Search → reply** | `web_search` JSON hits + Growformer reply in one transaction. |
 | **Search** | Legacy: UTF-8 query only → JSON hits. **v1**: search + Growformer synthesis. |
 | **Converse** | Multi-turn: load prior transcript by ref, reply, persist new transcript ref + reply. |
-| **Frontier** | Vault-tier charge + `messaging_send` to a recipient DID (returns `pending`). |
-| **Ping** | Same messaging path as frontier without vault charge (operator / connectivity checks). |
+| **Frontier** | Frontier fee + `messaging_send` to a recipient DID (returns `pending`). |
+| **Ping** | Same messaging path as frontier without a fee (operator / connectivity checks). |
 | **Configure** | Store a prefs blob in remote storage; return a short ref. |
 | **Health / brain info** | JSON health + loaded brain metadata. |
 
@@ -70,7 +70,7 @@ All multi-byte integers are **little-endian**. Length-prefixed UTF-8 blobs use a
 | **SEARCH** v1 | `0x03` + `0x01` | `[1][max_gen: u16][q_len: u16][query_utf8]` | UTF-8 synthesized answer |
 | **CONVERSE** | `0x04` | `[hist_ref_len: u16][hist_ref_utf8][msg_len: u16][msg_utf8]` | `[new_ref_len: u16][new_ref][reply_len: u16][reply_utf8]` |
 | **FRONTIER_SEND** | `0x05` | `[recipient_len: u16][recipient_utf8][payload_len: u16][payload_bytes]` | ASCII `pending` |
-| **PING** | `0x11` | Same layout as FRONTIER | ASCII `sent` (no vault charge) |
+| **PING** | `0x11` | Same layout as FRONTIER | ASCII `sent` (no fee) |
 | **BRAIN_INFO** | `0x12` | *(empty after opcode)* | UTF-8 JSON brain metadata |
 | **CONFIGURE** | `0x20` | `[prefs_len: u16][prefs_utf8]` | `[ref_len: u16][ref_utf8]` |
 
@@ -103,7 +103,7 @@ Charges frontier tier, sends binary payload to recipient DID via `messaging_send
 
 ### `0x11` — PING
 
-Same wire as FRONTIER but **no** `payment_vault_charge`; emits `routekit.ping.sent` with an 8-byte length marker.
+Same wire as FRONTIER but **no** fee; emits `routekit.ping.sent` with an 8-byte length marker.
 
 ### `0x12` — BRAIN_INFO
 
@@ -119,18 +119,18 @@ Stores prefs UTF-8 blob; returns a ref string for clients to persist.
 
 ---
 
-## Vault costs
+## Fees (ASTRA)
 
-Amounts are **decimal string** tiers passed to `payment_vault_charge` (host interprets against the caller’s vault / policy).
+Fees are native ASTRA. The caller attaches at least the fee as the call's value; `collect_fee` refuses the call otherwise (`InsufficientPayment`) and forwards everything attached to the network treasury (`0x…0004`), so nothing stays in the contract.
 
-| Tier constant | Value | Used by |
-|---------------|-------|---------|
-| Local | `"100"` | COMPLETE, CONVERSE |
-| Search | `"200"` | SEARCH legacy |
-| Pipeline / search+local | `"300"` | PIPELINE, SEARCH v1 |
-| Frontier | `"5000"` | FRONTIER_SEND |
+| Tier constant | Fee | Used by |
+|---------------|-----|---------|
+| `COST_LOCAL` | 100 µASTRA (0.0001 ASTRA) | COMPLETE, CONVERSE |
+| `COST_SEARCH` | 200 µASTRA | SEARCH legacy |
+| `COST_PIPE` / `COST_SEARCH_AND_LOCAL` | 300 µASTRA | PIPELINE, SEARCH v1 |
+| `COST_FRONTIER` | 5,000 µASTRA (0.005 ASTRA) | FRONTIER_SEND |
 
-Beneficiary for charges is the **caller DID** from `get_caller_did_string`, or `did:spacekit:anonymous` if unset.
+Value moves only on the chain, so paid operations run against a compute node. In the browser VM's default `"chain"` currency mode, attaching value is refused.
 
 ---
 
@@ -168,8 +168,7 @@ Deploy or seed the router brain bytes in VM / storage under this key before expe
 | `spacekit_tools` | `web_search` |
 | `spacekit_messaging` | `messaging_send` |
 | `spacekit_remote_storage` | `remote_storage_put`, `remote_storage_get` |
-| `spacekit_payments` | `payment_vault_charge` |
-| `env` | `get_caller_did`, `emit_event` |
+| `env` | `get_caller_did`, `emit_event`, `msg_value_u128`, `transfer_u128` |
 
 The SpaceKit JS VM implements these under `host.ts` / contract SDK parity docs.
 

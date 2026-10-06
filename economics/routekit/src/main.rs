@@ -13,8 +13,6 @@ mod prices;
 mod providers;
 mod router;
 mod storage_client;
-#[cfg(feature = "vault")]
-mod vault_relay;
 
 use std::path::Path;
 use std::time::Instant;

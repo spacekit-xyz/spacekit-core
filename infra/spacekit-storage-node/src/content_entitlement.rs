@@ -17,6 +17,10 @@ pub const OP_GET_LISTING: u8 = 0x05;
 pub const OP_GET_ENTITLEMENT: u8 = 0x06;
 /// Publisher-only approve/grant (no payment).
 pub const OP_GRANT: u8 = 0x07;
+/// Verify against a named listing (not just a file id; see `verify_for_publisher`).
+pub const OP_VERIFY_LISTING: u8 = 0x08;
+/// Extend a subscription by one period.
+pub const OP_RENEW: u8 = 0x09;
 
 pub const PRICING_ONE_TIME: u8 = 1;
 pub const PRICING_SUBSCRIPTION: u8 = 2;
@@ -27,6 +31,7 @@ pub const STATUS_WRONG_BUYER: u8 = 2;
 pub const STATUS_WRONG_FILE: u8 = 3;
 pub const STATUS_REVOKED: u8 = 4;
 pub const STATUS_WRONG_PK: u8 = 5;
+pub const STATUS_WRONG_LISTING: u8 = 6;
 
 /// Decoded entitlement record from OP_GET_ENTITLEMENT.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +52,9 @@ pub enum EntitlementVerifyStatus {
     WrongFile,
     Revoked,
     WrongPk,
+    /// The entitlement is for another listing, or the listing was not made by
+    /// the content's publisher for this content.
+    WrongListing,
     NotFound,
     Unconfigured,
     RpcError(String),
@@ -72,10 +80,11 @@ pub fn append_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(b);
 }
 
+/// `price` is native ASTRA in wei (u128, 16 bytes on the wire).
 pub fn build_create_listing_payload(
     listing_id: &str,
     file_id: &str,
-    price: u64,
+    price: u128,
     token: &str,
     pricing_type: u8,
     period: u64,
@@ -144,6 +153,64 @@ pub fn build_verify_payload(
     append_string(&mut out, file_id);
     out.extend_from_slice(buyer_pk_hash);
     out
+}
+
+pub fn build_verify_listing_payload(
+    entitlement_id: &[u8; 32],
+    buyer_did: &str,
+    listing_id: &str,
+    buyer_pk_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 4 + buyer_did.len() + listing_id.len() + 32);
+    out.push(OP_VERIFY_LISTING);
+    out.extend_from_slice(entitlement_id);
+    append_string(&mut out, buyer_did);
+    append_string(&mut out, listing_id);
+    out.extend_from_slice(buyer_pk_hash);
+    out
+}
+
+pub fn build_get_listing_payload(listing_id: &str) -> Vec<u8> {
+    let mut out = vec![OP_GET_LISTING];
+    append_string(&mut out, listing_id);
+    out
+}
+
+/// Decoded listing record from OP_GET_LISTING.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingRecord {
+    pub publisher_did: String,
+    pub file_id: String,
+    pub price_wei: u128,
+    pub token: String,
+    pub pricing_type: u8,
+    pub period: u64,
+    pub active: bool,
+}
+
+pub fn decode_listing_record(raw: &[u8]) -> Result<ListingRecord> {
+    let mut pos = 0usize;
+    let publisher_did = read_string(raw, &mut pos)?;
+    let file_id = read_string(raw, &mut pos)?;
+    if pos + 16 > raw.len() {
+        return Err(anyhow!("truncated listing price"));
+    }
+    let price_wei = u128::from_le_bytes(raw[pos..pos + 16].try_into().unwrap());
+    pos += 16;
+    let token = read_string(raw, &mut pos)?;
+    let pricing_type = *raw.get(pos).ok_or_else(|| anyhow!("truncated listing"))?;
+    pos += 1;
+    let period = read_u64(raw, &mut pos)?;
+    let active = *raw.get(pos).ok_or_else(|| anyhow!("truncated listing"))? != 0;
+    Ok(ListingRecord {
+        publisher_did,
+        file_id,
+        price_wei,
+        token,
+        pricing_type,
+        period,
+        active,
+    })
 }
 
 pub fn build_get_entitlement_payload(entitlement_id: &[u8; 32]) -> Vec<u8> {
@@ -223,6 +290,7 @@ pub fn status_from_byte(b: u8) -> EntitlementVerifyStatus {
         STATUS_WRONG_FILE => EntitlementVerifyStatus::WrongFile,
         STATUS_REVOKED => EntitlementVerifyStatus::Revoked,
         STATUS_WRONG_PK => EntitlementVerifyStatus::WrongPk,
+        STATUS_WRONG_LISTING => EntitlementVerifyStatus::WrongListing,
         _ => EntitlementVerifyStatus::RpcError(format!("unknown status {b}")),
     }
 }
@@ -306,6 +374,59 @@ impl EntitlementClient {
         }
     }
 
+    /// OP_VERIFY_LISTING: the entitlement is valid and for `listing_id`.
+    /// An all-zero `buyer_pk_hash` skips the key check.
+    pub async fn verify_listing(
+        &self,
+        entitlement_id: &[u8; 32],
+        buyer_did: &str,
+        listing_id: &str,
+        buyer_pk_hash: &[u8; 32],
+    ) -> EntitlementVerifyStatus {
+        let payload = build_verify_listing_payload(entitlement_id, buyer_did, listing_id, buyer_pk_hash);
+        match self.call_contract(payload).await {
+            Ok(bytes) if bytes.len() >= 2 && bytes[0] == 1 => status_from_byte(bytes[1]),
+            Ok(_) => EntitlementVerifyStatus::RpcError("malformed verify response".into()),
+            Err(e) => EntitlementVerifyStatus::RpcError(e.to_string()),
+        }
+    }
+
+    pub async fn get_listing(&self, listing_id: &str) -> Result<Option<ListingRecord>> {
+        let bytes = self.call_contract(build_get_listing_payload(listing_id)).await?;
+        if bytes.len() < 2 || bytes[0] != 1 {
+            return Ok(None);
+        }
+        decode_listing_record(&bytes[1..]).map(Some)
+    }
+
+    /// The check to use for access: the entitlement is valid for `listing_id`,
+    /// and that listing was created by `publisher_did` (for `file_id`, when
+    /// given). Anyone can create a listing under any id or for any file id,
+    /// so neither check alone is enough.
+    pub async fn verify_for_publisher(
+        &self,
+        entitlement_id: &[u8; 32],
+        buyer_did: &str,
+        listing_id: &str,
+        publisher_did: &str,
+        file_id: Option<&str>,
+        buyer_pk_hash: &[u8; 32],
+    ) -> EntitlementVerifyStatus {
+        let status = self
+            .verify_listing(entitlement_id, buyer_did, listing_id, buyer_pk_hash)
+            .await;
+        if !status.is_valid() {
+            return status;
+        }
+        match self.get_listing(listing_id).await {
+            Ok(Some(l)) if l.publisher_did == publisher_did && file_id.map_or(true, |f| l.file_id == f) => {
+                EntitlementVerifyStatus::Valid
+            }
+            Ok(_) => EntitlementVerifyStatus::WrongListing,
+            Err(e) => EntitlementVerifyStatus::RpcError(e.to_string()),
+        }
+    }
+
     pub async fn get_entitlement(
         &self,
         entitlement_id: &[u8; 32],
@@ -322,7 +443,7 @@ impl EntitlementClient {
         &self,
         listing_id: &str,
         file_id: &str,
-        price: u64,
+        price: u128,
         token: &str,
         pricing_type: u8,
         period: u64,
@@ -366,14 +487,21 @@ pub struct OnChainGrantCheck {
 pub async fn on_chain_content_grant(
     requester_did: &str,
     content_id_hex: &str,
+    publisher_did: &str,
     entitlement_id_hex: Option<&str>,
 ) -> Option<OnChainGrantCheck> {
     let client = EntitlementClient::from_env()?;
     if let Some(ent_hex) = entitlement_id_hex {
         if let Ok(ent_id) = parse_entitlement_id_hex(ent_hex) {
-            let pk_hash = [0u8; 32];
             let status = client
-                .verify(&ent_id, requester_did, content_id_hex, &pk_hash)
+                .verify_for_publisher(
+                    &ent_id,
+                    requester_did,
+                    &content_listing_id(content_id_hex),
+                    publisher_did,
+                    Some(content_id_hex),
+                    &[0u8; 32],
+                )
                 .await;
             if status.is_valid() {
                 return Some(OnChainGrantCheck {
@@ -412,6 +540,7 @@ pub async fn on_chain_content_grant(
 pub async fn on_chain_content_grant(
     _requester_did: &str,
     _content_id_hex: &str,
+    _publisher_did: &str,
     _entitlement_id_hex: Option<&str>,
 ) -> Option<OnChainGrantCheck> {
     None

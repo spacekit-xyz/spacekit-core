@@ -22,6 +22,8 @@ The messaging crate (`spacekit-messaging-node`) delivers quantum-resistant P2P m
 
 **User-paid fees** (not emission): messaging service fees in compute-node bonding curve default to **0.001 ASTRA** base — see `spacekit-compute-node/src/pricing/bonding_curve.rs`.
 
+**Paid channels** (not emission): sold in ASTRA through the `astra-entitlement-ledger` contract. The buyer pays the listing price straight to the publisher's address; the messaging node checks access with read-only calls (`OP_VERIFY_LISTING` + `OP_GET_LISTING`). ASTRA is the only currency; see [`PAYMENTS_AND_CURRENCY.md`](../../docs/PAYMENTS_AND_CURRENCY.md).
+
 ---
 
 ## Legacy references

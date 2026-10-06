@@ -6,7 +6,7 @@ ASTRA is SpaceKit's native L1 utility token. It is used to pay for network resou
 
 Three things ASTRA does:
 
-**Pays for network resources.** Smart contract executions, storage operations, messaging, identity operations — all of these consume ASTRA. The consumed ASTRA flows to the operators serving the relevant requests, paying them for the resources they provide.
+**Pays for network resources.** Smart contract executions, storage operations, messaging, identity operations — all of these consume ASTRA. Used gas is burned. Operators are paid for the resources they provide through service emission (below), not from the gas.
 
 **Secures the network.** Validators lock ASTRA as a security deposit when participating in consensus. The locked ASTRA is at risk: misbehavior (double-signing, prolonged unavailability, censorship) results in slashing. The stake itself does not earn yield — validators earn ASTRA by providing service while staked, not by holding the stake.
 
@@ -44,7 +44,7 @@ SWTCH Labs has raised equity capital ($3M+ at $55M+ valuation floor) from accred
 
 Third-party DeFi protocols built on SpaceKit may exist and may create yield products denominated in ASTRA. These are not SWTCH Labs products and the SpaceKit protocol does not endorse or guarantee them.
 
-**Not the same as SpaceKit Pay.** SpaceKit Pay is a separate primitive — non-custodial payment routing for AI service settlements in established stablecoins (USDC, USDT, DAI). SpaceKit Pay does not issue any token. ASTRA is the SpaceKit network's native utility token. The two serve different purposes. See [Relationship to SpaceKit Pay](#relationship-to-spacekit-pay) below.
+**Not one of several currencies.** ASTRA is the only currency on the SpaceKit network. Services, apps, content and channels are priced and paid in ASTRA. See [Paying for services and content](#paying-for-services-and-content) below.
 
 ## Supply
 
@@ -54,13 +54,13 @@ Third-party DeFi protocols built on SpaceKit may exist and may create yield prod
 | Decimals | 18 |
 | Atomic unit | 1 wei-ASTRA = 10⁻¹⁸ ASTRA |
 | Inflation | None |
-| Automatic burn | None |
+| Burn | Used gas only (no burn tied to fee volume) |
 
 The 2 billion cap is enforced at the protocol level. The protocol has no mechanism to create ASTRA beyond the cap. The supply does not inflate.
 
-ASTRA is emitted to operators through the **Service Reward Accumulator (SRA)**, which credits the **AstraRewards** on-chain contract per measured service. Emission follows a **4-year halving curve**: **200M ASTRA** in year 1, decaying toward an asymptotic **~1.15B** cumulative operator total under the 2B cap.
+ASTRA is emitted to operators through the **Service Reward Accumulator (SRA)**, which places rewards system calls at the start of a block. The node executes them natively and mints each operator's reward straight into its account balance, per measured service. Emission follows a **4-year halving curve**: **200M ASTRA** in year 1, decaying toward an asymptotic **~1.15B** cumulative operator total under the 2B cap.
 
-**Genesis treasury: 350M ASTRA (17.5%)** is minted at protocol INIT (not subject to halving). There is no bootstrap stake pool: nobody is given or lent ASTRA to stake, and nobody seeds markets. Validators stake only what they earned.
+**Genesis treasury: 350M ASTRA (17.5%)** is minted at protocol INIT to the on-chain treasury contract (not subject to halving). There is no bootstrap stake pool: nobody is given or lent ASTRA to stake, and nobody seeds markets. Validators stake only what they earned.
 
 Default annual category split: consensus **40%**, compute **30%**, storage **20%**, messaging **10%**. Governance may adjust shares within bounds; the **2B cap is not adjustable**.
 
@@ -99,22 +99,17 @@ Voting power is proportional to active validator stake. ASTRA held but not stake
 
 The governance mechanism — proposal format, voting period, quorum requirements, activation timing — is documented in the [governance specification](/docs/governance).
 
-## Relationship to SpaceKit Pay
+## Paying for services and content
 
-ASTRA and SpaceKit Pay are different primitives serving different purposes.
+ASTRA is the only currency on the SpaceKit network. A payment is an ASTRA transfer on the chain, proven by its transaction hash.
 
-**ASTRA** is the SpaceKit network's native utility token. It is consumed to pay for SpaceKit network resources (compute, storage, messaging, identity operations) and used to stake for validator participation. It is earned by operators running SpaceKit network nodes.
+- **Services.** A service names its price in ASTRA. The client pays with a chain transaction, and the service checks the hash (`POST /v1/payments/verify`) before serving.
+- **Apps, content and channels.** Sales go through the `astra-entitlement-ledger` contract. The buyer pays the listing price straight to the publisher's address; the ledger keeps nothing.
+- **Contract calls.** A paid call carries its fee as attached value. A contract can pay only from its own balance, never from its caller's.
 
-**SpaceKit Pay** is non-custodial payment routing for AI service settlements. It moves established stablecoins (USDC, USDT, DAI) atomically between AI service buyers and operators with a flat 5% treasury fee. It does not issue any token. It does not affect ASTRA.
+SpaceKit Pay, an earlier stablecoin payment router, was retired. See [`PAYMENTS_AND_CURRENCY.md`](../../docs/PAYMENTS_AND_CURRENCY.md).
 
-An operator running a compute node on the SpaceKit network might earn both: ASTRA for the network compute work (paid by the SpaceKit protocol via emission), and USDC (via SpaceKit Pay) for AI inference services delivered to buyers paying with USDC. These are two separate earning streams for two separate activities.
-
-A practical example: a contract on SpaceKit network calls an AI inference service.
-
-1. The contract uses SpaceKit Pay to pay the operator for the inference (USDC, atomic 95/5 split between operator and treasury). The operator's payout address on SpaceKit network receives 95% in USDC; the treasury receives 5% in USDC.
-2. Separately, the operator's compute node earns ASTRA for the gas consumed during the inference execution. This is paid by the SpaceKit protocol's emission mechanism for compute service.
-
-These don't double-count. The operator is paid for two different things — providing the AI inference service (paid by the buyer in USDC), and providing network compute resources (paid by the protocol in ASTRA).
+An operator can earn in two ways: emission for the network service its node provides (paid by the protocol), and ASTRA payments from buyers for services it sells. These don't double-count. They pay for two different things.
 
 ## ASTRA on secondary markets
 
@@ -126,7 +121,7 @@ Operators who have earned ASTRA through service may trade it on secondary market
 - Control secondary-market prices
 - Make forward-looking statements about ASTRA's market value
 
-If ASTRA appears on a secondary market, that's a result of operators trading their earned ASTRA. This is normal and expected for a utility token that has accumulated economic value through network growth — but it is not a SWTCH Labs activity.
+If ASTRA appears on a secondary market, that's a result of operators trading their earned ASTRA. SWTCH Labs does not operate, support or promote such trading, and makes no claim about ASTRA's price or value.
 
 ## Honest limitations
 
@@ -162,11 +157,11 @@ The [operator guide](/docs/operating-nodes) covers the operational specifics. Th
 
 - [Node operator guide](/docs/operating-nodes)
 - [Validator operations guide](/docs/validator-operations)
-- [SpaceKit Pay](/technology/payments)
+- [Payments and currency](../../docs/PAYMENTS_AND_CURRENCY.md)
 - [Governance specification](/docs/governance)
 - [Tokenomics technical specification v2.0](./SpaceKit_Tokenomics.md) (canonical reference)
 - [ASTRA emission schedule](./ASTRA_EMISSION.md)
-- [AstraRewards contract spec](./ASTRA_REWARDS_CONTRACT_SPEC.md)
+- [Rewards system calls spec](./ASTRA_REWARDS_CONTRACT_SPEC.md)
 - [Service Reward Accumulator spec](./SERVICE_REWARD_ACCUMULATOR_SPEC.md)
 - [What is SpaceKit?](/docs/what-is-spacekit) (network overview)
 

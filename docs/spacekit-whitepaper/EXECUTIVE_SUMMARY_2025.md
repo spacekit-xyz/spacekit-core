@@ -4,7 +4,9 @@
 > performance, and compliance claims below are not current SpaceKit
 > specifications. See [`SpaceKit-Whitepaper.md`](./SpaceKit-Whitepaper.md) and
 > [`../../economics/spacekit-tokenomics/`](../../economics/spacekit-tokenomics/)
-> for current material.
+> for current material. The 1.2B distribution below is superseded by the 2B
+> cap and operator service emission; ASTRA is the only currency (see
+> [`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md)).
 
 ## Complete Quantum-Resistant Blockchain Ecosystem - LIVE DEPLOYMENT
 
@@ -152,13 +154,14 @@ Result: Fair distribution based on actual network value creation
   - **5% Consensus Participation**: Validator operations
   - **5% Network Security**: Security auditing and reporting
 
-### **Sigmoid Bonding Curve Economics**
+### **Currency and Payments (current)**
 
-**Dynamic Price Discovery**:
-- **Automatic Market Balancing**: Price adjusts to actual network demand
-- **Fair Value Discovery**: Merit-based pricing without speculation
-- **Growth Incentives**: Early contributors receive higher rewards
-- **Sustainable Economics**: Long-term value aligned with network utility
+The bonding-curve pricing model described in the 2025 draft is not part of the network. Current facts:
+- **One Currency**: ASTRA, held as native balances on the SpaceKit chain, is the only currency; it is a utility token for gas, staking, governance and paying for services, not a stablecoin
+- **No Price Mechanism**: The protocol sets no ASTRA price; there are no stablecoin rails, exchange rates or oracles
+- **Earned by Service**: Operators earn newly emitted ASTRA for measured service; staking alone pays no yield
+- **Marketplace Sales**: Paid in ASTRA via the `astra-entitlement-ledger` contract, straight to the publisher
+- See [`../PAYMENTS_AND_CURRENCY.md`](../PAYMENTS_AND_CURRENCY.md)
 
 ### **Investment Highlights**
 

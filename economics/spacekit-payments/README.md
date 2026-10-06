@@ -1,143 +1,100 @@
 # spacekit-payments
 
-Unified payment layer for the SpaceKit platform. Normalizes three distinct payment rails — **x402 (USDC on Base)**, **aUSD vault credits**, and **native ASTRA** — into a single `Credit` type that can be applied to SpacekitVM balances.
+Payments for the SpaceKit platform, in **ASTRA only**.
 
-TODO: Remove the Ausd & Ausd Vault modules and the associated code. We are atomic and should not need to track balances.
+ASTRA is SpaceKit's one currency. It exists only as native balances on the SpaceKit chain, in wei (18 decimals). This crate prices, verifies and routes payments in ASTRA. There are no USD-denominated balances, no stablecoin rails (x402/USDC, aUSD) and no exchange rates.
 
-## Architecture
+## How a payment works
 
 ```
-┌──────────────┐  ┌───────────────┐  ┌──────────────────┐
-│  x402 (USDC) │  │  aUSD Vault   │  │  Native ASTRA    │
-│  EIP-3009    │  │  EIP-191 sig  │  │  In-VM transfer  │
-└──────┬───────┘  └───────┬───────┘  └────────┬─────────┘
-       │                  │                   │
-       ▼                  ▼                   ▼
-  ┌────────────────────────────────────────────────┐
-  │              PaymentReceipt                    │
-  │   (tx_hash, amount, asset, network, timestamp) │
-  └──────────────────────┬─────────────────────────┘
-                         │
-                         ▼
-  ┌────────────────────────────────────────────────┐
-  │              FeeRouter                         │
-  │   verify → deduct network fee → convert to     │
-  │   ASTRA → apply credit via CreditApplier       │
-  └──────────────────────┬─────────────────────────┘
-                         │
-              ┌──────────┴──────────┐
-              ▼                     ▼
-     ┌──────────────┐     ┌──────────────┐
-     │  Beneficiary │     │   Treasury   │
-     │  VM Balance  │     │  Fee Collect │
-     └──────────────┘     └──────────────┘
+payer ──ASTRA transfer (chain tx)──▶ payee address
+                 │
+                 ▼  tx hash
+        PaymentVerifier ── looks the tx up on the chain (ChainLookup):
+                           success? right payee? enough value? not used before?
+                 │
+                 ▼
+          PaymentReceipt { tx_hash, from, to, amount_wei, block_number, settled_at }
 ```
+
+A payment is proven by its transaction hash. Nothing is taken on the payer's word.
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `types` | Core types: `PaymentNetwork`, `PaymentAsset`, `PaymentRequirement`, `PaymentReceipt`, `Credit`, `PaymentConfig` |
-| `fee_router` | `FeeRouter` — converts verified receipts into ASTRA VM credits with configurable network fee (basis points) and treasury collection |
-| `x402` | HTTP 402 Payment Required protocol: `X402Response` builder, `X402PaymentProof` parsing, facilitator relay verification |
-| `ausd` | `AusdVault` — in-memory aUSD balance tracking with nonce-based replay protection and charge-to-receipt conversion |
-| `middleware` | Warp filter for x402 payment gating on HTTP routes (feature: `warp-middleware`) |
+| `types` | `PaymentAsset` (ASTRA), `PaymentRequirement`, `PaymentReceipt`, `Credit`, `PaymentConfig`; exact decimal helpers `parse_astra`, `format_astra`, `parse_wei` |
+| `verify` | `PaymentVerifier` checks a payment against the chain through the `ChainLookup` trait (the compute node implements it for its own chain) |
+| `fee_router` | `FeeRouter` splits an ASTRA payment into the payee's share and the network fee (basis points) and hands both to a `CreditApplier`, which must move them as chain transfers (never mint) |
+| `intent` | ASTRA actions in signed intents: contract value (`value_astra`), transfers, and the `max_value_wei` cap; other assets are refused |
+| `middleware` | Warp filter for pay-per-request routes: `402` with an ASTRA price, then `X-PAYMENT: <tx hash>` (feature `warp-middleware`) |
 
 ## Features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `x402` | yes | Enables `reqwest`-based facilitator relay for x402 payment verification |
-| `warp-middleware` | yes | Enables the `middleware` module with warp filters for payment-gated routes |
+| `warp-middleware` | yes | Enables the `middleware` module |
 
 ## Usage
-
-Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
 spacekit-payments = { path = "../spacekit-payments" }
 ```
 
-### FeeRouter
+### Verify a payment
 
 ```rust
-use spacekit_payments::{FeeRouter, PaymentConfig, PaymentReceipt, PaymentAsset, PaymentNetwork};
-use spacekit_payments::fee_router::CreditApplier;
+use spacekit_payments::{parse_astra, PaymentAsset, PaymentRequirement, PaymentVerifier};
 
-struct MyApplier;
-impl CreditApplier for MyApplier {
-    fn apply_credit(&self, credit: &spacekit_payments::Credit) -> anyhow::Result<()> {
-        println!("Credit {} ASTRA to {}", credit.amount_astra, credit.beneficiary_did);
-        Ok(())
-    }
-}
-
-let config = PaymentConfig {
-    pay_to_address: "0x...".to_string(),
-    testnet: true,
-    network_fee_bps: 25, // 0.25%
-    usdc_to_astra_rate: 1_000_000.0,
-    ..Default::default()
+// `chain` implements `ChainLookup` (e.g. the compute node's `SwtchvmNode`).
+let verifier = PaymentVerifier::new(chain).with_min_confirmations(2);
+let requirement = PaymentRequirement {
+    amount_wei: parse_astra("5")?.to_string(),
+    asset: PaymentAsset::ASTRA,
+    pay_to: "0x…payee".to_string(),
+    chain_id: None,
+    description: Some("Studio notes, 30 days".to_string()),
 };
-
-let router = FeeRouter::new(config, Arc::new(MyApplier));
+let receipt = verifier.verify(&tx_hash, &requirement)?; // fails if reused
 ```
 
-### aUSD Vault
+The set of used transactions is in memory. A service that grants something lasting for a payment must also store the transaction hash with the grant, so a restart cannot accept the same payment twice.
+
+### Pay-per-request route (Warp)
 
 ```rust
-use spacekit_payments::AusdVault;
-use spacekit_payments::ausd::VaultChargeRequest;
-
-let vault = AusdVault::new();
-vault.credit("did:spacekit:alice", 10.0).await;
-
-let req = VaultChargeRequest {
-    user_did: "did:spacekit:alice".to_string(),
-    amount_ausd: "3.50".to_string(),
-    nonce: 1,
-    signature: "0x...".to_string(),
-    description: Some("Contract execution".to_string()),
-};
-let receipt = vault.process_charge(&req).await?;
-```
-
-### x402 Payment Gate (Warp)
-
-```rust
-use spacekit_payments::middleware::{require_payment, PaymentGate, handle_payment_rejection};
+use spacekit_payments::middleware::{handle_payment_rejection, require_payment, PaymentGate};
 
 let gate = PaymentGate {
-    price_usdc: "0.01".to_string(),
+    price_wei: parse_astra("0.01")?,
+    pay_to: "0x…payee".to_string(),
+    chain_id: Some("spacekit-mainnet".to_string()),
     description: "Contract execution fee".to_string(),
-    beneficiary_did: "did:spacekit:contract:xyz".to_string(),
 };
 
 let route = warp::path("execute")
-    .and(require_payment(gate, config, fee_router))
-    .map(|credit| { /* credit verified, proceed */ });
+    .and(require_payment(gate, verifier.clone()))
+    .map(|receipt| { /* paid by receipt.tx_hash */ })
+    .recover(handle_payment_rejection);
 ```
 
-## Compute Node Integration
-
-The compute node exposes these payment endpoints:
+## Compute node endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/payments/config` | GET | Returns accepted payment methods and network configuration |
-| `/v1/payments/verify` | POST | Verify an x402 receipt and record the credit |
-| `/v1/payments/charge-ausd` | POST | Deduct aUSD from a user's vault balance (nonce-protected) |
-| `/v1/payments/credit-ausd` | POST | Credit a user's aUSD balance (from website deposit bridge) |
-| `/v1/payments/balance-ausd` | GET | Query a user's aUSD vault balance |
+| `/v1/payments/config` | GET | Accepted asset (ASTRA, 18 decimals), chain id, network fee |
+| `/v1/payments/verify` | POST | `{ tx_hash, pay_to, amount_wei, scope? }`: verify an ASTRA payment once; content and channel scopes are forwarded to the storage node's settlement inbox |
+| `/v1/tx/{hash}` | GET | The transaction: `from`, `to`, `value_wei`, `success`, `confirmations` |
+| `/v1/execute` | POST | Validate a signed intent (ASTRA only); lists the chain transactions it needs |
 
 ## Tests
 
 ```bash
-cargo test
+cargo test -p spacekit-payments
 ```
 
-7 tests covering fee routing (USDC + ASTRA), aUSD vault charges, nonce replay rejection, insufficient balance, and x402 response serialization.
+Covers exact ASTRA decimal parsing, payment verification (payee, amount, failed transactions, confirmations, replay), fee routing and intent limits. The compute node's tests check verification against real mined blocks.
 
 ## License
 

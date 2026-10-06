@@ -12,14 +12,16 @@
 |-----------|-----------|-----------|
 | WI1 Fact-based `content view` + access evaluation | **Done** | HTTP API parity if needed |
 | WI2 `PaymentRequired` grant lookup | **Partial** — local grants + entitlement + AppLicenseNFT opcodes | Per-content license contract deploy in prod |
-| WI3 `subscribe` | **Partial** — payment verify + local grant | Channel `OP_PURCHASE` + live router auto-settle |
-| WI4 Paid PPV flow | **Partial (Sprint 3)** — listener, compute→storage webhook (`POST /api/content/settlements`), `/v1/payments/verify` | Payment-router native push; no manual `record-payment` in prod |
+| WI3 `subscribe` | **Partial** — payment verify + local grant | Channel `OP_PURCHASE` + auto-settle from on-chain ASTRA payments |
+| WI4 Paid PPV flow | **Partial (Sprint 3)** — listener, compute→storage webhook (`POST /api/content/settlements`), `/v1/payments/verify` | No manual `record-payment` in prod |
 | WI5 Publish listing | **Partial** — `OP_CREATE_LISTING` on publish when `SPACEKIT_ENTITLEMENT_CONTRACT_ID` set | Listing sync if price changes post-publish |
-| Polish | **Done** — ASTRA, SPHINCS+ on publish, channel facts | Federation soak; live sign-off with real Pay |
+| Polish | **Done** — ASTRA, SPHINCS+ on publish, channel facts | Federation soak; live sign-off with real ASTRA payments |
 
 **Modules:** `content_grants.rs`, `content_access.rs`, `content_entitlement.rs`, `content_payment.rs`, `content_settlement.rs`; CLI: `content_integration.rs`, `content_monetization.rs`. Tests: `content_sprint2` (15), `content_e2e_soak` (14). CLI soak: [content-monetization-soak.md](documentation/guides/content-monetization-soak.md).
 
-**Production flow (paid PPV):** `publish --pricing pay_per_view` (+ entitlement env) → `content view --pay` or `content pay` → pay publisher → `content settle` (or `pay --tx-hash --amount`) → `OP_PURCHASE` + local grant → `view --output`.
+**Production flow (paid PPV):** `publish --pricing pay_per_view` (+ entitlement env) → `content view --pay` or `content pay` → pay publisher in ASTRA → `content settle` (or `pay --tx-hash --amount`) → `OP_PURCHASE` + local grant → `view --output`.
+
+**Payments.** Paid content and channels are priced and paid in ASTRA, the network's only currency, through the `astra-entitlement-ledger` contract: purchase and renewal pay the listing price straight to the publisher's address, and the ledger keeps no funds. A payment is proven by its ASTRA transaction hash. Compute `POST /v1/payments/verify` checks payee, amount and success, then forwards `content:` / `channel:` scopes to the storage settlement inbox (`POST /api/content/settlements`) with `amount_wei`, asset `ASTRA` and `payer_did`. SpaceKit Pay is retired (see [docs/PAYMENTS_AND_CURRENCY.md](../../docs/PAYMENTS_AND_CURRENCY.md)).
 
 **Dev fallback:** `record-payment` + `access --payment-ref` (no on-chain purchase).
 
@@ -57,7 +59,7 @@ The completion gap is in three places:
 
 Three smaller items worth correcting as part of completion:
 
-- **Currency string discrepancy:** CLI help text says "ASTRA" but code writes "SWTCHX" as the currency parameter. Should be "ASTRA" consistently (or whatever the canonical token name is across the system).
+- **Currency string discrepancy:** CLI help text says "ASTRA" but code writes "SWTCHX" as the currency parameter. Should be "ASTRA" consistently; ASTRA is the only currency.
 - **Placeholder signatures:** CLI-published facts use placeholder SPHINCS+ signatures, which may be rejected by strict-mode storage nodes. Real signatures should be used.
 - **CLI documentation drift:** The CLI says "free or pay_per_view" but the docs reference "subscription" and "mixed" as additional pricing models. The implementation handles `free` and `pay_per_view`; subscription and mixed need to be added.
 
@@ -67,7 +69,7 @@ The goal is to make `spacekit content publish` (and the related surface) functio
 
 - A user can publish content with pricing free, pay-per-view, subscription, or mixed
 - A consumer can view free content directly
-- A consumer can view paid content after paying via SpaceKit Pay
+- A consumer can view paid content after paying in ASTRA
 - A consumer can subscribe to a channel and view all content within it
 - Channel-level subscription state is tracked on-chain via the entitlement-ledger
 - Per-content payment is tracked on-chain via AppLicenseNFT or similar
@@ -83,9 +85,9 @@ The completion plan reuses existing standard library contracts. Each piece of th
 | Channel registry | (none required; channels are FactPackage records) | Persist channel facts on `create-channel` |
 | Per-content registration | AppStore (`app-store/appstore.rs`) | Optional: register paid content as "apps" for discoverability |
 | License-to-view (pay-per-view) | AppLicenseNFT (`app-store/app_license_nft.rs`) | Mint per content_id on payment |
-| Channel subscription | astra-entitlement-ledger (`marketplace/`) | Record subscription with expiration |
-| Payment routing | astra-payment-router (`payments/`) | Route payments for pay-per-view and subscription |
-| Payment escrow | astra-escrow (`payments/`) | Hold payment until grant is recorded |
+| Channel subscription | astra-entitlement-ledger (`marketplace/`) | Record subscription with expiration; `OP_PURCHASE` / renew pays the price in ASTRA straight to the publisher |
+| Payment routing | astra-payment-router (`payments/`) | Not needed for listing purchases (the ledger pays the publisher directly); available for ASTRA splits |
+| Payment escrow | astra-escrow (`payments/`) | Optional hold/release/refund record for ASTRA payments until the grant is recorded |
 | Access checks | astra-access-control + fact_storage policy evaluation | Evaluate against on-chain grant state |
 
 The completion is about wiring these together, not building new contracts.
@@ -176,8 +178,8 @@ The `on_chain_lookup::has_active_license_for_content` function:
 
 1. Look up the channel fact (channel pricing, subscription terms)
 2. If free channel: record entitlement directly via entitlement-ledger (no payment)
-3. If paid channel: initiate payment via astra-payment-router → astra-escrow
-4. On payment confirmation: record entitlement via entitlement-ledger with appropriate expiration
+3. If paid channel: pay the channel price in ASTRA through the entitlement ledger (`OP_PURCHASE`, which pays the publisher directly)
+4. On payment confirmation (verified by ASTRA transaction hash): record entitlement via entitlement-ledger with appropriate expiration
 5. Optionally: notify channel publisher of new subscriber
 
 **Specific flow:**
@@ -190,9 +192,9 @@ spacekit content subscribe --channel <channel_did> [--tier <tier_name>]
 # 1. Look up channel fact
 # 2. Determine pricing (from channel metadata)
 # 3. If paid: 
-#    - Request payment quote from astra-payment-router
-#    - Initiate payment with appropriate metadata
-#    - Wait for payment confirmation
+#    - Read the listing price (ASTRA wei) from the entitlement ledger
+#    - Pay it in ASTRA (OP_PURCHASE pays the publisher's address)
+#    - Wait for payment confirmation (tx hash, /v1/payments/verify)
 # 4. On payment confirmation (or for free channels):
 #    - Call astra-entitlement-ledger.grant_entitlement(
 #        recipient_did: requester_did,
@@ -331,7 +333,7 @@ params.insert("currency".to_string(), "ASTRA".to_string());
 ```rust
 // Add to PaymentRequired parameters
 params.insert("on_network".to_string(), "spacekit".to_string());
-// (or "ethereum", "base", etc., for cross-network pricing)
+// Always "spacekit": content is priced and paid in ASTRA on the SpaceKit chain only
 ```
 
 **Fix 3: Add tier/license_type metadata.**
@@ -359,8 +361,8 @@ This delivers: free content access works correctly; paid content correctly denie
 
 **Phase 2 (additional 3 weeks):**
 
-4. Complete paid subscription via SpaceKit Pay integration
-5. Add `content access` for pay-per-view via SpaceKit Pay
+4. Complete paid subscription with ASTRA payments through the entitlement ledger
+5. Add `content access` for pay-per-view with ASTRA payments
 6. Add `content renew` for renewable subscriptions
 7. Currency string fix and other corrections
 
@@ -386,12 +388,9 @@ Recommendation: in-fact for v1 (simpler), with optional AppStore registration fo
 
 **Decision 3: Currency display vs. underlying token.**
 
-The CLI currently mismatches (says "ASTRA" but writes "SWTCHX"). The underlying token name should be canonical. Options:
-- Both ASTRA and SWTCHX are accepted (multi-currency)
-- ASTRA is the canonical name; SWTCHX is a historical artifact to remove
-- ASTRA is the network-native fee token; SWTCHX is a separate stable token
+The CLI currently mismatches (says "ASTRA" but writes "SWTCHX"). The underlying token name should be canonical.
 
-Recommendation: Resolve this question explicitly. The CLI and code should be consistent.
+Resolved: ASTRA is the only currency on the network; SWTCHX is a historical artifact to remove. There is no second or stable token. The CLI and code should both say ASTRA.
 
 **Decision 4: Subscription cancellation.**
 
@@ -418,12 +417,12 @@ Combined timeline for the completion work:
 - Free channel subscription scaffold
 
 **Sprint 2 (Weeks 4-6): Paid flow completion**
-- Paid subscription via SpaceKit Pay
+- Paid subscription in ASTRA via the entitlement ledger
 - `content access` for pay-per-view
 - `content renew` for renewable subscriptions
 
 **Sprint 3 (Theme A): Production-ready monetization**
-- Live SpaceKit Pay: `POST /v1/payments/verify` from `content settle` / `content pay --tx-hash`
+- Live ASTRA payments: `POST /v1/payments/verify` (by ASTRA tx hash) from `content settle` / `content pay --tx-hash`
 - `OP_PURCHASE` via `call_contract_raw` + `content purchase` / auto on settle
 - Pending purchases + settlement inbox (`content_settlement.rs`)
 - **Done:** astra-escrow (`content_escrow.rs`) — OP_CREATE on pay quote, OP_RELEASE on grant, OP_REFUND on `complete_pay_flow` failure + local `refund_on_grant_failure`
@@ -440,7 +439,7 @@ This completion work coordinates with:
 
 **Growformer launch.** Growformer is **not** distributed as downloadable content. See [GROWFORMER_SPEC.md](GROWFORMER_SPEC.md) (library embedded in the `spacekit` CLI, feature entitlements). General publish/view/soak flows for other content types are in [CONTENT_PUBLISHING.md](CONTENT_PUBLISHING.md).
 
-**SpaceKit Pay integration.** The completion is one of the larger SpaceKit Pay integration projects. Successful completion validates the SpaceKit Pay routing for general content purchase flows.
+**ASTRA payments.** SpaceKit Pay is retired. The completion uses ASTRA payments on the SpaceKit chain through the entitlement ledger, verified by transaction hash. Successful completion validates that path for general content purchase flows.
 
 **Security audit.** The audit currently in progress should review the completion as part of the launch readiness. The access policy evaluation, payment verification, and on-chain grant logic are security-critical paths.
 

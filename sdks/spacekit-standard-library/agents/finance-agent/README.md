@@ -1,7 +1,7 @@
 # SpaceKit Financial Analysis Agent
 
 ## Overview
-The **Financial Analysis Agent** is a SpaceKit/Growformer smart contract that exposes a compact binary protocol for financial computation. It mirrors the architectural patterns of RouteKit — routing, vault metering, remote storage refs, and Growformer‑backed reasoning — but specializes in **market data enrichment**, **risk analysis**, **factor modeling**, **sentiment scoring**, and **backtest‑style scenario evaluation**.
+The **Financial Analysis Agent** is a SpaceKit/Growformer smart contract that exposes a compact binary protocol for financial computation. It mirrors the architectural patterns of RouteKit — routing, ASTRA fees, remote storage refs, and Growformer‑backed reasoning — but specializes in **market data enrichment**, **risk analysis**, **factor modeling**, **sentiment scoring**, and **backtest‑style scenario evaluation**.
 
 This agent is designed as a **foundation layer** for higher‑order financial agents, dashboards, quant pipelines, and automated risk monitors.
 
@@ -41,19 +41,16 @@ All messages follow the same pattern as RouteKit:
 
 ---
 
-## 💰 Vault Costs
-Each opcode charges the caller’s vault:
+## 💰 Fees (ASTRA)
+Each opcode requires its fee in native ASTRA, attached to the call. `collect_fee` refuses the call if less is attached and forwards everything attached to the network treasury (`0x…0004`):
 
-- Market snapshot → `COST_DATA`
-- Risk metrics → `COST_RISK`
-- Factor exposure → `COST_FACTOR`
-- Sentiment signal → `COST_SENTIMENT`
-- Backtest query → `COST_BACKTEST`
+- Market snapshot → `COST_DATA` (150 µASTRA)
+- Risk metrics → `COST_RISK` (400 µASTRA)
+- Factor exposure → `COST_FACTOR` (300 µASTRA)
+- Sentiment signal → `COST_SENTIMENT` (350 µASTRA)
+- Backtest query → `COST_BACKTEST` (600 µASTRA)
 
-This mirrors RouteKit’s economic model:
-
-> “`payment_vault_charge(COST_LOCAL, beneficiary().as_str())?;`”  
-> “`payment_vault_charge(COST_SEARCH_AND_LOCAL, ...)`”
+This mirrors RouteKit: `collect_fee(COST_DATA, &TREASURY_ADDRESS)?;`
 
 ---
 

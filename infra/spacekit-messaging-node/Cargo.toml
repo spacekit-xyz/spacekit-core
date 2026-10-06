@@ -22,6 +22,9 @@ path = "src/bin/http_gateway.rs"
 required-features = ["standalone"]
 
 [dependencies]
+# Node identity: k256 keys and chain-style addresses (did:spacekit:<address>)
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
 # Core SpaceKit functionality
 spacekit-primitives = { path = "../../foundation/spacekit-primitives" }
 

@@ -24,6 +24,14 @@
         "import": "./dist/contracts/index.js",
         "types": "./dist/contracts/index.d.ts"
       },
+      "./chain": {
+        "import": "./dist/chain/index.js",
+        "types": "./dist/chain/index.d.ts"
+      },
+      "./messaging": {
+        "import": "./dist/messaging/index.js",
+        "types": "./dist/messaging/index.d.ts"
+      },
       "./platform": {
         "import": "./dist/platform.js",
         "types": "./dist/platform.d.ts"
@@ -77,6 +85,8 @@
     ],
     "dependencies": {
       "@mlc-ai/web-llm": "^0.2.80",
+      "@noble/ciphers": "^1.3.0",
+      "@noble/curves": "^1.9.7",
       "@noble/ed25519": "^2.3.0",
       "@noble/hashes": "^1.5.0",
       "buffer": "^6.0.3",
@@ -93,7 +103,7 @@
       "build": "tsc -p tsconfig.json && npm run copy:assets",
       "copy:assets": "mkdir -p dist/wasm",
       "typecheck": "tsc -p tsconfig.json --noEmit",
-      "test": "tsc -p tsconfig.json && node --test dist/*.test.js dist/spacetime/*.test.js dist/vm/*.test.js",
+      "test": "tsc -p tsconfig.json && node --test dist/*.test.js dist/spacetime/*.test.js dist/vm/*.test.js dist/messaging/*.test.js dist/chain/*.test.js",
       "pq:wasm": "bash scripts/build-sphincs-wasm.sh",
       "prepublishOnly": "npm run build",
       "start": "npm run build && node dist/entry-node.js",

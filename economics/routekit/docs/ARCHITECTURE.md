@@ -6,6 +6,8 @@
 **Authors:** swtch labs  
 **Scope:** Full system architecture, component design, data flows, interfaces, and deployment topology for the TradingKit trading terminal — a vertically integrated AI-powered trading terminal built on RouteKit (swtch.ai) and the SpaceKit network (spacekit.xyz).
 
+> **Settlement scope (October 2026).** ASTRA is the only currency on the SpaceKit network. Intents settled on SpaceKit (`POST /v1/execute`) carry ASTRA wei only (`value_astra`, `max_fee_astra`, constraint `max_value_wei`); the compute node validates them and lists the chain transactions to sign, and moves nothing itself. Vault charges and non-ASTRA transfers are refused. The trades of external assets (ETH, BTC, USDC and others) in this document execute on external chains (Ethereum, BSC, Base); SpaceKit holds and settles no asset other than ASTRA. Market prices and USD valuations shown in the terminal are external market data for display, not balances on SpaceKit.
+
 ---
 
 ## Table of contents
@@ -298,7 +300,7 @@ RULES:
    allowed_venues. These are set by the system.
 5. venue_hint is advisory — you may suggest a venue, but the system
    may route differently for better execution.
-6. Express uncertainty as conservative constraints (low max_notional_usd,
+6. Express uncertainty as conservative constraints (low max_value_wei,
    tight min_amount_out), not as hedged prose.
 7. Always explain WHY in rationale — cite actual values from context
    (RSI reading, price level, portfolio weight, news sentiment score).
@@ -678,7 +680,7 @@ spacekit.simulate(draft)
   ├── fetch live quotes ─────────────────────────▶ price feed API
   │   ◄──────────────────────────────── quotes ───┤
   ├── simulate actions in WASM VM
-  └── check constraints (slippage, notional)
+  └── check constraints (slippage, max value)
         │
         ▼
 SimulationResult shown to user
@@ -932,7 +934,7 @@ async function establishSession(relayUrl: string): Promise<SecureSession> {
 User configures agent limits in terminal UI:
   Allowed assets:  ETH, BTC, USDC
   Allowed actions: swap only
-  Max per intent:  $500 notional
+  Max per intent:  value cap in wei (max_value_wei; ASTRA wei on SpaceKit)
   Max per hour:    10 intents
   Duration:        7 days
           │
@@ -969,8 +971,8 @@ fn verify_agent_scope(scope: &AgentScope, intent: &Intent) -> Result<()> {
         }
     }
 
-    if let Some(max_notional) = scope.max_notional_usd {
-        require!(intent.estimated_notional_usd()? <= max_notional,
+    if let Some(max_value) = scope.max_value_wei {
+        require!(intent.total_value_wei()? <= max_value,
                  ErrorCode::AgentScopeExceeded);
     }
 
@@ -1045,7 +1047,7 @@ Multi-device safety: the Compute Node issues nonces with an atomic counter. Devi
 | `AGENT_SCOPE_EXCEEDED` | Contract | Action exceeds agent grant | Expand scope or sign directly |
 | `AGENT_EXPIRED` | Contract | Agent scope grant expired | Re-grant scope |
 | `CONSTRAINT_SLIPPAGE` | Client / Contract | Slippage exceeded tolerance | Widen tolerance or retry |
-| `CONSTRAINT_NOTIONAL` | Client / Contract | Notional cap exceeded | Reduce size |
+| `CONSTRAINT_NOTIONAL` | Client / Contract | Value cap (`max_value_wei`) exceeded | Reduce size |
 | `RELAY_UNAVAILABLE` | Client | Relay unreachable, direct submit eligible | User confirms direct submit |
 | `RELAY_REQUIRED` | Client | Bridge intent, relay required | Wait for relay recovery |
 | `PROVIDER_DEGRADED` | Relay | Provider degraded, traffic shifted | Automatic — no user action |

@@ -17,7 +17,7 @@
  * 4. `uploadEnvelope(baseUrl, ownerDid, ownerPubkeyHex, envelopeBytes)` → fileId.
  */
 
-import { bytesToHex, hexToBytes } from "./storage";
+import { bytesToHex, hexToBytes } from "./storage.js";
 import { gcm } from "@noble/ciphers/aes";
 import { sha256 } from "@noble/hashes/sha256";
 

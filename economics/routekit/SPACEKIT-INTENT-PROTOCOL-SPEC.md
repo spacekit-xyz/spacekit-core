@@ -6,6 +6,8 @@
 **Scope:** Intent schema, authorization model, lifecycle, relay, on-chain execution, quantum-safe transport, and nonce management.  
 **Out of scope:** Tokenomics, governance, cross-chain bridge implementation details.
 
+> **Settlement scope (October 2026).** On the SpaceKit network, ASTRA is the only currency. SpaceKit intents (`POST /v1/execute`) carry ASTRA wei only (`value_astra`, `max_fee_astra`, constraint `max_value_wei`); the compute node validates them and lists the chain transactions the actor must sign, and moves nothing itself. Vault charges and non-ASTRA transfers are refused. The swaps, bridges and approvals of external assets (ETH, USDC and other tokens on Ethereum, BSC, Base) described below are intents executed on those external chains. SpaceKit itself settles only in ASTRA and holds no other asset.
+
 **Changelog v0.1 → v0.2**
 - Resolved: Nonce management via SpaceKit Compute Node on Mainnet (§3.1, §11)
 - Resolved: `venue_hint` documented as strictly advisory (§3.4.1)
@@ -178,9 +180,10 @@ interface Constraints {
   // e.g. ["uniswap-v3", "curve", "1inch"]
   allowed_venues:      string[];
 
-  // Maximum notional value of the entire intent in USD.
-  // Intent rejected if simulation shows total execution value exceeds this.
-  max_notional_usd?:   number;
+  // Maximum total value the intent may move, as a decimal string in wei.
+  // On SpaceKit this is ASTRA wei; on an external chain, that chain's native asset in wei.
+  // No USD conversion. Intent rejected if simulation shows total execution value exceeds this.
+  max_value_wei?:      string;
 
   // Minimum output amount for the overall intent, in the output asset's base unit.
   // Used as a final backstop in addition to per-action min_amount_out.
@@ -190,7 +193,7 @@ interface Constraints {
 
 ### 3.4 Actions
 
-All `amount` and value fields are decimal strings (e.g. `"1000000"` for 1 USDC with 6 decimals) to avoid floating-point issues across languages.
+All `amount` and value fields are decimal strings in the asset's base unit (e.g. `"1000000000000000000"` for 1 ASTRA, 18 decimals; on an external chain, `"1000000"` for 1 USDC with 6 decimals) to avoid floating-point issues across languages. On SpaceKit, the only asset is ASTRA.
 
 ```typescript
 type Action =
@@ -318,7 +321,7 @@ pub struct AgentScope {
     pub actor_id:        Address,        // Granting user
     pub allowed_assets:  Vec<AssetId>,   // Empty = no asset restriction
     pub allowed_actions: Vec<ActionType>,// e.g. [Swap, Approve]
-    pub max_notional_usd:Option<u64>,    // Per-intent notional cap (USD, cents)
+    pub max_value_wei:   Option<u128>,   // Per-intent value cap in wei (ASTRA wei on SpaceKit)
     pub max_frequency:   Option<u32>,    // Max intents per hour
     pub expiry:          u64,            // Unix timestamp
     pub policy_hash:     Option<[u8;32]>,// Optional: hash of an off-chain policy doc
@@ -333,7 +336,7 @@ pub struct AgentScope {
 4. For each action in `intent.actions`:
    - Action type is in `allowed_actions`.
    - All assets involved are in `allowed_assets` (or `allowed_assets` is empty).
-5. Check `intent.constraints.max_notional_usd <= scope.max_notional_usd` (if scope sets a cap).
+5. Check `intent.constraints.max_value_wei <= scope.max_value_wei` (if scope sets a cap).
 6. Check frequency: intents from this agent in the last hour < `max_frequency`.
 7. All checks pass → proceed to action execution. Any failure → revert.
 
@@ -432,7 +435,7 @@ The WebLLM instance is initialised with a system prompt that:
 - Prohibits producing `actor`, `agent`, `nonce`, `expiry`, or signature-related fields.
 - Prohibits producing `constraints.allowed_venues` — venue policy is a user decision. See §3.4.1.
 - `venue_hint` may be produced if the user explicitly mentions a venue preference.
-- Instructs the model to express uncertainty as a conservative `min_amount_out` or low `max_notional_usd`, not as ambiguous prose.
+- Instructs the model to express uncertainty as a conservative `min_amount_out` or low `max_value_wei`, not as ambiguous prose.
 - Requires `rationale` to explain *why* the proposed action makes sense given the user's context, not just *what* it does.
 - All model I/O within the browser is processed locally. No content from the LLM context or output is transmitted to the relay or any external service.
 
@@ -453,7 +456,7 @@ User context / natural language request
                     [WASM VM Simulation]
                      ├─ fetch live quotes (price service)
                      ├─ simulate each action in order
-                     ├─ check constraints (slippage, notional)
+                     ├─ check constraints (slippage, max value)
                      └─ produce SimulationResult
                            │
                     present to user:
@@ -674,7 +677,7 @@ Consistent error codes across client, relay, and contract allow the UI to displa
 | `AGENT_EXPIRED` | Contract | Agent scope grant has expired | User must re-grant scope |
 | `CONSTRAINT_SLIPPAGE` | Client (sim) / Contract | Slippage exceeds `max_slippage_bps` | Widen slippage or retry at better price |
 | `CONSTRAINT_GAS` | Relay | Estimated gas exceeds `max_gas_gwei` | Raise gas limit or wait for lower gas |
-| `CONSTRAINT_NOTIONAL` | Client (sim) / Contract | Total value exceeds `max_notional_usd` | Reduce size or raise notional cap |
+| `CONSTRAINT_NOTIONAL` | Client (sim) / Contract | Total value exceeds `max_value_wei` | Reduce size or raise the value cap |
 | `VENUE_NOT_ALLOWED` | Contract | Chosen venue not in `allowed_venues` | Update venue list or remove restriction |
 | `CHAIN_UNSUPPORTED` | Relay | Target chain not supported | Check supported chain list |
 | `SIMULATION_FAILED` | Client | Simulation could not produce a result | Retry; may indicate stale quotes |

@@ -13,6 +13,7 @@ mod full_client;
 mod growformer_entitlement;
 mod growformer_model_manager;
 mod marketplace_integration;
+mod network_devnet;
 mod network_e2e;
 mod network_memory;
 mod network_profile;

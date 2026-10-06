@@ -35,14 +35,21 @@
 //!
 //! ## Replication
 //!
-//! Proposals and votes travel over P2P gossip and are applied idempotently.
-//! Governance is not yet ordered by the chain: two changes decided at the same
-//! moment on different nodes could be applied in different orders. Authorities
-//! should run one membership change at a time during bootstrap. Every node
-//! publishes [`GovernanceState::state_hash`] so divergence is visible
-//! (`GET /v1/chain/status`).
+//! Proposals and votes are consensus transactions (see `chain_consensus`):
+//! a node checks them, queues them in its transaction pool (which is relayed
+//! to every node) and they take effect when a block includes them, at that
+//! block's time. The state lives in the chain, so every node applies the same
+//! changes in the same order and a node that joins later replays them.
+//!
+//! ## After the lift
+//!
+//! In proof of stake the validator set comes from staking (`staking`), and
+//! only protocol settings are governed (`set_block_production`). Votes are
+//! weighted by effective stake in whole ASTRA, counted against the electorate
+//! snapshot taken when the proposal was included, and a proposal passes with
+//! two thirds of that weight.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,11 +57,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::consensus_coordinator::ConsensusCoordinator;
-use crate::network::{NetworkService, P2PMessage};
 
 pub const PROPOSAL_DOMAIN: &str = "SPACEKIT-GOVERNANCE-PROPOSAL-v1";
 pub const VOTE_DOMAIN: &str = "SPACEKIT-GOVERNANCE-VOTE-v1";
@@ -70,7 +75,6 @@ const MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_POS_GRACE_SECS: i64 = 30 * 86_400;
 const MAX_TITLE_LEN: usize = 200;
 const MAX_DESCRIPTION_LEN: usize = 4_000;
-const MAX_ORPHAN_VOTES: usize = 1_024;
 
 pub fn now_unix() -> i64 {
     SystemTime::now()
@@ -122,6 +126,30 @@ pub fn approvals_needed(n: usize) -> usize {
     (2 * n).div_ceil(3)
 }
 
+/// Weight needed out of `total`: `ceil(2 * total / 3)`.
+pub fn weight_needed(total: u64) -> u64 {
+    ((2 * total as u128).div_ceil(3)) as u64
+}
+
+/// A proof-of-stake voter: a validator's key and its stake in whole ASTRA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voter {
+    pub sphincs_pk_hex: String,
+    pub weight: u64,
+}
+
+/// Hash of a stake-weighted electorate (`pos`, then `did weight` per line).
+pub fn stake_electorate_hash(voters: &BTreeMap<String, Voter>) -> String {
+    let mut text = String::from("pos\n");
+    for (did, v) in voters {
+        text.push_str(did);
+        text.push(' ');
+        text.push_str(&v.weight.to_string());
+        text.push('\n');
+    }
+    sha256_hex(text.as_bytes())
+}
+
 // ── Types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +184,10 @@ pub enum ProposalAction {
         did: String,
     },
     LiftPoa,
+    /// Change when blocks are produced (see `block_production`).
+    SetBlockProduction {
+        config: crate::block_production::BlockProduction,
+    },
 }
 
 /// The signed body of a proposal.
@@ -240,14 +272,19 @@ pub struct ProposalRecord {
     /// afterwards, e.g. when this proposal added an authority).
     #[serde(default)]
     pub final_tally: Option<Tally>,
+    /// Proof of stake: the validators and weights when the proposal was
+    /// made. Votes are counted against this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub electorate: Option<BTreeMap<String, Voter>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tally {
-    pub approve: usize,
-    pub reject: usize,
-    pub eligible: usize,
-    pub needed: usize,
+    /// Approving votes (PoA) or approving stake in whole ASTRA (PoS).
+    pub approve: u64,
+    pub reject: u64,
+    pub eligible: u64,
+    pub needed: u64,
 }
 
 /// A change the validator set must reflect after a proposal executes.
@@ -256,6 +293,7 @@ pub enum GovernanceEffect {
     AuthorityAdded { did: String, sphincs_public_key: Vec<u8> },
     AuthorityRemoved { did: String },
     ProofOfStakeActivated,
+    BlockProductionChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +346,26 @@ pub struct PoaGenesis {
     #[serde(default)]
     pub min_validators_to_lift: Option<usize>,
     pub authorities: Vec<GenesisAuthority>,
+    /// When blocks are produced (default: on demand, see `block_production`).
+    #[serde(default)]
+    pub block_production: Option<crate::block_production::BlockProduction>,
+    /// Staking rules after the lift (minimum stake, unbonding period).
+    #[serde(default)]
+    pub staking: Option<crate::staking::StakingParams>,
+    /// Days authorities keep producing unstaked after the lift (default 30).
+    #[serde(default)]
+    pub pos_grace_days: Option<u64>,
+    /// Treasury multisig (signers and threshold), written into the treasury
+    /// contract's storage at genesis.
+    #[serde(default)]
+    pub treasury: Option<TreasuryGenesis>,
+}
+
+/// M-of-N signers of the treasury contract (`0x…0004`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreasuryGenesis {
+    pub threshold: u64,
+    pub signer_dids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +388,25 @@ pub struct GovernanceState {
     #[serde(default)]
     pub pos_activated_at: Option<i64>,
     pub min_validators_to_lift: usize,
+    /// Authorities removed by governance. Kept so blocks they sealed while
+    /// they were authorities still verify for nodes that catch up later.
+    #[serde(default)]
+    pub former_authorities: BTreeMap<String, Authority>,
+    /// When blocks are produced. From the genesis file; changed by
+    /// `set_block_production` proposals.
+    #[serde(default)]
+    pub block_production: crate::block_production::BlockProduction,
+    /// After the lift: the staked validators and their weight (whole ASTRA),
+    /// refreshed from the staking registry at the start of every block.
+    #[serde(default)]
+    pub stake_electorate: BTreeMap<String, Voter>,
+    /// How long authorities keep producing unstaked after the lift.
+    #[serde(default = "default_pos_grace_secs")]
+    pub pos_grace_secs: i64,
+}
+
+fn default_pos_grace_secs() -> i64 {
+    DEFAULT_POS_GRACE_SECS
 }
 
 impl GovernanceState {
@@ -344,6 +421,10 @@ impl GovernanceState {
             proposals: BTreeMap::new(),
             pos_activated_at: None,
             min_validators_to_lift: DEFAULT_MIN_VALIDATORS_TO_LIFT,
+            former_authorities: BTreeMap::new(),
+            block_production: Default::default(),
+            stake_electorate: BTreeMap::new(),
+            pos_grace_secs: DEFAULT_POS_GRACE_SECS,
         }
     }
 
@@ -351,6 +432,10 @@ impl GovernanceState {
         if genesis.authorities.is_empty() {
             bail!("PoA genesis must name at least one authority");
         }
+        let block_production = genesis.block_production.clone().unwrap_or_default();
+        block_production
+            .validate()
+            .map_err(|e| anyhow!("genesis block_production: {e}"))?;
         let mut authorities = BTreeMap::new();
         for a in &genesis.authorities {
             let pk = hex::decode(a.sphincs_pk_hex.trim())
@@ -383,6 +468,13 @@ impl GovernanceState {
                 .min_validators_to_lift
                 .unwrap_or(DEFAULT_MIN_VALIDATORS_TO_LIFT)
                 .max(1),
+            former_authorities: BTreeMap::new(),
+            block_production,
+            stake_electorate: BTreeMap::new(),
+            pos_grace_secs: genesis
+                .pos_grace_days
+                .map(|d| (d as i64) * 86_400)
+                .unwrap_or(DEFAULT_POS_GRACE_SECS),
         })
     }
 
@@ -390,8 +482,33 @@ impl GovernanceState {
         self.mode == ConsensusMode::ProofOfAuthority
     }
 
+    /// Sorted authority DIDs (block producer schedule order).
+    pub fn authority_dids(&self) -> Vec<String> {
+        self.authorities.keys().cloned().collect()
+    }
+
+    /// Public key of a current or former authority, for block seal checks.
+    pub fn sealing_key(&self, did: &str) -> Option<Vec<u8>> {
+        self.authorities
+            .get(did)
+            .or_else(|| self.former_authorities.get(did))
+            .and_then(|a| hex::decode(&a.sphincs_pk_hex).ok())
+    }
+
+    /// PoA: hash of the authority DIDs. PoS: hash of the staked validators
+    /// and their weights.
     pub fn electorate_hash(&self) -> String {
-        electorate_hash(self.authorities.keys().map(String::as_str))
+        if self.is_poa() {
+            electorate_hash(self.authorities.keys().map(String::as_str))
+        } else {
+            stake_electorate_hash(&self.stake_electorate)
+        }
+    }
+
+    /// Whether PoS authorities may still produce unstaked at `now`.
+    pub fn within_pos_grace(&self, now: i64) -> bool {
+        self.pos_activated_at
+            .is_some_and(|at| now < at + self.pos_grace_secs)
     }
 
     /// Hash of what every node must agree on: mode and authority set.
@@ -407,6 +524,10 @@ impl GovernanceState {
             text.push_str(&a.sphincs_pk_hex);
             text.push('\n');
         }
+        // Nodes that disagree on block production would take turns differently.
+        text.push_str("production ");
+        text.push_str(&self.block_production.canonical());
+        text.push('\n');
         sha256_hex(text.as_bytes())
     }
 
@@ -441,12 +562,6 @@ impl GovernanceState {
         if self.proposals.contains_key(&id) {
             return Ok(SubmitOutcome::Duplicate { id });
         }
-        if !self.is_poa() {
-            return Err(invalid(
-                "the network has left proof of authority; validator-set governance is closed",
-            ));
-        }
-
         let body: ProposalBody = serde_json::from_str(&signed.body_json)
             .map_err(|e| invalid(format!("body_json is not a valid proposal: {e}")))?;
         if body.version != 1 {
@@ -481,9 +596,17 @@ impl GovernanceState {
             return Err(invalid("proposal has already expired"));
         }
 
-        let proposer_key = self
-            .authority_key(&body.proposer_did)
-            .ok_or_else(|| invalid(format!("{} is not an authority", body.proposer_did)))?;
+        let proposer_key = if self.is_poa() {
+            self.authority_key(&body.proposer_did)
+                .ok_or_else(|| invalid(format!("{} is not an authority", body.proposer_did)))?
+        } else {
+            self.stake_electorate
+                .get(&body.proposer_did)
+                .and_then(|v| hex::decode(&v.sphincs_pk_hex).ok())
+                .ok_or_else(|| {
+                    invalid(format!("{} is not a staked validator", body.proposer_did))
+                })?
+        };
         let signature = hex::decode(signed.signature_hex.trim())
             .map_err(|_| invalid("signature_hex is not hex"))?;
         if !verify(
@@ -493,7 +616,9 @@ impl GovernanceState {
         ) {
             return Err(invalid("proposal signature does not verify against the proposer's key"));
         }
-        if body.electorate_hash != self.electorate_hash() {
+        // PoS proposals are counted against the stake snapshot taken when
+        // they are included, so their electorate_hash is informational.
+        if self.is_poa() && body.electorate_hash != self.electorate_hash() {
             return Err(GovernanceError::StaleElectorate);
         }
         self.check_action(&body.action)?;
@@ -513,6 +638,7 @@ impl GovernanceState {
                 decided_at: None,
                 outcome: None,
                 final_tally: None,
+                electorate: (!self.is_poa()).then(|| self.stake_electorate.clone()),
             },
         );
         // A single-authority network decides as soon as its one vote lands;
@@ -525,6 +651,12 @@ impl GovernanceState {
 
     /// Whether `action` could execute against the current state.
     fn check_action(&self, action: &ProposalAction) -> Result<(), GovernanceError> {
+        if !self.is_poa() && !matches!(action, ProposalAction::SetBlockProduction { .. }) {
+            return Err(invalid(
+                "after the lift, validators join and leave by staking; only protocol settings \
+                 are governed (set_block_production)",
+            ));
+        }
         match action {
             ProposalAction::AddAuthority {
                 did,
@@ -567,6 +699,13 @@ impl GovernanceState {
                 }
                 Ok(())
             }
+            ProposalAction::SetBlockProduction { config } => {
+                config.validate().map_err(invalid)?;
+                if *config == self.block_production {
+                    return Err(invalid("block production already has this setting"));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -580,11 +719,16 @@ impl GovernanceState {
     ) -> Result<VoteOutcome, GovernanceError> {
         self.expire(now);
         let network = self.network.clone();
-        let key = self.authority_key(&vote.voter_did);
         let record = self
             .proposals
             .get(&vote.proposal_id)
             .ok_or(GovernanceError::UnknownProposal)?;
+        let key = match &record.electorate {
+            Some(voters) => voters
+                .get(&vote.voter_did)
+                .and_then(|v| hex::decode(&v.sphincs_pk_hex).ok()),
+            None => self.authority_key(&vote.voter_did),
+        };
         let signature_hex = vote.signature_hex.trim().to_ascii_lowercase();
 
         if let Some(existing) = record.votes.get(&vote.voter_did) {
@@ -603,7 +747,9 @@ impl GovernanceState {
                 serde_json::to_string(&record.status).unwrap_or_default()
             )));
         }
-        let key = key.ok_or_else(|| invalid(format!("{} is not an authority", vote.voter_did)))?;
+        let key = key.ok_or_else(|| {
+            invalid(format!("{} may not vote on this proposal", vote.voter_did))
+        })?;
         let signature =
             hex::decode(&signature_hex).map_err(|_| invalid("signature_hex is not hex"))?;
         if !verify(
@@ -630,6 +776,28 @@ impl GovernanceState {
         Ok(VoteOutcome::Recorded { effects })
     }
 
+    /// `(approve, reject, eligible)`: PoA counts the current authorities'
+    /// votes; PoS weighs votes by the stake snapshot taken at proposal time.
+    pub fn tally_weights(&self, record: &ProposalRecord) -> (u64, u64, u64) {
+        match &record.electorate {
+            Some(voters) => {
+                let total: u64 = voters.values().map(|v| v.weight).sum();
+                let (a, r) = record.votes.iter().fold((0u64, 0u64), |(a, r), (did, v)| {
+                    let w = voters.get(did).map(|x| x.weight).unwrap_or(0);
+                    match v.choice {
+                        VoteChoice::Approve => (a + w, r),
+                        VoteChoice::Reject => (a, r + w),
+                    }
+                });
+                (a, r, total)
+            }
+            None => {
+                let (a, r) = self.tally(record);
+                (a as u64, r as u64, self.authorities.len() as u64)
+            }
+        }
+    }
+
     /// `(approve, reject)` counted over the current authorities only.
     pub fn tally(&self, record: &ProposalRecord) -> (usize, usize) {
         record
@@ -647,13 +815,12 @@ impl GovernanceState {
         if let Some(t) = record.final_tally {
             return t;
         }
-        let (approve, reject) = self.tally(record);
-        let n = self.authorities.len();
+        let (approve, reject, eligible) = self.tally_weights(record);
         Tally {
             approve,
             reject,
-            eligible: n,
-            needed: approvals_needed(n),
+            eligible,
+            needed: weight_needed(eligible),
         }
     }
 
@@ -664,26 +831,31 @@ impl GovernanceState {
         if record.status != ProposalStatus::Pending {
             return Vec::new();
         }
-        if record.body.electorate_hash != self.electorate_hash() || !self.is_poa() {
+        // A PoA proposal must still match the authority set, and cannot
+        // survive the lift. PoS proposals carry their own electorate.
+        if record.electorate.is_none()
+            && (record.body.electorate_hash != self.electorate_hash() || !self.is_poa())
+        {
             self.set_status(id, ProposalStatus::Stale, now, None);
             return Vec::new();
         }
-        let n = self.authorities.len();
-        let needed = approvals_needed(n);
-        let (approve, reject) = self.tally(record);
+        let (approve, reject, eligible) = self.tally_weights(record);
+        let needed = weight_needed(eligible);
         let action = record.body.action.clone();
         let frozen = Tally {
             approve,
             reject,
-            eligible: n,
+            eligible,
             needed,
         };
-        if approve >= needed || reject > n - needed {
+        let passed = eligible > 0 && approve >= needed;
+        let failed = reject > eligible.saturating_sub(needed);
+        if passed || failed {
             if let Some(p) = self.proposals.get_mut(id) {
                 p.final_tally = Some(frozen);
             }
         }
-        if approve >= needed {
+        if passed {
             match self.execute(id, &action, now) {
                 Ok(effects) => {
                     self.set_status(id, ProposalStatus::Executed, now, None);
@@ -695,7 +867,7 @@ impl GovernanceState {
                     Vec::new()
                 }
             }
-        } else if reject > n - needed {
+        } else if failed {
             self.set_status(id, ProposalStatus::Rejected, now, None);
             Vec::new()
         } else {
@@ -719,6 +891,7 @@ impl GovernanceState {
         for (id, p) in self.proposals.iter_mut() {
             if id != executed
                 && p.status == ProposalStatus::Pending
+                && p.electorate.is_none()
                 && (!poa || p.body.electorate_hash != current)
             {
                 p.status = ProposalStatus::Stale;
@@ -758,13 +931,19 @@ impl GovernanceState {
                 }])
             }
             ProposalAction::RemoveAuthority { did } => {
-                self.authorities.remove(did);
+                if let Some(former) = self.authorities.remove(did) {
+                    self.former_authorities.insert(did.clone(), former);
+                }
                 Ok(vec![GovernanceEffect::AuthorityRemoved { did: did.clone() }])
             }
             ProposalAction::LiftPoa => {
                 self.mode = ConsensusMode::ProofOfStake;
                 self.pos_activated_at = Some(now);
                 Ok(vec![GovernanceEffect::ProofOfStakeActivated])
+            }
+            ProposalAction::SetBlockProduction { config } => {
+                self.block_production = config.clone();
+                Ok(vec![GovernanceEffect::BlockProductionChanged])
             }
         }
     }
@@ -777,83 +956,50 @@ pub fn sphincs_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bo
     spacekit_did::sphincs::SphincsPlus::verify(public_key, message, signature)
 }
 
-/// Where gossip and HTTP submissions land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Local,
-    Gossip,
-}
-
+/// Governance and staking, held in the chain (see `chain_consensus`).
+///
+/// Proposals, votes and stake messages submitted over HTTP are checked
+/// against the head state and queued as consensus transactions. They take
+/// effect when a block includes them, on every node alike; the transaction
+/// pool relays them. Reads come from the head block's state.
 pub struct ValidatorGovernance {
-    state: RwLock<GovernanceState>,
-    state_path: Option<PathBuf>,
+    network: String,
+    /// Initial state from the PoA genesis file (installed at height 0).
+    genesis: Option<GovernanceState>,
+    staking_params: crate::staking::StakingParams,
+    treasury_genesis: Option<TreasuryGenesis>,
+    vm: std::sync::OnceLock<Arc<crate::spacekitvm::SwtchvmNode>>,
     coordinator: Arc<ConsensusCoordinator>,
-    network: RwLock<Option<NetworkService>>,
-    /// Votes that arrived before their proposal (gossip reordering).
-    orphan_votes: RwLock<VecDeque<SignedVote>>,
-    pos_grace_secs: i64,
+    /// DIDs this node registered with the coordinator.
+    registered: tokio::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ValidatorGovernance {
-    /// Load persisted state, or start from the PoA genesis file, or fall back
-    /// to plain proof of stake when neither exists.
-    ///
-    /// Environment:
-    /// - `SPACEKIT_GOVERNANCE_STATE_PATH` (default
-    ///   `temp_blockchain_storage/governance.json`)
-    /// - `SPACEKIT_POA_GENESIS_FILE`: genesis authorities; read only when no
-    ///   state file exists yet
-    /// - `SPACEKIT_POS_GRACE_DAYS` (default 30)
+    /// `SPACEKIT_POA_GENESIS_FILE`: genesis authorities, block production and
+    /// staking rules. Without it the node runs a plain chain with no
+    /// governance.
     pub fn from_env(network: &str, coordinator: Arc<ConsensusCoordinator>) -> Result<Self> {
-        let state_path = PathBuf::from(
-            std::env::var("SPACEKIT_GOVERNANCE_STATE_PATH")
-                .unwrap_or_else(|_| "temp_blockchain_storage/governance.json".to_string()),
-        );
         let genesis_path = std::env::var("SPACEKIT_POA_GENESIS_FILE")
             .ok()
             .filter(|p| !p.trim().is_empty())
             .map(PathBuf::from);
-        let grace_days: i64 = std::env::var("SPACEKIT_POS_GRACE_DAYS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_POS_GRACE_SECS / 86_400);
-        Self::load(
-            network,
-            Some(state_path),
-            genesis_path.as_deref(),
-            coordinator,
-            grace_days.max(0) * 86_400,
-        )
+        if std::env::var_os("SPACEKIT_POS_GRACE_DAYS").is_some() {
+            warn!(
+                "SPACEKIT_POS_GRACE_DAYS is ignored: the grace period is part of consensus; set \
+                 pos_grace_days in the genesis file"
+            );
+        }
+        Self::load(network, genesis_path.as_deref(), coordinator)
     }
 
     pub fn load(
         network: &str,
-        state_path: Option<PathBuf>,
         genesis_path: Option<&Path>,
         coordinator: Arc<ConsensusCoordinator>,
-        pos_grace_secs: i64,
     ) -> Result<Self> {
-        let existing = match &state_path {
-            Some(path) if path.exists() => {
-                let raw = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
-                let state: GovernanceState = serde_json::from_str(&raw)
-                    .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
-                if state.network != network {
-                    bail!(
-                        "{} belongs to network {:?}, this node runs {:?}",
-                        path.display(),
-                        state.network,
-                        network
-                    );
-                }
-                Some(state)
-            }
-            _ => None,
-        };
-        let state = match (existing, genesis_path) {
-            (Some(state), _) => state,
-            (None, Some(path)) => {
+        let mut treasury_genesis = None;
+        let (genesis, staking_params) = match genesis_path {
+            Some(path) => {
                 let raw = std::fs::read_to_string(path)
                     .map_err(|e| anyhow!("reading PoA genesis {}: {e}", path.display()))?;
                 let genesis: PoaGenesis = serde_json::from_str(&raw)
@@ -865,265 +1011,242 @@ impl ValidatorGovernance {
                         network
                     );
                 }
-                let state = GovernanceState::from_genesis(&genesis, now_unix())?;
+                let staking = genesis.staking.clone().unwrap_or_default();
+                if let Some(t) = &genesis.treasury {
+                    if t.threshold == 0 || t.threshold as usize > t.signer_dids.len() {
+                        bail!("treasury threshold must be between 1 and the number of signers");
+                    }
+                    treasury_genesis = Some(t.clone());
+                }
+                // Genesis timestamps are fixed (0) so every node installs
+                // byte-identical state.
+                let state = GovernanceState::from_genesis(&genesis, 0)?;
                 info!(
                     authorities = state.authorities.len(),
-                    "Starting in proof of authority from genesis {}",
+                    "Proof of authority genesis from {}",
                     path.display()
                 );
-                state
+                (Some(state), staking)
             }
-            (None, None) => GovernanceState::proof_of_stake(network),
+            None => (None, crate::staking::StakingParams::default()),
         };
-        let gov = Self {
-            state: RwLock::new(state),
-            state_path,
+        Ok(Self {
+            network: network.to_string(),
+            genesis,
+            staking_params,
+            treasury_genesis,
+            vm: std::sync::OnceLock::new(),
             coordinator,
-            network: RwLock::new(None),
-            orphan_votes: RwLock::new(VecDeque::new()),
-            pos_grace_secs,
-        };
-        Ok(gov)
+            registered: tokio::sync::Mutex::new(Default::default()),
+        })
     }
 
+    /// Connect to the chain; installs the genesis state at height 0.
+    pub async fn attach_vm(&self, vm: Arc<crate::spacekitvm::SwtchvmNode>) -> Result<()> {
+        if let Some(genesis) = &self.genesis {
+            vm.init_consensus_genesis(
+                genesis.clone(),
+                self.staking_params.clone(),
+                self.treasury_genesis.clone(),
+            )
+            .await?;
+        }
+        let _ = self.vm.set(vm);
+        Ok(())
+    }
+
+    fn vm(&self) -> Option<&Arc<crate::spacekitvm::SwtchvmNode>> {
+        self.vm.get()
+    }
+
+    /// Governance as of the head block, with deadlines applied at `now` for
+    /// display (the chain applies them when the next block begins).
     pub async fn snapshot(&self) -> GovernanceState {
-        let mut state = self.state.read().await.clone();
+        let mut state = match self.vm() {
+            Some(vm) => match vm.consensus_state().await {
+                Some(cs) => cs.governance,
+                None => self
+                    .genesis
+                    .clone()
+                    .unwrap_or_else(|| GovernanceState::proof_of_stake(&self.network)),
+            },
+            None => self
+                .genesis
+                .clone()
+                .unwrap_or_else(|| GovernanceState::proof_of_stake(&self.network)),
+        };
         state.expire(now_unix());
         state
     }
 
     pub async fn is_poa(&self) -> bool {
-        self.state.read().await.is_poa()
+        self.snapshot().await.is_poa()
     }
 
-    fn persist(&self, state: &GovernanceState) {
-        let Some(path) = &self.state_path else { return };
-        let result = (|| -> Result<()> {
-            if let Some(dir) = path.parent() {
-                if !dir.as_os_str().is_empty() {
-                    std::fs::create_dir_all(dir)?;
-                }
-            }
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            warn!("could not persist governance state to {}: {e}", path.display());
+    /// Whether this network has on-chain governance (a PoA genesis).
+    pub fn has_genesis(&self) -> bool {
+        self.genesis.is_some()
+    }
+
+    async fn queue(&self, msg: crate::chain_consensus::ConsensusMessage) -> Result<String, String> {
+        let vm = self.vm().ok_or("the chain is not running yet")?;
+        vm.submit_consensus_message(&msg)
+            .await
+            .map(|(hash, _)| format!("0x{}", hex::encode(hash)))
+            .map_err(|e| e.to_string())
+    }
+
+    fn map_error(e: String) -> GovernanceError {
+        if e.contains("different authority set") {
+            GovernanceError::StaleElectorate
+        } else if e == "unknown proposal" {
+            GovernanceError::UnknownProposal
+        } else {
+            GovernanceError::Invalid(e)
         }
     }
 
-    /// Register every authority with the coordinator (at startup).
-    pub async fn sync_coordinator(&self) {
-        let state = self.state.read().await.clone();
-        if !state.is_poa() && !self.within_pos_grace(&state) {
-            return;
-        }
-        for a in state.authorities.values() {
-            let Ok(pk) = hex::decode(&a.sphincs_pk_hex) else { continue };
-            if let Err(e) = self.coordinator.register_authority(a.did.clone(), pk).await {
-                warn!("could not register authority {}: {e}", a.did);
-            }
-        }
-    }
-
-    fn within_pos_grace(&self, state: &GovernanceState) -> bool {
-        state
-            .pos_activated_at
-            .is_some_and(|at| now_unix() < at + self.pos_grace_secs)
-    }
-
-    async fn apply_effects(&self, effects: &[GovernanceEffect]) {
-        for effect in effects {
-            match effect {
-                GovernanceEffect::AuthorityAdded {
-                    did,
-                    sphincs_public_key,
-                } => {
-                    info!("Governance admitted authority {did}");
-                    if let Err(e) = self
-                        .coordinator
-                        .register_authority(did.clone(), sphincs_public_key.clone())
-                        .await
-                    {
-                        warn!("could not register authority {did}: {e}");
-                    }
-                }
-                GovernanceEffect::AuthorityRemoved { did } => {
-                    info!("Governance removed authority {did}");
-                    self.coordinator.remove_validator(did).await;
-                }
-                GovernanceEffect::ProofOfStakeActivated => {
-                    info!(
-                        "Governance lifted proof of authority: the network is now proof of \
-                         stake. Authorities must register stake within {} days.",
-                        self.pos_grace_secs / 86_400
-                    );
-                }
-            }
-        }
-    }
-
-    async fn broadcast(&self, msg: P2PMessage) {
-        if let Some(net) = self.network.read().await.as_ref() {
-            if let Err(e) = net.broadcast(msg) {
-                debug!("governance gossip failed: {e}");
-            }
-        }
-    }
-
+    /// Check a proposal and queue it for the next block.
     pub async fn submit_proposal(
         &self,
         signed: SignedProposal,
-        source: Source,
-    ) -> Result<SubmitOutcome, GovernanceError> {
-        let outcome = {
-            let mut state = self.state.write().await;
-            state.expire(now_unix());
-            let outcome = state.submit_proposal(&signed, now_unix(), &sphincs_verify)?;
-            if matches!(outcome, SubmitOutcome::New { .. }) {
-                self.persist(&state);
-            }
-            outcome
-        };
-        if let SubmitOutcome::New { id, .. } = &outcome {
-            info!(proposal = %id, ?source, "Accepted governance proposal");
-            if let Ok(json) = serde_json::to_string(&signed) {
-                self.broadcast(P2PMessage::GovernanceProposal { signed_json: json })
-                    .await;
-            }
-            self.retry_orphans(id).await;
+    ) -> Result<(SubmitOutcome, Option<String>), GovernanceError> {
+        let id = proposal_id(&signed.body_json);
+        if self.snapshot().await.proposals.contains_key(&id) {
+            return Ok((SubmitOutcome::Duplicate { id }, None));
         }
-        Ok(outcome)
+        let tx = self
+            .queue(crate::chain_consensus::ConsensusMessage::GovernanceProposal { proposal: signed })
+            .await
+            .map_err(Self::map_error)?;
+        info!(proposal = %id, "Queued governance proposal");
+        Ok((
+            SubmitOutcome::New {
+                id,
+                effects: Vec::new(),
+            },
+            Some(tx),
+        ))
     }
 
-    pub async fn submit_vote(
+    /// Check a vote and queue it for the next block.
+    pub async fn submit_vote(&self, vote: SignedVote) -> Result<(VoteOutcome, Option<String>), GovernanceError> {
+        let state = self.snapshot().await;
+        if let Some(existing) = state
+            .proposals
+            .get(&vote.proposal_id)
+            .and_then(|p| p.votes.get(&vote.voter_did))
+        {
+            if existing.choice == vote.choice
+                && existing.signature_hex == vote.signature_hex.trim().to_ascii_lowercase()
+            {
+                return Ok((VoteOutcome::Duplicate, None));
+            }
+        }
+        let tx = self
+            .queue(crate::chain_consensus::ConsensusMessage::GovernanceVote { vote: vote.clone() })
+            .await
+            .map_err(Self::map_error)?;
+        info!(proposal = %vote.proposal_id, voter = %vote.voter_did, "Queued governance vote");
+        Ok((
+            VoteOutcome::Recorded {
+                effects: Vec::new(),
+            },
+            Some(tx),
+        ))
+    }
+
+    /// Check a stake message and queue it for the next block.
+    pub async fn submit_stake(&self, stake: crate::staking::SignedStake) -> Result<String, String> {
+        self.queue(crate::chain_consensus::ConsensusMessage::Stake { stake })
+            .await
+    }
+
+    /// Check a SPHINCS+-signed native transfer and queue it for the next block.
+    pub async fn submit_transfer(
         &self,
-        vote: SignedVote,
-        source: Source,
-    ) -> Result<VoteOutcome, GovernanceError> {
-        let result = {
-            let mut state = self.state.write().await;
-            let result = state.submit_vote(&vote, now_unix(), &sphincs_verify);
-            if matches!(result, Ok(VoteOutcome::Recorded { .. })) {
-                self.persist(&state);
-            }
-            result
-        };
-        match &result {
-            Ok(VoteOutcome::Recorded { effects }) => {
-                info!(proposal = %vote.proposal_id, voter = %vote.voter_did, ?source,
-                    "Recorded governance vote");
-                self.apply_effects(effects).await;
-                if let Ok(json) = serde_json::to_string(&vote) {
-                    self.broadcast(P2PMessage::GovernanceVote { signed_json: json })
-                        .await;
-                }
-            }
-            Err(GovernanceError::UnknownProposal) if source == Source::Gossip => {
-                let mut orphans = self.orphan_votes.write().await;
-                if orphans.len() >= MAX_ORPHAN_VOTES {
-                    orphans.pop_front();
-                }
-                orphans.push_back(vote);
-            }
-            _ => {}
-        }
-        result
+        transfer: crate::chain_consensus::SignedTransfer,
+    ) -> Result<String, String> {
+        self.queue(crate::chain_consensus::ConsensusMessage::Transfer { transfer })
+            .await
     }
 
-    async fn retry_orphans(&self, proposal_id: &str) {
-        let ready: Vec<SignedVote> = {
-            let mut orphans = self.orphan_votes.write().await;
-            let (ready, rest): (Vec<_>, Vec<_>) = orphans
-                .drain(..)
-                .partition(|v| v.proposal_id == proposal_id);
-            orphans.extend(rest);
-            ready
+    /// Staking rules and validators with their holdings and effective stake.
+    pub async fn staking_view(&self) -> serde_json::Value {
+        let Some(vm) = self.vm() else {
+            return serde_json::json!({ "enabled": false });
         };
-        for vote in ready {
-            if let Err(e) = self.submit_vote(vote, Source::Gossip).await {
-                debug!("orphan governance vote rejected: {e}");
-            }
-        }
-    }
-
-    /// Listen for governance gossip and re-broadcast anything new.
-    pub fn start_p2p_listener(self: &Arc<Self>, network: NetworkService) -> tokio::task::JoinHandle<()> {
-        let gov = self.clone();
-        tokio::spawn(async move {
-            *gov.network.write().await = Some(network.clone());
-            let mut rx = network.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(P2PMessage::GovernanceProposal { signed_json }) => {
-                        match serde_json::from_str::<SignedProposal>(&signed_json) {
-                            Ok(signed) => {
-                                if let Err(e) = gov.submit_proposal(signed, Source::Gossip).await {
-                                    debug!("gossiped governance proposal rejected: {e}");
-                                }
-                            }
-                            Err(e) => debug!("malformed governance proposal gossip: {e}"),
-                        }
-                    }
-                    Ok(P2PMessage::GovernanceVote { signed_json }) => {
-                        match serde_json::from_str::<SignedVote>(&signed_json) {
-                            Ok(vote) => {
-                                if let Err(e) = gov.submit_vote(vote, Source::Gossip).await {
-                                    debug!("gossiped governance vote rejected: {e}");
-                                }
-                            }
-                            Err(e) => debug!("malformed governance vote gossip: {e}"),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("governance listener lagged {n} messages");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
+        let world = vm.runtime_state();
+        let world = world.read().await;
+        let Some(cs) = crate::chain_consensus::load(&world) else {
+            return serde_json::json!({ "enabled": false });
+        };
+        let now = now_unix().max(0) as u64;
+        let min = cs.staking.params.min_stake_wei();
+        let validators: Vec<serde_json::Value> = cs
+            .staking
+            .validators
+            .values()
+            .map(|v| {
+                let holdings = crate::chain_consensus::astra_holdings_wei(&world, &v.did);
+                let effective = v.effective_wei(holdings);
+                serde_json::json!({
+                    "did": v.did,
+                    "name": v.name,
+                    "sphincs_pk_hex": v.sphincs_pk_hex,
+                    "bonded_wei": v.bonded_wei.to_string(),
+                    "unbonding": v.unbonding.iter().map(|u| serde_json::json!({
+                        "amount_wei": u.amount_wei.to_string(),
+                        "release_at": u.release_at,
+                    })).collect::<Vec<_>>(),
+                    "holdings_wei": holdings.to_string(),
+                    "effective_wei": effective.to_string(),
+                    "active": effective >= min && effective > 0,
+                    "next_nonce": v.nonce,
+                })
+            })
+            .collect();
+        let producers = crate::chain_consensus::producer_set(&world, now);
+        serde_json::json!({
+            "enabled": true,
+            "network": cs.governance.network,
+            "mode": http::mode_str(cs.governance.mode),
+            "params": cs.staking.params,
+            "min_stake_wei": min.to_string(),
+            "validators": validators,
+            "producers": producers,
+            "stake_domain": crate::staking::STAKE_DOMAIN,
         })
     }
 
-    /// Expire proposals and, once the PoS grace period ends, drop authorities
-    /// that have not registered stake.
-    pub fn start_ticker(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let gov = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                gov.tick().await;
+    /// Keep the consensus coordinator's validator list in step with the
+    /// chain's producer set.
+    pub async fn sync_coordinator(&self) {
+        let Some(vm) = self.vm() else { return };
+        let set = vm.producer_set(now_unix().max(0) as u64).await;
+        let wanted: std::collections::BTreeMap<String, Vec<u8>> = set
+            .members
+            .iter()
+            .filter_map(|p| hex::decode(&p.sphincs_pk_hex).ok().map(|k| (p.did.clone(), k)))
+            .collect();
+        let mut registered = self.registered.lock().await;
+        for (did, pk) in &wanted {
+            if !registered.contains(did) {
+                if let Err(e) = self.coordinator.register_authority(did.clone(), pk.clone()).await {
+                    warn!("could not register validator {did}: {e}");
+                    continue;
+                }
+                registered.insert(did.clone());
             }
-        })
-    }
-
-    pub async fn tick(&self) {
-        let now = now_unix();
-        let state = {
-            let mut state = self.state.write().await;
-            let before = state.clone();
-            state.expire(now);
-            if *state != before {
-                self.persist(&state);
-            }
-            state.clone()
-        };
-        if state.is_poa() || self.within_pos_grace(&state) {
-            return;
         }
-        let Some(activated) = state.pos_activated_at else { return };
-        if now < activated + self.pos_grace_secs {
-            return;
-        }
-        let dropped = self
-            .coordinator
-            .remove_unstaked_authorities(&state.authorities.keys().cloned().collect::<Vec<_>>())
-            .await;
-        for did in dropped {
-            info!("PoS grace period over: {did} has no registered stake and stops validating");
+        let gone: Vec<String> = registered
+            .iter()
+            .filter(|d| !wanted.contains_key(*d))
+            .cloned()
+            .collect();
+        for did in gone {
+            self.coordinator.remove_validator(&did).await;
+            registered.remove(&did);
         }
     }
 }
@@ -1145,7 +1268,7 @@ pub mod http {
         Box::new(warp::reply::with_status(warp::reply::json(&value), status))
     }
 
-    fn mode_str(mode: ConsensusMode) -> &'static str {
+    pub fn mode_str(mode: ConsensusMode) -> &'static str {
         match mode {
             ConsensusMode::ProofOfAuthority => "proof_of_authority",
             ConsensusMode::ProofOfStake => "proof_of_stake",
@@ -1153,7 +1276,8 @@ pub mod http {
     }
 
     /// Summary of the validator set and governance rules.
-    pub fn overview(state: &GovernanceState, pos_grace_secs: i64) -> serde_json::Value {
+    pub fn overview(state: &GovernanceState) -> serde_json::Value {
+        let pos_grace_secs = state.pos_grace_secs;
         let n = state.authorities.len();
         let pending = state
             .proposals
@@ -1168,8 +1292,12 @@ pub mod http {
             "authorities": state.authorities.values().collect::<Vec<_>>(),
             "authority_count": n,
             "approvals_needed": approvals_needed(n),
+            "stake_electorate": state.stake_electorate,
+            "stake_weight_total": state.stake_electorate.values().map(|v| v.weight).sum::<u64>(),
+            "stake_weight_needed": weight_needed(state.stake_electorate.values().map(|v| v.weight).sum::<u64>()),
             "fault_tolerance": fault_tolerance(n),
             "min_validators_to_lift": state.min_validators_to_lift,
+            "block_production": state.block_production,
             "can_lift_poa": state.is_poa() && n >= state.min_validators_to_lift,
             "pending_proposals": pending,
             "pos_activated_at": state.pos_activated_at,
@@ -1245,7 +1373,7 @@ pub mod http {
             .and_then(|gov: Arc<ValidatorGovernance>| async move {
                 let state = gov.snapshot().await;
                 Ok::<_, warp::Rejection>(json_status(
-                    overview(&state, gov.pos_grace_secs),
+                    overview(&state),
                     StatusCode::OK,
                 ))
             });
@@ -1298,12 +1426,13 @@ pub mod http {
             .and(warp::body::json::<SignedProposal>())
             .and(with_gov.clone())
             .and_then(|signed: SignedProposal, gov: Arc<ValidatorGovernance>| async move {
-                let reply = match gov.submit_proposal(signed, Source::Local).await {
-                    Ok(SubmitOutcome::New { id, .. }) => json_status(
-                        serde_json::json!({ "status": "accepted", "id": id }),
-                        StatusCode::CREATED,
+                // Queued for the next block; it takes effect when included.
+                let reply = match gov.submit_proposal(signed).await {
+                    Ok((SubmitOutcome::New { id, .. }, tx)) => json_status(
+                        serde_json::json!({ "status": "queued", "id": id, "tx_hash": tx }),
+                        StatusCode::ACCEPTED,
                     ),
-                    Ok(SubmitOutcome::Duplicate { id }) => json_status(
+                    Ok((SubmitOutcome::Duplicate { id }, _)) => json_status(
                         serde_json::json!({ "status": "duplicate", "id": id }),
                         StatusCode::OK,
                     ),
@@ -1320,22 +1449,68 @@ pub mod http {
             .and(with_gov.clone())
             .and_then(|vote: SignedVote, gov: Arc<ValidatorGovernance>| async move {
                 let id = vote.proposal_id.clone();
-                let reply = match gov.submit_vote(vote, Source::Local).await {
-                    Ok(outcome) => {
+                let reply = match gov.submit_vote(vote).await {
+                    Ok((outcome, tx)) => {
                         let state = gov.snapshot().await;
                         let proposal = state.proposals.get(&id).map(|p| proposal_view(&state, p, false));
                         json_status(
                             serde_json::json!({
-                                "status": if matches!(outcome, VoteOutcome::Duplicate) { "duplicate" } else { "recorded" },
+                                "status": if matches!(outcome, VoteOutcome::Duplicate) { "duplicate" } else { "queued" },
+                                "tx_hash": tx,
                                 "proposal": proposal,
                             }),
-                            StatusCode::OK,
+                            if matches!(outcome, VoteOutcome::Duplicate) { StatusCode::OK } else { StatusCode::ACCEPTED },
                         )
                     }
                     Err(e) => error_reply(e),
                 };
                 Ok::<_, warp::Rejection>(reply)
             });
+
+        // GET /v1/staking — rules, validators, stake, and the producer set.
+        let staking_route = warp::path!("v1" / "staking")
+            .and(warp::get())
+            .and(with_gov.clone())
+            .and_then(|gov: Arc<ValidatorGovernance>| async move {
+                Ok::<_, warp::Rejection>(json_status(gov.staking_view().await, StatusCode::OK))
+            });
+
+        // POST /v1/staking  { body_json, signature_hex }
+        let stake_route = warp::path!("v1" / "staking")
+            .and(warp::post())
+            .and(warp::body::content_length_limit(MAX_BODY_BYTES))
+            .and(warp::body::json::<crate::staking::SignedStake>())
+            .and(with_gov.clone())
+            .and_then(|stake: crate::staking::SignedStake, gov: Arc<ValidatorGovernance>| async move {
+                let reply = match gov.submit_stake(stake).await {
+                    Ok(tx) => json_status(
+                        serde_json::json!({ "status": "queued", "tx_hash": tx }),
+                        StatusCode::ACCEPTED,
+                    ),
+                    Err(e) => json_status(serde_json::json!({ "error": e }), StatusCode::BAD_REQUEST),
+                };
+                Ok::<_, warp::Rejection>(reply)
+            });
+
+        // POST /v1/transfer  { body_json, signature_hex } — native ASTRA from
+        // the address of a SPHINCS+ DID (see chain_consensus::TransferBody).
+        let transfer_route = warp::path!("v1" / "transfer")
+            .and(warp::post())
+            .and(warp::body::content_length_limit(MAX_BODY_BYTES))
+            .and(warp::body::json::<crate::chain_consensus::SignedTransfer>())
+            .and(with_gov.clone())
+            .and_then(
+                |transfer: crate::chain_consensus::SignedTransfer, gov: Arc<ValidatorGovernance>| async move {
+                    let reply = match gov.submit_transfer(transfer).await {
+                        Ok(tx) => json_status(
+                            serde_json::json!({ "status": "queued", "tx_hash": tx }),
+                            StatusCode::ACCEPTED,
+                        ),
+                        Err(e) => json_status(serde_json::json!({ "error": e }), StatusCode::BAD_REQUEST),
+                    };
+                    Ok::<_, warp::Rejection>(reply)
+                },
+            );
 
         // GET /v1/governance/export — every signed proposal and vote, so a
         // relay or a lagging node can replay them.
@@ -1350,12 +1525,16 @@ pub mod http {
                     .map(|p| {
                         serde_json::json!({
                             "proposal": p.signed,
-                            "votes": p.votes.iter().map(|(did, v)| SignedVote {
-                                proposal_id: p.id.clone(),
-                                voter_did: did.clone(),
-                                choice: v.choice,
-                                signature_hex: v.signature_hex.clone(),
-                            }).collect::<Vec<_>>(),
+                            "submitted_at": p.submitted_at,
+                            "votes": p.votes.iter().map(|(did, v)| serde_json::json!({
+                                "vote": SignedVote {
+                                    proposal_id: p.id.clone(),
+                                    voter_did: did.clone(),
+                                    choice: v.choice,
+                                    signature_hex: v.signature_hex.clone(),
+                                },
+                                "received_at": v.received_at,
+                            })).collect::<Vec<_>>(),
                         })
                     })
                     .collect();
@@ -1375,6 +1554,12 @@ pub mod http {
             .or(vote_route)
             .unify()
             .or(export_route)
+            .unify()
+            .or(staking_route)
+            .unify()
+            .or(stake_route)
+            .unify()
+            .or(transfer_route)
             .unify()
             .boxed()
     }
@@ -1414,6 +1599,10 @@ mod tests {
             &PoaGenesis {
                 network: "testnet".into(),
                 min_validators_to_lift: Some(min_lift),
+                block_production: None,
+                staking: None,
+                pos_grace_days: None,
+                treasury: None,
                 authorities: ops
                     .iter()
                     .map(|o| GenesisAuthority {
@@ -1561,6 +1750,34 @@ mod tests {
     }
 
     #[test]
+    fn set_block_production_changes_the_state_hash() {
+        use crate::block_production::{BlockProduction, ProductionMode};
+        let ops: Vec<Op> = (1..=4).map(op).collect();
+        let mut s = genesis(&ops, 10);
+        assert_eq!(s.block_production.mode, ProductionMode::OnDemand);
+        let before = s.state_hash();
+
+        // Invalid and no-op settings are refused up front.
+        let bad = ProposalAction::SetBlockProduction { config: BlockProduction::interval(10) };
+        assert!(s.submit_proposal(&propose(&s, &ops[0], bad, 1_000), 1_000, &fake_verify).is_err());
+        let same = ProposalAction::SetBlockProduction { config: BlockProduction::default() };
+        assert!(s.submit_proposal(&propose(&s, &ops[0], same, 1_000), 1_000, &fake_verify).is_err());
+
+        let config = BlockProduction::interval(1_000);
+        let action = ProposalAction::SetBlockProduction { config: config.clone() };
+        let id = new_id(s.submit_proposal(&propose(&s, &ops[0], action, 1_000), 1_000, &fake_verify).unwrap());
+        let mut last = None;
+        for o in &ops[..3] {
+            last = Some(s.submit_vote(&vote(&id, o, VoteChoice::Approve), 1_001, &fake_verify).unwrap());
+        }
+        assert_eq!(last.unwrap(), VoteOutcome::Recorded { effects: vec![GovernanceEffect::BlockProductionChanged] });
+        assert_eq!(s.block_production, config);
+        assert_ne!(s.state_hash(), before);
+        // The electorate did not change.
+        assert_eq!(s.authorities.len(), 4);
+    }
+
+    #[test]
     fn rejection_and_expiry() {
         let ops: Vec<Op> = (1..=4).map(op).collect();
         let mut s = genesis(&ops, 10);
@@ -1612,6 +1829,10 @@ mod tests {
         let g = PoaGenesis {
             network: "testnet".into(),
             min_validators_to_lift: None,
+            block_production: None,
+            staking: None,
+            pos_grace_days: None,
+            treasury: None,
             authorities: vec![GenesisAuthority {
                 did: "did:spacekit:testnet:0000".into(),
                 sphincs_pk_hex: hex::encode(&o.pk),

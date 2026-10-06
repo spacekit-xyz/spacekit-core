@@ -100,6 +100,15 @@ fn astra_to_units(amount: f64) -> u64 {
     (amount.max(0.0) * 1_000_000.0) as u64
 }
 
+/// Wei per micro-ASTRA: ASTRA has 18 decimals on chain; quotes here are kept
+/// in micro-ASTRA (`price_units`).
+const WEI_PER_UNIT: u128 = 1_000_000_000_000;
+
+/// ASTRA (to micro precision) as native wei.
+pub(crate) fn astra_to_wei(amount: f64) -> u128 {
+    astra_to_units(amount) as u128 * WEI_PER_UNIT
+}
+
 pub fn entitlement_configured() -> bool {
     EntitlementClientConfig::from_env().is_some()
 }
@@ -128,7 +137,7 @@ pub async fn ensure_content_listing(
     let payload = build_create_listing_payload(
         &listing_id,
         content_id_hex,
-        astra_to_units(price_astra),
+        astra_to_wei(price_astra),
         "ASTRA",
         pricing_type,
         period,
@@ -177,7 +186,7 @@ pub async fn purchase_listing_on_chain(
             &contract_id,
             payload,
             buyer_did.to_string(),
-            price_units as u128,
+            price_units as u128 * WEI_PER_UNIT,
             DEFAULT_GAS,
         )
         .await?;

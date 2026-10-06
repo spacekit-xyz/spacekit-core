@@ -124,6 +124,10 @@ async function main(): Promise<void> {
   const chainId = args["chain-id"] ?? process.env.SPACEKIT_CHAIN_ID ?? "spacekit-local";
   const apiKey = args["api-key"] ?? process.env.SPACEKIT_API_KEY;
   const devMode = (args["dev-mode"] ?? process.env.SPACEKIT_DEV_MODE) === "true";
+  // ASTRA lives on the chain. A self-contained local ledger is for offline
+  // development only: --currency local-dev (or SPACEKIT_CURRENCY=local-dev).
+  const currency =
+    (args["currency"] ?? process.env.SPACEKIT_CURRENCY) === "local-dev" ? "local-dev" : "chain";
   const useBunServe = (args["use-bun-serve"] ?? process.env.SPACEKIT_USE_BUN_SERVE) === "true";
 
   console.log(`[spacekit] Initializing VM (chain: ${chainId}, devMode: ${devMode})...`);
@@ -135,6 +139,7 @@ async function main(): Promise<void> {
     chainId,
     genesisConfig,
     devMode,
+    currency,
   });
 
   if (useBunServe && typeof Bun !== "undefined") {

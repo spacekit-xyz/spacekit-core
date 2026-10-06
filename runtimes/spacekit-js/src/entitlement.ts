@@ -29,6 +29,10 @@ export const EntitlementOp = {
   GET_ENTITLEMENT: 0x06,
   /** Publisher-only approve/grant (no payment). */
   GRANT: 0x07,
+  /** Verify against a named listing (use with GET_LISTING's publisher). */
+  VERIFY_LISTING: 0x08,
+  /** Extend a subscription by one period (pays the price). */
+  RENEW: 0x09,
 } as const;
 
 /** Verification status bytes returned by OP_VERIFY. */
@@ -39,7 +43,16 @@ export const EntitlementStatus = {
   WRONG_FILE: 3,
   REVOKED: 4,
   WRONG_PK: 5,
+  /** The entitlement is for another listing. */
+  WRONG_LISTING: 6,
 } as const;
+
+/**
+ * Submit a call to the entitlement-ledger contract **on the chain** with
+ * `value` wei attached; resolve to the contract's output once it succeeded.
+ * Use `chainContractCaller` from `chain/client`.
+ */
+export type SubmitLedgerCall = (input: Uint8Array, value: bigint) => Promise<Uint8Array>;
 
 export const ENTITLEMENT_EVENT = "entitlement:granted";
 
@@ -57,6 +70,15 @@ function encodeString(s: string): Uint8Array {
   buf[0] = encoded.length & 0xff;
   buf[1] = (encoded.length >> 8) & 0xff;
   buf.set(encoded, 2);
+  return buf;
+}
+
+function encodeU128LE(v: bigint): Uint8Array {
+  if (v < 0n || v >= 1n << 128n) throw new Error("amount out of range");
+  const buf = new Uint8Array(16);
+  const dv = new DataView(buf.buffer);
+  dv.setBigUint64(0, v & ((1n << 64n) - 1n), true);
+  dv.setBigUint64(8, v >> 64n, true);
   return buf;
 }
 
@@ -82,7 +104,8 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 // ────────────────────── Payload builders ──────────────────────
 
 /**
- * Build `OP_CREATE_LISTING` input bytes.
+ * Build `OP_CREATE_LISTING` input bytes. `price` is native ASTRA in wei
+ * (u128); payments go straight to the publisher's address.
  */
 export function buildCreateListingInput(opts: {
   listingId: string;
@@ -96,7 +119,7 @@ export function buildCreateListingInput(opts: {
     new Uint8Array([EntitlementOp.CREATE_LISTING]),
     encodeString(opts.listingId),
     encodeString(opts.fileId),
-    encodeU64LE(opts.price),
+    encodeU128LE(opts.price),
     encodeString(opts.token),
     new Uint8Array([opts.pricingType]),
     encodeU64LE(opts.period),
@@ -140,6 +163,37 @@ export function buildVerifyInput(
     encodeString(fileId),
     buyerPkHash,
   );
+}
+
+/**
+ * Build `OP_VERIFY_LISTING` input bytes: the entitlement must be for
+ * `listingId`. An all-zero `buyerPkHash` skips the key check. Check the
+ * listing's publisher with `OP_GET_LISTING` too: anyone can create a listing.
+ */
+export function buildVerifyListingInput(
+  entitlementId: Uint8Array,
+  buyerDid: string,
+  listingId: string,
+  buyerPkHash: Uint8Array,
+): Uint8Array {
+  if (buyerPkHash.length !== 32) {
+    throw new Error("buyerPkHash must be 32 bytes");
+  }
+  return concat(
+    new Uint8Array([EntitlementOp.VERIFY_LISTING]),
+    entitlementId,
+    encodeString(buyerDid),
+    encodeString(listingId),
+    buyerPkHash,
+  );
+}
+
+/** Build `OP_RENEW` input bytes (attach the listing price as value). */
+export function buildRenewInput(entitlementId: Uint8Array): Uint8Array {
+  if (entitlementId.length !== 32) {
+    throw new Error("entitlementId must be 32 bytes");
+  }
+  return concat(new Uint8Array([EntitlementOp.RENEW]), entitlementId);
 }
 
 /**
@@ -189,6 +243,27 @@ export function buildRevokeInput(entitlementId: Uint8Array): Uint8Array {
   return concat(new Uint8Array([EntitlementOp.REVOKE]), entitlementId);
 }
 
+/** Chain submission, or a local-dev VM. */
+async function submitToLedger(
+  opts: { submitLedgerCall?: SubmitLedgerCall; vm?: SpacekitVm; contractId: string },
+  input: Uint8Array,
+  value: bigint,
+  callerDid: string,
+): Promise<Uint8Array> {
+  if (opts.submitLedgerCall) {
+    return opts.submitLedgerCall(input, value);
+  }
+  if (!opts.vm) {
+    throw new Error("pass submitLedgerCall (the ledger is on the chain)");
+  }
+  const tx = await opts.vm.submitTransaction(opts.contractId, input, callerDid, value);
+  const receipt = opts.vm.getReceipt(tx.id);
+  if (!receipt || receipt.status <= 0) {
+    throw new Error(`Ledger transaction failed: status=${receipt?.status ?? "none"}`);
+  }
+  return receipt.result;
+}
+
 // ────────────────────── Rewrap fetch ──────────────────────
 
 export interface RewrapOptions {
@@ -228,8 +303,13 @@ export async function fetchRewrappedEnvelope(
 // ────────────────────── End-to-end orchestration ──────────────────────
 
 export interface PurchaseAndDownloadOptions {
-  /** SpacekitVm instance for executing the purchase transaction. */
-  vm: SpacekitVm;
+  /**
+   * Submits the purchase to the ledger on the chain (where the payment is
+   * made). Preferred; required unless the VM runs `currency: "local-dev"`.
+   */
+  submitLedgerCall?: SubmitLedgerCall;
+  /** Local-dev only: execute the purchase on a local VM ledger. */
+  vm?: SpacekitVm;
   /** Contract ID (address) of the deployed entitlement-ledger. */
   contractId: string;
   /** Listing ID the buyer wants to purchase. */
@@ -260,26 +340,13 @@ export interface PurchaseAndDownloadOptions {
 export async function purchaseAndDownload(
   opts: PurchaseAndDownloadOptions,
 ): Promise<Uint8Array> {
-  // 1. Execute OP_PURCHASE on the VM
+  // 1. OP_PURCHASE on the ledger (on the chain, where the payment is made)
   const purchaseInput = buildPurchaseInput(
     opts.listingId,
     buyerPkHashFromPublicKeyHex(opts.buyerPublicKeyHex),
   );
-  const tx = await opts.vm.submitTransaction(
-    opts.contractId,
-    purchaseInput,
-    opts.buyerDid,
-    opts.paymentValue,
-  );
-
-  const receipt = opts.vm.getReceipt(tx.id);
-  if (!receipt || receipt.status <= 0) {
-    throw new Error(
-      `Purchase transaction failed: status=${receipt?.status ?? "none"}`,
-    );
-  }
-
-  const entitlementId = parsePurchaseResult(receipt.result);
+  const output = await submitToLedger(opts, purchaseInput, opts.paymentValue, opts.buyerDid);
+  const entitlementId = parsePurchaseResult(output);
   const entitlementIdHex = bytesToHex(entitlementId);
 
   // 2. Fetch re-wrapped envelope from the storage node
@@ -332,7 +399,10 @@ export async function uploadDeliveryCapsule(
 }
 
 export interface GrantAndPrepareDeliveryOptions {
-  vm: SpacekitVm;
+  /** Submits the grant to the ledger on the chain. */
+  submitLedgerCall?: SubmitLedgerCall;
+  /** Local-dev only: execute the grant on a local VM ledger. */
+  vm?: SpacekitVm;
   contractId: string;
   listingId: string;
   /** Publisher DID (must own the listing). */
@@ -374,19 +444,8 @@ export async function grantAndPrepareDelivery(
     opts.recipientDid,
     buyerPkHashFromPublicKeyHex(opts.recipientPublicKeyHex),
   );
-  const tx = await opts.vm.submitTransaction(
-    opts.contractId,
-    grantInput,
-    opts.publisherDid,
-  );
-  const receipt = opts.vm.getReceipt(tx.id);
-  if (!receipt || receipt.status <= 0) {
-    throw new Error(
-      `Grant transaction failed: status=${receipt?.status ?? "none"}`,
-    );
-  }
-
-  const entitlementId = parseGrantResult(receipt.result);
+  const output = await submitToLedger(opts, grantInput, 0n, opts.publisherDid);
+  const entitlementId = parseGrantResult(output);
   const entitlementIdHex = bytesToHex(entitlementId);
 
   const capsule = await opts.encryptFileKeyForRecipient(

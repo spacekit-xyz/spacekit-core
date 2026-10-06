@@ -487,7 +487,7 @@ impl SpacekitContract for DefiVault {
             )
             .into_bytes()),
             OP_BALANCE => Ok(format!(
-                r#"{{"asset":"AUSD","balance":"0","owner":"{}"}}"#,
+                r#"{{"asset":"ASTRA","balance_wei":"0","owner":"{}"}}"#,
                 get_caller_did_string()
             )
             .into_bytes()),

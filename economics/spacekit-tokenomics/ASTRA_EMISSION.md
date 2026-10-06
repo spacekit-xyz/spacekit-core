@@ -6,7 +6,7 @@
 **Date:** 2026
 **References:** ASTRA Economic Model Decision Memo; SpaceKit Tokenomics v2.0
 
-This document specifies the emission schedule for ASTRA — the rate at which new ASTRA is minted to operators as rewards for service. It provides the constants used by the AstraRewards contract and the protocol-level reward accumulator.
+This document specifies the emission schedule for ASTRA — the rate at which new ASTRA is minted to operators as rewards for service. It provides the constants used by the node's native rewards code (system address `0x…0003`, `native_rewards.rs`) and the protocol-level reward accumulator.
 
 The decisions in this document operationalize the ASTRA Economic Model Decision Memo. The 2B hard cap is enforced; the decay curve ensures asymptotic approach to the cap without exceeding it.
 
@@ -126,7 +126,7 @@ The exact measurement units, the relative weighting between sub-categories withi
 
 ## 7. Treasury allocation
 
-A portion of the 2B cap is held in a multi-signature wallet controlled by SWTCH Labs as the protocol treasury. Treasury ASTRA is used for:
+A portion of the 2B cap is held by the protocol treasury: the on-chain treasury contract at `0x…0004`, which pays only spends approved by M of its N signers (set in the PoA genesis file). Treasury ASTRA is used for:
 
 - Protocol development funding (paying contributors who build SpaceKit)
 - Audit and security work (paying for independent audits, bug bounties)
@@ -135,7 +135,7 @@ A portion of the 2B cap is held in a multi-signature wallet controlled by SWTCH 
 
 **Treasury initial allocation: 350,000,000 ASTRA (17.5% of cap).**
 
-This is minted to the treasury wallet at protocol genesis. It is NOT subject to the decay curve — it exists at genesis and decreases only as treasury spending decisions are made.
+This is minted to the treasury contract in the first block by the rewards `INIT` system call. It is NOT subject to the decay curve — it exists at genesis and decreases only as treasury spending decisions are made.
 
 **Treasury counts against the 2B cap.** Total ever-emitted = treasury allocation + cumulative operator emission. With ~1.154B asymptotic operator emission + 350M treasury = ~1.504B total, leaving ~496M as additional reserve.
 
@@ -159,7 +159,7 @@ The 50M that earlier drafts earmarked for bootstrap stake stays in the genesis t
 
 Emission during the PoA phase follows the normal schedule (§2–6): same curve, same category shares, same per-epoch proportional allocation. Nothing is capped or redirected.
 
-**Locking.** ASTRA credited during the PoA phase to an authority DID, or to any operator DID affiliated with SWTCH Labs or the SpaceKit Foundation, is credited to a **locked balance** in AstraRewards:
+**Locking.** ASTRA credited during the PoA phase to an authority DID, or to any operator DID affiliated with SWTCH Labs or the SpaceKit Foundation, is credited with `CREDIT_LOCKED` to a **locked balance** kept by the node's native rewards code. What has vested is released into the address's balance block by block:
 
 | Parameter | Value |
 |---|---|
@@ -196,14 +196,14 @@ The reserve cannot be allocated unilaterally by SWTCH Labs. Governance approval 
 
 ## 10. Cap enforcement
 
-The AstraRewards contract enforces the 2B cap at the protocol level:
+The node's native rewards code (`native_rewards.rs`) enforces the 2B cap at the protocol level:
 
-- `total_emitted` tracks cumulative ASTRA minted via the credit operation.
+- `rewards.total_emitted` tracks cumulative ASTRA minted via the credit operations (locked amounts included).
 - Each credit operation checks `total_emitted + credit_amount <= 2_000_000_000 * 10^18`.
 - If a credit would exceed the cap, it is rejected (the entire credit, not partial).
-- This is the backstop. The decay curve should prevent the cap from being reached in practice, but the contract enforces the cap regardless.
+- This is the backstop. The decay curve should prevent the cap from being reached in practice, but the node enforces the cap regardless.
 
-The contract does NOT have any path to mint above the cap, regardless of caller, signer, or governance action. This is a constant of the protocol.
+The node does NOT have any path to mint above the cap, regardless of caller, signer, or governance action. This is a constant of the protocol.
 
 ## 11. Decay curve as on-chain function
 
@@ -248,7 +248,7 @@ The following parameters may be adjusted by on-chain governance:
 **Not adjustable by governance:**
 - 2B hard cap
 - Treasury initial allocation (350M, set at genesis)
-- The non-burnability property (no automatic burn mechanism)
+- The burn rule (only used gas is burned; no burn tied to fee volume)
 
 ## 13. Honest limitations
 
@@ -274,16 +274,19 @@ A few honest acknowledgments:
 | Component | Status | Location |
 |-----------|--------|----------|
 | **Constants** | Aligned | `spacekit-primitives::v1::sdk::token` — `ASTRA_MAX_SUPPLY_WEI`, `ASTRA_GENESIS_TREASURY_WEI`, `ASTRA_INITIAL_ANNUAL_EMISSION_WEI` |
-| **AstraRewards contract** | Spec + Rust reference | [`../spacekit-standard-library/rewards/astra-rewards/`](../spacekit-standard-library/rewards/astra-rewards/) |
+| **Native rewards** (system address `0x…0003`) | Implemented | `spacekit-compute-node` `native_rewards.rs`: INIT / CREDIT / CREDIT_LOCKED / END_POA executed by the node, minting into native account balances. Replaces the AstraRewards WASM contract |
+| **Treasury** contract (`0x…0004`) | Implemented | Holds the 350M minted by INIT as native ASTRA; M-of-N spends, signers from the PoA genesis `treasury` section |
 | **SRA (reward accumulator)** | Wired (compute host) | [`spacekit-service-rewards`](../spacekit-service-rewards/), [`spacekit-compute-node/src/service_reward_accumulator.rs`](../spacekit-compute-node/src/service_reward_accumulator.rs) — hooks `SwtchvmNode::mine_block`; enable via `[compute.sra_config] enabled = true` |
-| **SRA → AstraRewards CREDIT** | Wired (when WASM built) | `SraHost` calls `OP_CREDIT` via `SwtchvmRuntime::call_contract_public` from `sra_admin_address`; set `apply_credits_onchain = false` to audit-only |
+| **SRA → CREDIT** | Implemented | The SRA places the rewards system calls at the start of a block; the node executes them natively, and every importer re-derives and checks them |
 | **Service log schema** | `spacekit-log` | `EventKind::Service` — canonical SRA topics; compute-node emits `ContractExecuted` on mined txs |
-| **Proof-of-authority bootstrap** | Implemented | `spacekit-compute-node/src/validator_governance.rs`, [`GOVERNANCE.md`](../../infra/spacekit-compute-node/GOVERNANCE.md): authorities, signed proposals, 10-validator lift, 30-day PoS grace |
-| **PoA-phase reward lock (§8a)** | Implemented | AstraRewards `SET_LOCKED_RECIPIENT` / `END_POA` / `RELEASE` / `GET_LOCKED` / `GET_PHASE`; locked balances vest from the INIT block time. `SraHost` marks the current authorities and `affiliated_operator_dids` (`SPACEKIT_AFFILIATED_OPERATOR_DIDS`) before crediting, and withholds a block's credits if the marks cannot be applied |
+| **Proof-of-authority bootstrap** | Implemented | `spacekit-compute-node/src/validator_governance.rs`, `chain_consensus.rs`, [`GOVERNANCE.md`](../../infra/spacekit-compute-node/GOVERNANCE.md): authorities, signed proposals applied in blocks, 10-validator lift, PoS grace period from the genesis file |
+| **PoA-phase reward lock (§8a)** | Implemented | Settlements are system transactions at the start of a block; credits to current authorities and `affiliated_operator_dids` are `CREDIT_LOCKED` (0x11) while the chain's governance state is PoA, and `END_POA` follows the lift. Locked balances vest from the genesis block time and are released into the balance block by block; `GET /v1/balance/{address}` reports `locked_wei` |
+| **Consensus category (§4–5)** | Implemented | One consensus unit per block to its `proposer_did` (the sealing authority or validator). Block production is how validators earn the consensus share, locked during PoA, which they can stake after the lift |
+| **Validator stake** | Implemented (no slashing) | `spacekit-compute-node/src/staking.rs`: SPHINCS+-signed bond/unbond messages applied in blocks; stake is drawn from native holdings (balance plus locked rewards not yet released); effective stake `min(bonded, holdings − unbonding)` weights block production and governance after the lift |
 | **Per-epoch settlement (§5)** | Implemented | `SraState::record_events` + `maybe_advance_epoch`: each category's epoch budget is split by measured units when the epoch closes |
 | **Storage/compute node minting** | Legacy testnet | Per-node calculators + daily caps — disable `enable_token_minting` when SRA is enabled — see [`operator-guides/README.md`](./operator-guides/README.md) |
 
-Legacy node `enable_token_minting` paths are **not** the production emission model; use SRA + AstraRewards for mainnet-aligned emission.
+Legacy node `enable_token_minting` paths are **not** the production emission model; use SRA + native rewards system calls for mainnet-aligned emission.
 
 ## 16. Contact
 

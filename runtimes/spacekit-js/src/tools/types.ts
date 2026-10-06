@@ -44,31 +44,24 @@ export interface RemoteStorageAdapter {
 
 /* ─── Payments (intent-based) ────────────────────────────── */
 
+/**
+ * A payment a contract asked for with `payment_transfer`. ASTRA is the only
+ * currency: `asset` is always "ASTRA" and `amount` is wei (decimal string).
+ */
 export interface PaymentEffect {
-  type: "transfer" | "vault_charge" | "sponsor_vault_charge";
+  type: "transfer";
   to: string;
-  asset: string;
+  asset: "ASTRA";
   amount: string;
-  beneficiary?: string;
-  /** Set when `type === "sponsor_vault_charge"` — vault debit is attributed to this sponsor. */
-  sponsorDid?: string;
-  /** Operation label validated against paymaster policy (e.g. `vault_charge`). */
-  operation?: string;
 }
 
+/**
+ * Carries out `payment_transfer` effects after a local execution. ASTRA moves
+ * only on the chain, so an implementation must submit a chain transaction
+ * (and is responsible for the payer's consent); it must never keep balances.
+ */
 export interface PaymentAdapter {
-  transfer(to: string, asset: string, amount: bigint): Promise<boolean>;
-  vaultCharge(amount: string, beneficiary: string): Promise<boolean>;
-  /**
-   * Optional: mirror `paymaster_sponsor_charge` to a treasury / payment API after the VM
-   * has already enforced in-memory sponsor policy and budget.
-   */
-  sponsorVaultCharge?(
-    sponsorDid: string,
-    amount: string,
-    beneficiaryDid: string,
-    operation: string,
-  ): Promise<boolean>;
+  transfer(to: string, asset: "ASTRA", amountWei: bigint): Promise<boolean>;
 }
 
 /* ─── Buffered side-effects (fire-and-forget) ────────────── */

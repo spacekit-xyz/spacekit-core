@@ -37,6 +37,18 @@ pub struct GovernanceArgs {
 pub enum GovernanceCommands {
     /// Consensus mode, authorities, and thresholds
     Status,
+    /// Staking rules, validators and their stake, and the block producers
+    Staking,
+    /// Bond or unbond this wallet's ASTRA as validator stake (signed, applied in the next block)
+    Stake {
+        #[arg(value_enum)]
+        action: StakeActionArg,
+        /// Amount in ASTRA (decimal, e.g. 15000 or 0.5)
+        amount: String,
+        /// Validator name shown by explorers
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// List proposals
     Proposals {
         /// Filter: pending, executed, rejected, expired, stale, failed
@@ -100,6 +112,63 @@ pub enum ProposeAction {
     },
     /// End proof of authority and switch to proof of stake (needs >= 10 validators)
     LiftPoa,
+    /// Change when blocks are produced (every node follows the decided setting)
+    SetBlockProduction {
+        /// on-demand: blocks only for transactions, due rewards, and heartbeats; interval: every block time
+        #[arg(long, value_enum)]
+        mode: ProductionMode,
+        /// Minimum gap between blocks (on-demand) or the block time (interval)
+        #[arg(long, default_value_t = 2000)]
+        block_time_ms: u64,
+        /// On-demand: wait this long after the first pending transaction
+        #[arg(long, default_value_t = 500)]
+        batch_window_ms: u64,
+        /// On-demand: an empty block after this much idle time (0 = never)
+        #[arg(long, default_value_t = 300)]
+        heartbeat_secs: u64,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum ProductionMode {
+    OnDemand,
+    Interval,
+}
+
+impl ProductionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProductionMode::OnDemand => "on_demand",
+            ProductionMode::Interval => "interval",
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum StakeActionArg {
+    /// Add stake (from the DID's AstraRewards holdings, locked or not)
+    Bond,
+    /// Start unbonding (stops counting now; released after the unbonding period)
+    Unbond,
+}
+
+/// Parse a decimal ASTRA amount into wei (18 decimals).
+fn astra_to_wei(amount: &str) -> Result<u128, Box<dyn std::error::Error>> {
+    let amount = amount.trim();
+    let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
+    if frac.len() > 18 || whole.is_empty() && frac.is_empty() {
+        return Err(format!("invalid ASTRA amount {amount:?}").into());
+    }
+    let whole: u128 = if whole.is_empty() { 0 } else { whole.parse()? };
+    let frac: u128 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<18}").parse()?
+    };
+    Ok(whole
+        .checked_mul(1_000_000_000_000_000_000)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or("amount too large")?)
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -119,6 +188,7 @@ impl Choice {
 
 struct Wallet {
     did: String,
+    pk_hex: String,
     secret_key: Vec<u8>,
 }
 
@@ -146,6 +216,7 @@ fn load_wallet(path: Option<&PathBuf>) -> Result<Wallet, Box<dyn std::error::Err
     }
     Ok(Wallet {
         did,
+        pk_hex: pk_hex.to_ascii_lowercase(),
         secret_key: hex::decode(sk_hex)?,
     })
 }
@@ -229,6 +300,16 @@ pub async fn handle_governance_command(args: &GovernanceArgs) -> CmdResult {
                     "not yet"
                 }
             );
+            let bp = &g["block_production"];
+            if bp.is_object() {
+                println!(
+                    "Blocks:         {} (block time {} ms, batch {} ms, heartbeat {} s)",
+                    bp["mode"].as_str().unwrap_or("?").replace('_', "-"),
+                    bp["block_time_ms"],
+                    bp["batch_window_ms"],
+                    bp["heartbeat_secs"]
+                );
+            }
             println!("Electorate:     {}", g["electorate_hash"].as_str().unwrap_or(""));
             println!("State hash:     {}", g["state_hash"].as_str().unwrap_or(""));
             if let Some(list) = g["authorities"].as_array() {
@@ -288,6 +369,20 @@ pub async fn handle_governance_command(args: &GovernanceArgs) -> CmdResult {
                     serde_json::json!({ "kind": "remove_authority", "did": did })
                 }
                 ProposeAction::LiftPoa => serde_json::json!({ "kind": "lift_poa" }),
+                ProposeAction::SetBlockProduction {
+                    mode,
+                    block_time_ms,
+                    batch_window_ms,
+                    heartbeat_secs,
+                } => serde_json::json!({
+                    "kind": "set_block_production",
+                    "config": {
+                        "mode": mode.as_str(),
+                        "block_time_ms": block_time_ms,
+                        "batch_window_ms": batch_window_ms,
+                        "heartbeat_secs": heartbeat_secs,
+                    },
+                }),
             };
             let now = chrono::Utc::now().timestamp();
             let period = (voting_days * 86_400.0).round() as i64;
@@ -362,6 +457,90 @@ pub async fn handle_governance_command(args: &GovernanceArgs) -> CmdResult {
             }
             let sig = sign(&wallet, format!("{PROPOSAL_DOMAIN}\n{body_json}").as_bytes())?;
             println!("{sig}");
+        }
+        GovernanceCommands::Staking => {
+            let v = get_json(&format!("{node}/v1/staking")).await?;
+            if v["enabled"] != true {
+                println!("This network has no on-chain staking (no PoA genesis).");
+                return Ok(());
+            }
+            println!("Mode:           {}", v["mode"].as_str().unwrap_or("").green());
+            println!(
+                "Minimum stake:  {} ASTRA, unbonding {} days",
+                v["params"]["min_stake_astra"],
+                v["params"]["unbonding_secs"].as_u64().unwrap_or(0) / 86_400
+            );
+            let producers = &v["producers"];
+            println!(
+                "Producers:      {} ({})",
+                producers["members"].as_array().map(Vec::len).unwrap_or(0),
+                if producers["weighted"] == true {
+                    "stake-weighted"
+                } else if producers["fallback"] == true {
+                    "authorities, no validator has the minimum stake yet"
+                } else {
+                    "authorities, round robin"
+                }
+            );
+            println!("\nValidators:");
+            for val in v["validators"].as_array().cloned().unwrap_or_default() {
+                let wei = |k: &str| {
+                    val[k].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0)
+                        / 1_000_000_000_000_000_000
+                };
+                println!(
+                    "   {} {}  bonded {} ASTRA, effective {} ASTRA, holds {} ASTRA{}",
+                    if val["active"] == true { "●".green() } else { "○".yellow() },
+                    val["did"].as_str().unwrap_or(""),
+                    wei("bonded_wei"),
+                    wei("effective_wei"),
+                    wei("holdings_wei"),
+                    val["name"].as_str().map(|n| format!(" ({n})")).unwrap_or_default()
+                );
+            }
+        }
+        GovernanceCommands::Stake {
+            action,
+            amount,
+            name,
+        } => {
+            let wallet = load_wallet(args.wallet.as_ref())?;
+            let g = get_json(&format!("{node}/v1/governance")).await?;
+            let network = g["network"].as_str().ok_or("node did not report its network")?;
+            let staking = get_json(&format!("{node}/v1/staking")).await?;
+            let nonce = staking["validators"]
+                .as_array()
+                .and_then(|vs| vs.iter().find(|v| v["did"].as_str() == Some(wallet.did.as_str())))
+                .and_then(|v| v["next_nonce"].as_u64())
+                .unwrap_or(0);
+            let amount_wei = astra_to_wei(amount)?;
+            let mut body = serde_json::json!({
+                "version": 1,
+                "network": network,
+                "did": wallet.did,
+                "sphincs_pk_hex": wallet.pk_hex,
+                "action": match action {
+                    StakeActionArg::Bond => "bond",
+                    StakeActionArg::Unbond => "unbond",
+                },
+                "amount_wei": amount_wei.to_string(),
+                "nonce": nonce,
+            });
+            if let Some(name) = name {
+                body["name"] = serde_json::Value::String(name.clone());
+            }
+            let body_json = serde_json::to_string(&body)?;
+            let signature_hex = sign(&wallet, format!("SPACEKIT-STAKE-v1\n{body_json}").as_bytes())?;
+            let res = post_json(
+                &format!("{node}/v1/staking"),
+                &serde_json::json!({ "body_json": body_json, "signature_hex": signature_hex }),
+            )
+            .await?;
+            println!(
+                "✅ Stake message {} ({}); it takes effect in the next block",
+                res["status"].as_str().unwrap_or(""),
+                res["tx_hash"].as_str().unwrap_or("")
+            );
         }
         GovernanceCommands::SignVote {
             proposal_id,
