@@ -25,6 +25,8 @@ Lower-ranked material must not override executable behavior.
 
 - [Developer network setup](guides/developer-network-setup.md) — local,
   permissioned-private, and public/testnet participation.
+- [Building on Windows](guides/windows-build.md) — WSL 2 (recommended) and the
+  native MSVC toolchain.
 - [Security verification](security/security-verification.md) — offline and
   live checks for compute and runtime security boundaries.
 - [CLI command reference](../tools/spacekit-cli/COMMANDS.md).
