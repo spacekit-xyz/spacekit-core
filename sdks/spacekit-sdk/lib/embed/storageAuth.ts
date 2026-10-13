@@ -224,8 +224,8 @@ export function websiteStorageSession(options: {
 
 /**
  * `recordSubscription` backed by the website API
- * (`POST {apiBase}/api/apps/:appId/subscriptions`), which verifies the payment
- * on-chain and writes the record as a trusted service.
+ * (`POST {apiBase}/api/apps/:appId/subscriptions`), which verifies the ASTRA payment
+ * on the SpaceKit chain and writes the record as a trusted service.
  */
 export function createSubscriptionRecorder(options: {
   apiBase: string;
@@ -244,10 +244,9 @@ export function createSubscriptionRecorder(options: {
         headers: { "Content-Type": "application/json", Authorization: authorization },
         body: JSON.stringify({
           publisher_did: req.publisherDid,
-          amount_cents: req.amountCents,
+          amount_wei: req.amountWei,
           period_days: req.periodDays,
           tx_hash: req.txHash,
-          payer_address: req.payerAddress,
         }),
       },
     );

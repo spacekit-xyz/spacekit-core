@@ -86,7 +86,29 @@ export interface MountSpacekitAppOptions {
   /** Storage origin passed to the SDK bridge (defaults to `storageOrigin`). */
   bridgeStorageOrigin?: string;
   services: EmbedHostServices;
-  acquireBridge: (appId: string, storageOrigin: string, manifestName: string) => EmbeddedSdkBridge;
+  /**
+   * `collectionScope` is set for plugin installs (see `install`); pass it on to
+   * `acquireAppDataSdkBridge` so each install gets its own data.
+   */
+  acquireBridge: (
+    appId: string,
+    storageOrigin: string,
+    manifestName: string,
+    collectionScope?: string,
+  ) => EmbeddedSdkBridge;
+  /**
+   * Mount the package as a plugin installed in another app
+   * (`@spacekit/sdk/plugins`, `pluginInstallScope`). Its documents then live in
+   * the host app owner's namespace under a per-install scope, and `payments`
+   * is refused. Combine with `capabilities: pluginCapabilityPolicy(...)` so the
+   * plugin gets no more than the host app has.
+   */
+  install?: {
+    /** Install scope label (`i<hex>`), from `pluginInstallScope().collectionScope`. */
+    collectionScope: string;
+    /** The host app owner's DID, who owns the plugin's data in this app. */
+    ownerDid: string;
+  };
   endpoints?: EmbedEndpoints;
   /** Origin reported to the app in its embed config. Defaults to the host page origin. */
   parentOrigin?: string;
@@ -276,13 +298,16 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
 
     // The bridge exists only once the app is allowed to run.
     const bridgeOrigin = options.bridgeStorageOrigin ?? options.storageOrigin;
-    bridge = options.acquireBridge(options.appId, bridgeOrigin, manifest.name);
-    configureBridgeOwner(bridge, verified.creatorDid);
+    bridge = options.acquireBridge(options.appId, bridgeOrigin, manifest.name, options.install?.collectionScope);
+    configureBridgeOwner(bridge, options.install?.ownerDid ?? verified.creatorDid);
     await bridge.ensureHydrated();
     if (disposed) return;
 
     const policy: CapabilityPolicy = {
       ...options.capabilities,
+      ...(options.install
+        ? { deny: [...new Set([...(options.capabilities?.deny ?? []), "payments", "identity:auth-headers"])] }
+        : {}),
       trustedOrigins:
         options.capabilities?.trustedOrigins ??
         defaultTrustedOrigins([

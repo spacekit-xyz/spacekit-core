@@ -155,6 +155,15 @@ export {
 } from "./protocol.js";
 
 export {
+  chainAddressOfDid,
+  createAstraPaymentRequester,
+  type AstraPaymentPrompt,
+  type AstraPaymentRequesterOptions,
+} from "./payments.js";
+
+export { ASTRA_DECIMALS, WEI_PER_ASTRA, formatAstra, parseAstra, parseWei } from "../astra.js";
+
+export {
   createStorageAuthClient,
   createSubscriptionRecorder,
   websiteStorageSession,

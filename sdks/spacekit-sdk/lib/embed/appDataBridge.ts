@@ -1,3 +1,4 @@
+import { priceFromParams } from "../astra.js";
 import type { EmbeddedSdkBridge } from "./bridge.js";
 import type {
   AppCredentials,
@@ -18,7 +19,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 interface SubscriptionRecord {
   buyerDid: string;
   expiresAt: number;
-  amountCents: number;
+  /** ASTRA wei, decimal string. */
+  amountWei?: string;
   periodDays: number;
   txHash?: string;
   updatedAt: string;
@@ -48,6 +50,8 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
   private readonly storageOrigin: string;
   private readonly services: EmbedHostServices;
   private readonly httpHandler: EmbeddedHttpHandler;
+  /** Per-install infix for plugins (`i<hex>`), so installs never share data. */
+  private readonly collectionScope: string | null;
   private pushToIframe: ((topic: string, msg: unknown) => void) | null = null;
   private legacyWarned = false;
 
@@ -56,8 +60,13 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
     storageOrigin: string,
     services: EmbedHostServices,
     httpHandler: EmbeddedHttpHandler,
+    collectionScope?: string,
   ) {
     this.appId = appId.trim().toLowerCase();
+    if (collectionScope !== undefined && !/^i[0-9a-f]{1,16}$/.test(collectionScope)) {
+      throw new Error("collectionScope must be an install scope label (i + up to 16 hex)");
+    }
+    this.collectionScope = collectionScope ?? null;
     this.storageOrigin = storageOrigin;
     this.services = services;
     this.httpHandler = httpHandler;
@@ -84,7 +93,9 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
 
   private scopedCollection(collection: string): string {
     const clean = collection.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "default";
-    return `app_${this.appId}_${clean}`;
+    return this.collectionScope
+      ? `app_${this.appId}_${this.collectionScope}_${clean}`
+      : `app_${this.appId}_${clean}`;
   }
 
   private isOwnerViewer(): boolean {
@@ -192,7 +203,8 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
       active: expiresAt > Date.now(),
       expiresAt: expiresAt || null,
       viewerDid: viewer,
-      amountCents: record?.amountCents,
+      amountWei: record?.amountWei,
+      asset: "ASTRA",
       verified: record?.verified === true,
     };
   }
@@ -204,38 +216,36 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
     const pay = this.services.requestSubscriptionPayment;
     if (!pay) throw new Error("Payments are not configured on this host");
 
-    const amountCents = Math.round(Number(params.amountCents));
-    if (!amountCents || amountCents <= 0) throw new Error("subscribe: invalid amountCents");
+    const amountWei = priceFromParams(params, "payments.subscribe").toString();
     const periodDays = Math.max(1, Math.round(Number(params.periodDays) || DEFAULT_PERIOD_DAYS));
 
     const req: SubscriptionPaymentRequest = {
       publisherDid,
       appId: this.appId,
-      amountCents,
+      amountWei,
+      asset: "ASTRA",
     };
     const record = this.services.recordSubscription;
     if (!record) {
       // Checked before paying: without a verifying service the record could not be stored.
       throw new Error("This host cannot record verified subscriptions");
     }
-    const { txHash, payerAddress } = await pay(req);
+    const { txHash } = await pay(req);
 
-    // A trusted service verifies the payment and writes the record; storage
-    // nodes refuse subscription records written by clients.
+    // A trusted service verifies the ASTRA payment on the chain and writes the
+    // record; storage nodes refuse subscription records written by clients.
     const status = await record.call(this.services, {
       appId: this.appId,
       publisherDid,
-      amountCents,
+      amountWei,
       periodDays,
       txHash,
-      payerAddress,
     });
 
     const purchase: MarketplacePurchaseRecord = {
       buyerDid: viewer,
       appId: this.appId,
       txHash,
-      payerAddress,
     };
     void this.services.recordMarketplacePurchase?.(purchase).catch(() => {});
 
@@ -267,7 +277,7 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
       if (method === "status") return this.subscriptionStatus();
       if (method === "subscribe") return this.subscribe(params);
       if (method === "config") {
-        return { publisherDid: this.ownerDid, currency: "USD", model: "subscription" };
+        return { publisherDid: this.ownerDid, currency: "ASTRA", decimals: 18, model: "subscription" };
       }
       if (method === "charge") return this.subscribe(params);
       throw new Error(`Unknown payments method: ${method}`);
@@ -306,7 +316,8 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
     // Generic KV for vibe-coded / Token Wall-style apps. Uses localStorage so any
     // viewer can persist (documents.* requires owner DID auth).
     if (module === "storage") {
-      const lsKey = (key: string) => `spacekit:appdata:${this.appId}:${key}`;
+      const scope = this.collectionScope ? `${this.collectionScope}:` : "";
+      const lsKey = (key: string) => `spacekit:appdata:${this.appId}:${scope}${key}`;
       if (method === "ready") return { ready: true, appId: this.appId };
       if (method === "get" || method === "getRecord") {
         const key = String(params.key ?? "");
@@ -361,11 +372,13 @@ export function acquireAppDataSdkBridge(
   httpHandler: EmbeddedHttpHandler,
   appId: string,
   storageOrigin: string,
+  /** Plugin installs: the install scope label from `pluginInstallScope`. */
+  collectionScope?: string,
 ): AppDataSdkBridge {
-  const key = `${appId.trim().toLowerCase()}@${storageOrigin}`;
+  const key = `${appId.trim().toLowerCase()}${collectionScope ? `/${collectionScope}` : ""}@${storageOrigin}`;
   const cached = bridgeCache.get(key);
   if (cached) return cached;
-  const bridge = new AppDataSdkBridge(appId, storageOrigin, services, httpHandler);
+  const bridge = new AppDataSdkBridge(appId, storageOrigin, services, httpHandler, collectionScope);
   bridgeCache.set(key, bridge);
   return bridge;
 }

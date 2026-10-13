@@ -50,6 +50,9 @@ export type {
   ClientEvent,
 } from './SpacekitClient';
 
+// ASTRA amounts (SpaceKit's only currency)
+export { ASTRA_DECIMALS, WEI_PER_ASTRA, formatAstra, parseAstra, parseWei } from './astra';
+
 // Crypto utilities
 export { safeUUID } from './crypto';
 
