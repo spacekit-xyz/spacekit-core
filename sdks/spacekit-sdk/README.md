@@ -201,7 +201,10 @@ const host = createLocalStorageEmbedHost({
 
 A host with its own API adds `apiAuthorization`, for example from the website-api's `POST /api/auth/app-token`.
 
-For viewers signed in to your API rather than holding a `did:key`, pass `getSession: websiteStorageSession({ apiBase, getBearer })` instead of `getSigner`. Paid apps need `recordSubscription: createSubscriptionRecorder({ apiBase, authorization })`, so that a server verifies the payment before the subscription is recorded.
+For viewers signed in to your API rather than holding a `did:key`, pass `getSession: websiteStorageSession({ apiBase, getBearer })` instead of `getSigner`. Paid apps need two hooks. Prices are in ASTRA, SpaceKit's only currency; apps call `payments.subscribe({ amountAstra: "2.5" })` (or `amountWei`).
+
+- `requestSubscriptionPayment: createAstraPaymentRequester({ confirm, transfer })` shows the viewer the price and payee, then sends the ASTRA transfer on the SpaceKit chain (for example with spacekit-js `ChainClient.transfer`). It never holds keys.
+- `recordSubscription: createSubscriptionRecorder({ apiBase, authorization })` has a server verify the transaction on the chain before the subscription is recorded.
 
 ### Signed packages
 
@@ -210,6 +213,49 @@ Publishers sign with `spacekit app package … --sign-key <seed-file>`. Hosts ch
 ```ts
 trustPolicy={allowPublishers(["did:key:z6Mk…"])} // must be signed by a listed key
 ```
+
+## Plugins
+
+A plugin is a feature one author publishes and others add to their apps: a chat panel, a paid newsletter, an agent, a trained brain. `@spacekit/sdk/plugins` validates descriptors (`spacekit-plugin.json`), applies the install rules, and loads brain plugins. The full specification is `sdks/spacekit-apps/SPACEKIT-PLUGIN-SPEC.md`.
+
+```ts
+import {
+  parsePluginDescriptor, describePlugin, checkPluginPermissions,
+  pluginCapabilityPolicy, pluginInstallScope, resolvePluginConfig,
+} from "@spacekit/sdk/plugins";
+
+const plugin = parsePluginDescriptor(descriptorJson);
+const lines = describePlugin(plugin);                     // plain-language install screen
+const check = checkPluginPermissions(plugin.permissions, hostApp.manifest.permissions);
+if (check.missing.length) throw new Error(`Needs: ${check.missing.join(", ")}`);
+const settings = resolvePluginConfig(plugin, ownerSettings);
+const scope = pluginInstallScope({ pluginAppId, hostAppId, hostOwnerDid });
+
+mountSpacekitApp(el, {
+  appId: scope.pluginAppId,
+  install: { collectionScope: scope.collectionScope, ownerDid: scope.ownerDid },
+  capabilities: pluginCapabilityPolicy({ check }),
+  acquireBridge: (id, origin, _name, cs) => acquireAppDataSdkBridge(services, http, id, origin, cs),
+  /* storageOrigin, services, trustPolicy, requestPermissions … */
+});
+```
+
+The plugin gets no more than the host app has, its data lives in the app owner's namespace (one scope per install), and it cannot take payments from the app's viewers.
+
+Brains (Growformer and others) are plugins of kind `brain`: data, pinned by SHA-256, loaded only after every file verifies.
+
+```ts
+import * as spacekit from "@spacekit/spacekit-js";
+import { loadBrainPlugin, growformerEngine, httpBrainFileFetcher } from "@spacekit/sdk/plugins";
+
+await spacekit.initGrowformerHost();
+await loadBrainPlugin(brain, {
+  engine: growformerEngine(spacekit),
+  fetchFile: httpBrainFileFetcher((f) => `${apiBase}/api/files/${f.path}`),
+});
+```
+
+`spacekit-plugin init | validate | hash | sign` scaffolds, checks, hashes and signs descriptors.
 
 ### Upgrading from the pre-v1 frame
 
@@ -232,6 +278,8 @@ trustPolicy={allowPublishers(["did:key:z6Mk…"])} // must be signed by a listed
 | `@spacekit/sdk/embed/element` | `<spacekit-app>` custom element |
 | `@spacekit/sdk/react/embed` | `SpacekitEmbeddedApp` / `SpacekitAppFrame` React components |
 | `@spacekit/sdk/guest` | Types and accessor for `window.spacekit`, for use inside apps |
+| `@spacekit/sdk/plugins` | Plugin descriptors, install rules, brain loading, descriptor signatures |
+| `@spacekit/sdk/astra` | ASTRA amounts: `parseAstra`, `formatAstra`, `parseWei` |
 | `@spacekit/sdk/frame-host/spacekit-frame.html` | Frame-host page template for `isolation: "origin"` (placeholder host; regenerate with `spacekit-frame-host`) |
 | `@spacekit/sdk/styles` | Default CSS styles |
 

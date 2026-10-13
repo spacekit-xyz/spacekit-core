@@ -66,6 +66,14 @@
       "import": "./dist/embed/guest.js",
       "types": "./dist/embed/guest.d.ts"
     },
+    "./plugins": {
+      "import": "./dist/plugins/index.js",
+      "types": "./dist/plugins/index.d.ts"
+    },
+    "./astra": {
+      "import": "./dist/astra.js",
+      "types": "./dist/astra.d.ts"
+    },
     "./react/embed": {
       "import": "./dist/react/embed/index.js",
       "types": "./dist/react/embed/index.d.ts"
@@ -74,7 +82,8 @@
     "./frame-host/spacekit-frame.html": "./dist/frame-host/spacekit-frame.html"
   },
   "bin": {
-    "spacekit-frame-host": "./bin/spacekit-frame-host.mjs"
+    "spacekit-frame-host": "./bin/spacekit-frame-host.mjs",
+    "spacekit-plugin": "./bin/spacekit-plugin.mjs"
   },
   "files": [
     "dist",
@@ -88,7 +97,7 @@
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint lib --ext .ts,.tsx",
-    "test": "echo \"Tests pending\" && exit 0"
+    "test": "node --test test/plugins.test.mjs"
   },
   "keywords": [
     "spacekit",
@@ -101,7 +110,8 @@
     "decentralized",
     "kyber",
     "post-quantum",
-    "encryption"
+    "encryption",
+    "plugins"
   ],
   "author": "SpaceKit Team",
   "license": "MIT",

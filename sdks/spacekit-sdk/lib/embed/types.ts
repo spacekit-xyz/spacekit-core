@@ -43,39 +43,47 @@ export interface EmbedEndpoints {
   wasmUrl?: string;
 }
 
+/**
+ * A payment the host asks the viewer to approve: an ASTRA transfer on the
+ * SpaceKit chain to the publisher. The host signs and submits it with the
+ * viewer's consent and returns the transaction hash.
+ */
 export interface SubscriptionPaymentRequest {
   publisherDid: string;
   appId: string;
-  amountCents: number;
+  /** ASTRA wei, decimal string. */
+  amountWei: string;
+  asset: "ASTRA";
 }
 
 export interface SubscriptionPaymentResult {
+  /** SpaceKit chain transaction hash (`0x…`). */
   txHash: string;
-  payerAddress?: string;
 }
 
 export interface MarketplacePurchaseRecord {
   buyerDid: string;
   appId: string;
   txHash?: string;
-  payerAddress?: string;
 }
 
 /** Payment details the host hands to its subscription service for verification. */
 export interface SubscriptionRecordRequest {
   appId: string;
   publisherDid: string;
-  amountCents: number;
+  /** ASTRA wei, decimal string. */
+  amountWei: string;
   periodDays: number;
   txHash: string;
-  payerAddress?: string;
 }
 
 export interface SubscriptionStatus {
   active: boolean;
   expiresAt: number | null;
   viewerDid: string | null;
-  amountCents?: number;
+  /** ASTRA wei paid for the current period, decimal string. */
+  amountWei?: string;
+  asset?: "ASTRA";
   reason?: string;
   /** True when a server verified the payment behind the record. */
   verified?: boolean;

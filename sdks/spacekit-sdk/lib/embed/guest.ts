@@ -29,9 +29,19 @@ export interface SpacekitSubscriptionStatus {
   active: boolean;
   expiresAt: number | null;
   viewerDid: string | null;
-  amountCents?: number;
+  /** ASTRA wei paid for the current period, decimal string. */
+  amountWei?: string;
+  asset?: "ASTRA";
+  /** True when a server verified the payment on the SpaceKit chain. */
+  verified?: boolean;
   reason?: string;
 }
+
+/**
+ * A subscription price in ASTRA: `amountAstra` ("1.5") or `amountWei`
+ * (integer string). ASTRA is SpaceKit's only currency.
+ */
+export type SpacekitPrice = { amountAstra: string; amountWei?: never } | { amountWei: string; amountAstra?: never };
 
 export interface SpacekitGuestApi {
   readonly appId: string;
@@ -60,8 +70,9 @@ export interface SpacekitGuestApi {
   };
   payments: {
     status(): Promise<SpacekitSubscriptionStatus>;
-    subscribe(options: { amountCents: number; periodDays?: number }): Promise<SpacekitSubscriptionStatus>;
-    config(): Promise<{ publisherDid: string | null; currency: string; model: string }>;
+    /** The host asks the viewer to approve an ASTRA payment to the publisher. */
+    subscribe(options: SpacekitPrice & { periodDays?: number }): Promise<SpacekitSubscriptionStatus>;
+    config(): Promise<{ publisherDid: string | null; currency: "ASTRA"; decimals: number; model: string }>;
   };
   identity: {
     did(): Promise<string | null>;

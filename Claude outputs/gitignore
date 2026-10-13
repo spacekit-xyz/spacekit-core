@@ -1,0 +1,46 @@
+# ---- Suggested root .gitignore for spacekit-projects ----
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Dependencies & build output
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+.vite/
+.vite-temp/
+
+# SpaceKit packaging & deploy state
+*.spkg
+*.spkg.files/
+package-staging/
+deploy-receipt.json
+*.log
+.spacekit/repo/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+**/swx/compute_storage/
+**/.keymaster-test-backup/
+
+# Trained brains & large data (use Git LFS or Releases instead)
+*.bin
+*.bin.zip
+*.bak-*
+*.prev.bin
+language/wordnet/data/shards/
+language/wordnet/data/wordnet_graph.json
+language/wordnet/data/eval_wordnet_lookup.jsonl
+
+# Duplicated archives of already-committed source
+blockchain/spacetime-consensus-agent/*.zip
+blockchain/spacetime-consensus-agent/*.tar.gz

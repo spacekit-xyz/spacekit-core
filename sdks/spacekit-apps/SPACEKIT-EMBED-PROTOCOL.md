@@ -103,7 +103,7 @@ The guard receives each call first. It either rejects it, which becomes a `res` 
 | `identity.did` / `getState` | none | Reveals the viewer DID to the app. |
 | `identity.setState` | `identity:write` | `myDid` is always removed unless the host sets `allowIdentityOverride`. |
 | `identity.authHeaders` | `identity:auth-headers` | Hands over the session token. Refused unless the host sets `exposeAuthHeaders`, a legacy option. |
-| `payments.status` / `config` / `subscribe` / `charge` | none | The host's payment UI asks the viewer to confirm. `subscribe` needs the host's `recordSubscription` hook: a trusted service verifies the payment and writes the record (§11). Without the hook it fails before any payment is taken. |
+| `payments.status` / `config` / `subscribe` / `charge` | none | Prices are in ASTRA, SpaceKit's only currency: `subscribe({ amountAstra: "1.5" })` or `{ amountWei }`. USD amounts are refused. The host asks the viewer to confirm and sends an ASTRA transfer on the SpaceKit chain (`requestSubscriptionPayment`; `createAstraPaymentRequester` builds one). `subscribe` also needs the host's `recordSubscription` hook: a trusted service verifies the transaction and writes the record (§11). Without the hook it fails before any payment is taken. |
 | `messaging.publish` / `subscribe` | none | Local to the frame (loopback). |
 | `messaging.send` / `list` | `messaging` | |
 | `http.fetch` / `sseSubscribe` / `sseClose` | see §6.2 | |
@@ -240,10 +240,18 @@ The signature is Ed25519 over the UTF-8 bytes of `"SpaceKit package signature v1
 
 ## 11. Known gaps
 
-- **Subscriptions: price is set by the app.** Subscriptions are server-verified: the SpaceKit Pay transaction must route at least `amount_cents` to the publisher, each transaction counts once, and only a trusted service writes the record. If the app has a marketplace listing, the listing sets the publisher and the minimum price. Without a listing, the app names the price in `payments.subscribe`. So apps should check `amountCents` (and `verified`) in `payments.status` against their own price.
+- **Subscriptions: price is set by the app.** Subscriptions are server-verified: the SpaceKit chain transaction must succeed and pay at least `amount_wei` ASTRA to the publisher (the address in a `did:spacekit:` DID, the publisher's registered payout address, the listing's `pay_to`, or the entitlement ledger), each transaction counts once, and only a trusted service writes the record. If the app has a marketplace listing, the listing sets the publisher and the minimum price. Without a listing, the app names the price in `payments.subscribe`. So apps should check `amountWei` (and `verified`) in `payments.status` against their own price.
 - **Asset URLs.** Asset paths are rewritten only in the entry HTML. Relative `url()` references in CSS and relative ES-module imports between chunks do not resolve from `blob:` URLs. This is the same as before v1.
 
-## 12. Compatibility
+## 12. Plugin installs
+
+A package can also run as a plugin inside another app (`SPACEKIT-PLUGIN-SPEC.md`). The host mounts it with `install: { collectionScope, ownerDid }`:
+
+- `documents.*` go to `app_<pluginAppId>_<collectionScope>_<collection>` in the host app owner's namespace, so each install has its own data and the plugin author cannot read it.
+- `payments.*` and `identity.authHeaders` are refused.
+- The host's capability policy should come from `pluginCapabilityPolicy`, so the plugin gets no more than the host app has.
+
+## 13. Compatibility
 
 - The guest shim is injected by the host, so packages built for the old bridge need no rebuild. They behave differently only if they call `identity.authHeaders`, write `myDid`, or depend on IndexedDB, cookies or service workers in opaque mode.
 - Removed from the old bridge: replies broadcast with `postMessage("*")`, `identity.authHeaders` by default, app-controlled `myDid` writes, and credentials sent to any URL.
