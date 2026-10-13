@@ -289,7 +289,7 @@ export function injectSdkBridgeIntoHtml(
       status:function(){return window.spacekit.call("payments","status",{})},
       subscribe:function(o){return window.spacekit.call("payments","subscribe",o||{})},
       config:function(){return window.spacekit.call("payments","config",{})},
-      charge:function(a,t){return window.spacekit.call("payments","charge",{amount:a,token:t})},
+      charge:function(o){return window.spacekit.call("payments","charge",(o&&typeof o==="object")?o:{amountAstra:String(o)})},
     },
     identity:{
       did:function(){return window.spacekit.call("identity","did",{})},
@@ -300,6 +300,28 @@ export function injectSdkBridgeIntoHtml(
     crypto:{
       encryptUpload:function(blob,ownerPubkey){return window.spacekit.call("crypto","encryptUpload",{blob:blob,ownerPubkey:ownerPubkey||"demo-owner"})},
       decryptBlob:function(cid,iv,wrappedKey){return window.spacekit.call("crypto","decryptBlob",{cid:cid,iv:iv,wrappedKey:wrappedKey})},
+    },
+    plugins:{
+      call:function(id,method,params){return window.spacekit.call("plugins","call",{plugin:id,method:method,params:params||{}})},
+      list:function(){return window.spacekit.call("plugins","list",{})},
+      config:function(){return window.spacekit.call("plugins","config",{})},
+      serve:function(method,handler){
+        if(!window.__skPluginHandlers){
+          window.__skPluginHandlers={};
+          if(!window.__skTopicSubs)window.__skTopicSubs={};
+          if(!window.__skTopicSubs["__plugins:request"])window.__skTopicSubs["__plugins:request"]=[];
+          window.__skTopicSubs["__plugins:request"].push({id:"__plugins",cb:function(req){
+            var h=req&&window.__skPluginHandlers[req.method];
+            var answer=function(body){body.requestId=req.requestId;return window.spacekit.call("plugins","respond",body)};
+            if(!h){answer({error:"no handler for "+(req&&req.method)});return}
+            Promise.resolve().then(function(){return h(req.params||{})}).then(
+              function(r){answer({result:r===undefined?null:r})},
+              function(e){answer({error:String((e&&e.message)||e||"error")})});
+          }});
+        }
+        window.__skPluginHandlers[method]=handler;
+        return function(){if(window.__skPluginHandlers[method]===handler)delete window.__skPluginHandlers[method]};
+      },
     },
     app:{
       ready:function(){return window.spacekit.call("app","ready",{})},

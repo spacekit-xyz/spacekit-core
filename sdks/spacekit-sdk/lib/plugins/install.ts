@@ -190,6 +190,12 @@ export function describePlugin(descriptor: PluginDescriptor): string[] {
         `Download size: ${size >= 1024 * 1024 ? `${(size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(size / 1024))} KB`}`,
       );
     }
+    const base = descriptor.brain.base_model;
+    if (base) {
+      lines.push(
+        `Also needs the open model ${base.name} (${(base.size / (1024 * 1024 * 1024)).toFixed(1)} GB, license: ${base.license}), downloaded separately`,
+      );
+    }
     if (descriptor.brain.training?.summary) lines.push(`Trained on: ${descriptor.brain.training.summary}`);
     if (descriptor.brain.training?.includes_captured_conversations) {
       lines.push("Trained partly on captured conversations");

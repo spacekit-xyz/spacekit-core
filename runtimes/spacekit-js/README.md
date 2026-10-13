@@ -1059,6 +1059,7 @@ flowchart LR
 - **Fire-and-forget**: Pattern for side-effect tools (messaging, payments) where the host buffers the effect and returns immediately; flushed after contract execution.
 - **Messaging Node**: P2P relay for inter-agent communication and external API access. Operators fulfill requests server-side and sign responses.
 - **Growformer**: Local neural network brain loaded into WASM for gas-only inference (generation, converse, codegen). No external API calls.
+- **`GrowformerInstance`**: One of several Growformer brains on a page, each with its own conversation, inference rules, topic graph and grounding graph (`GrowformerInstance.create()`, `loadBrain`, `converse`, `destroy`). Needs a Growformer build with the instance API (`isGrowformerMultiInstance()`); the `initGrowformerHost`/`loadGrowformerBrain` functions keep driving the default brain.
 - **EIP-1193**: Ethereum provider interface (`window.ethereum`).
 - **LWW**: Last-write-wins merge strategy for sync conflicts.
 - **Multi-runtime**: Ability to run the same codebase on browser, Node.js, and Bun.

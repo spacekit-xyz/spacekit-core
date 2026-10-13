@@ -58,6 +58,13 @@ export type {
   InitGrowformerHostWithBrainFromUrlOptions,
 } from "./growformer/runtime.js";
 export {
+  GrowformerInstance,
+  growformerEngineInfo,
+  isGrowformerMultiInstance,
+  listGrowformerInstances,
+} from "./growformer/instances.js";
+export type { GrowformerEngineInfo } from "./growformer/instances.js";
+export {
   configureGrowformerCapture,
   newGrowformerCaptureSession,
   isGrowformerCaptureEnabled,

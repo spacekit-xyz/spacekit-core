@@ -272,3 +272,147 @@ test("descriptor signatures", async () => {
   const wrongDid = JSON.stringify({ v: 1, alg: "ed25519", did: "did:key:z6Mkdeadbeef", public_key: pub.toString("hex"), signature: sig });
   assert.match((await P.verifyPluginDescriptorSignature(bytes, wrongDid)).reason, /DID/);
 });
+
+test("plugin router: app calls a service plugin through the host", async () => {
+  const svc = P.parsePluginDescriptor({
+    spacekit_plugin: 1, id: "acme.translate", name: "Translate", version: "1.0.0", kind: "service",
+    publisher: "did:key:z6MkA", summary: "Translates text.",
+    service: { methods: { translate: { description: "Translate text", params: {
+      text: { type: "string", label: "Text", required: true, max_length: 100 },
+      to: { type: "select", label: "Language", options: ["en", "es"], default: "en" },
+    } } } },
+  });
+  const router = new P.PluginRouter({ timeoutMs: 50 });
+  router.install({ pluginAppId: "ABC123", descriptor: svc, config: { tone: "formal" } });
+  assert.deepEqual(router.list().map((p) => [p.id, p.methods]), [["acme.translate", ["translate"]]]);
+  await assert.rejects(router.handleAppCall("call", { plugin: "acme.translate", method: "translate", params: { text: "hola" } }), /not running/);
+
+  // The plugin frame answers requests it receives as events.
+  router.attachFrame("abc123", (topic, msg) => {
+    assert.equal(topic, P.PLUGIN_REQUEST_TOPIC);
+    queueMicrotask(() => router.handlePluginCall("abc123", "respond", { requestId: msg.requestId, result: `${msg.params.to}:${msg.params.text}` }));
+  });
+  assert.equal(await router.handleAppCall("call", { plugin: "acme.translate", method: "translate", params: { text: "hola" } }), "en:hola");
+  assert.equal(await router.handleAppCall("call", { plugin: "abc123", method: "translate", params: { text: "hi", to: "es" } }), "es:hi");
+  await assert.rejects(router.handleAppCall("call", { plugin: "acme.translate", method: "delete", params: {} }), /no method/);
+  await assert.rejects(router.handleAppCall("call", { plugin: "acme.translate", method: "translate", params: { text: "x", to: "fr" } }), /one of/);
+  await assert.rejects(router.handleAppCall("call", { plugin: "acme.translate", method: "translate", params: { extra: 1, text: "x" } }), /not a parameter/);
+  await assert.rejects(router.handleAppCall("call", { plugin: "nope", method: "translate", params: {} }), /not installed/);
+  assert.deepEqual(router.handlePluginCall("abc123", "config", {}), { tone: "formal" });
+  assert.throws(() => router.handlePluginCall("abc123", "call", {}), /not available to plugins/);
+  assert.throws(() => router.handlePluginCall("other", "config", {}), /not installed/);
+
+  // Errors from the plugin, answers from the wrong plugin, timeouts, detach.
+  router.attachFrame("abc123", (_t, msg) => queueMicrotask(() => router.handlePluginCall("abc123", "respond", { requestId: msg.requestId, error: "quota exceeded" })));
+  await assert.rejects(router.handleAppCall("call", { plugin: "abc123", method: "translate", params: { text: "a" } }), /quota exceeded/);
+  router.install({ pluginAppId: "def456", descriptor: { ...svc, id: "acme.other" }, config: {} });
+  let lastId;
+  router.attachFrame("abc123", (_t, msg) => { lastId = msg.requestId; });
+  const pending = router.handleAppCall("call", { plugin: "abc123", method: "translate", params: { text: "a" } });
+  assert.equal(router.handlePluginCall("def456", "respond", { requestId: lastId, result: "forged" }), false);
+  await assert.rejects(pending, /did not answer in time/);
+  const pending2 = router.handleAppCall("call", { plugin: "abc123", method: "translate", params: { text: "a" } });
+  router.detachFrame("abc123");
+  await assert.rejects(pending2, /stopped/);
+});
+
+test("requirePluginLicense", async () => {
+  const rec = (over) => ({ hostAppId: "h", pluginAppId: "p", pluginId: "acme.x", version: "1.0.0", descriptorSha256: "aa", kind: "ui", config: { a: 1 }, ownerDid: "did:x:o", installedAt: "", updatedAt: "", license: { required: true }, licensed: true, currentDescriptorSha256: "aa", updateAvailable: false, ...over });
+  let seen;
+  const policy = (r) => P.requirePluginLicense({ hostAppId: "h", client: { get: async () => r }, onInstall: (x) => { seen = x; } });
+  assert.equal(await policy(rec({}))({ appId: "p" }), true);
+  assert.deepEqual(seen.config, { a: 1 });
+  assert.match(await policy(null)({ appId: "p" }), /not installed/);
+  assert.match(await policy(rec({ licensed: false }))({ appId: "p" }), /license/);
+  assert.match(await policy(rec({ updateAvailable: true, currentDescriptorSha256: "bb" }))({ appId: "p" }), /changed since/);
+  const failing = P.requirePluginLicense({ hostAppId: "h", client: { get: async () => { throw new Error("offline"); } } });
+  assert.match(await failing({ appId: "p" }), /offline/);
+
+  const calls = [];
+  const client = P.createPluginInstallClient({
+    apiBase: "https://api.example/",
+    authorization: () => "Bearer s",
+    fetchImpl: async (url, init = {}) => {
+      calls.push([String(url), init.method ?? "GET", init.headers?.Authorization, init.body]);
+      if (String(url).endsWith("/missing")) return new Response("{}", { status: 404 });
+      if (init.method === "PUT") return new Response(JSON.stringify({ error: "pay first", price_wei: "5" }), { status: 402 });
+      return new Response(JSON.stringify(rec({})), { status: 200 });
+    },
+  });
+  assert.equal((await client.get("H", "P")).licensed, true);
+  assert.equal(await client.get("h", "missing"), null);
+  await assert.rejects(client.install("h", "p", { version: "1.0.0", descriptorSha256: "aa" }), (e) => e.status === 402 && e.details.price_wei === "5");
+  assert.deepEqual(calls[0].slice(0, 2), ["https://api.example/api/apps/h/plugins/p", "GET"]);
+  assert.equal(calls[2][2], "Bearer s");
+  assert.deepEqual(JSON.parse(calls[2][3]), { version: "1.0.0", descriptor_sha256: "aa", config: {} });
+});
+
+test("brain plugins load into separate Growformer instances", async () => {
+  const d = P.parsePluginDescriptor(brainDescriptor());
+  const bytes = { "pets.bin": brainBin, "inference.toml": rules, "topics.toml": topic, "overlay.toml": overlay, "notes.txt": extra };
+  const make = () => {
+    const state = { brain: 0, rules: null, topics: null };
+    return { state, inst: {
+      loadBrain: (b) => { state.brain = b.length; },
+      loadInferenceToml: (t) => { state.rules = t; },
+      loadFragmentsJsonl: () => 0,
+      loadTopicGraph: (b, o) => { state.topics = [b, o]; },
+      loadGroundingGraph: () => {},
+    } };
+  };
+  const a = make();
+  const b = make();
+  await P.loadBrainPlugin(d, { engine: P.growformerInstanceEngine(a.inst, { engine: "growformer", version: "0.4.1" }), fetchFile: async (f) => bytes[f.path] });
+  assert.equal(a.state.brain, brainBin.length);
+  assert.equal(b.state.brain, 0);
+  assert.ok(a.state.rules.includes("max_tokens"));
+  await assert.rejects(P.loadBrainPlugin(d, { engine: P.growformerInstanceEngine(b.inst, { engine: "growformer", version: "0.1.0" }), fetchFile: async (f) => bytes[f.path] }), /\^0\.4\.0/);
+  // The default-runtime adapter takes the version from growformerEngineInfo and never loads guardrails.
+  const eng = P.growformerEngine({ loadGrowformerBrain() {}, loadGrowformerInferenceToml() {}, loadGrowformerFragmentsJsonl() {}, loadGrowformerTopicGraph() {}, loadGrowformerGroundingGraph() {}, growformerEngineInfo: () => ({ engine: "growformer", version: "0.4.3" }) });
+  assert.equal(eng.version, "0.4.3");
+  assert.equal(eng.loadGuardrailsJsonl, undefined);
+});
+
+test("growformer-system1 brains, extra roles and open base models", async () => {
+  const s1 = enc("system1-heads");
+  const d = brainDescriptor({
+    id: "acme.support-decisions",
+    brain: {
+      engine: "growformer-system1",
+      runs_on: ["browser", "node"],
+      training: { summary: "Labelled support tickets" },
+      base_model: { name: "Qwen3-0.6B-Q8_0.gguf", arch: "qwen3", sha256: "a".repeat(64), size: 639 * 1024 * 1024, license: "Apache-2.0", source: "https://huggingface.co/Qwen" },
+    },
+    files: [{ path: "support.s1.json.gz", role: "system1", sha256: sha(s1), size: s1.length }],
+  });
+  const r = P.validatePluginDescriptor(d);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(P.weightsRole("growformer-system1"), "system1");
+  assert.ok(P.describePlugin(r.descriptor).some((l) => l.includes("Qwen3-0.6B-Q8_0.gguf") && l.includes("Apache-2.0")));
+  // A system1 brain without its weights, or a base model without a license, is refused.
+  assert.match(P.validatePluginDescriptor({ ...d, files: [] }).errors.join(), /role "system1"/);
+  const noLicense = structuredClone(d);
+  delete noLicense.brain.base_model.license;
+  assert.match(P.validatePluginDescriptor(noLicense).errors.join(), /license/);
+  // The loader hands the system1 weights to the engine.
+  let got;
+  const res = await P.loadBrainPlugin(r.descriptor, {
+    engine: { name: "growformer-system1", loadBrain: (b) => { got = b.length; } },
+    fetchFile: async () => s1,
+  });
+  assert.equal(got, s1.length);
+  assert.deepEqual(res.loaded, ["system1"]);
+  // growformer-llm roles are known (no warnings).
+  const llm = brainDescriptor({
+    brain: { engine: "growformer-llm", runs_on: ["node"], training: { summary: "x" } },
+    files: [
+      { path: "b.bin", role: "bin", sha256: sha(brainBin), size: brainBin.length },
+      { path: "label-model.json", role: "label_model", sha256: "b".repeat(64), size: 10 },
+      { path: "chat.json", role: "lm_checkpoint", sha256: "c".repeat(64), size: 10 },
+      { path: "chat.tok", role: "tokenizer", sha256: "d".repeat(64), size: 10 },
+    ],
+  });
+  const lr = P.validatePluginDescriptor(llm);
+  assert.equal(lr.ok, true);
+  assert.equal(lr.warnings.filter((w) => w.includes("not a known brain role")).length, 0);
+});

@@ -182,7 +182,7 @@ Brains for Growformer and Growformer-LLM are plugins of kind `brain`. They are a
   "uses": ["ai"],
   "brain": {
     "engine": "growformer",
-    "engine_version": "^0.4.0",
+    "engine_version": "^0.1.0",
     "runs_on": ["browser"],
     "abilities": ["converse"],
     "base": { "id": "spacekit.growformer-base", "version": "1.0.0" },
@@ -206,16 +206,15 @@ Brains for Growformer and Growformer-LLM are plugins of kind `brain`. They are a
   - `engine` names the runtime that executes the brain, for example `growformer` or `growformer-llm`.
   - Brains are not interchangeable between engines. A loader refuses a brain whose engine or version range does not match.
   - `runs_on` tells hosts whether it fits in a browser, needs Node, or runs on a compute node.
-- **Files and roles:** the roles are the ones marketplace listings already use:
-  - `bin` (weights, exactly one)
-  - `inference_toml`
-  - `guardrails_jsonl`
-  - `fragments_jsonl`
-  - `topic_graph` (plus optional `topic_graph_overlay`)
-  - `grounding_toml`
-  - `companion_ui`
+- **Files and roles:** every brain ships exactly one weights file, whose role depends on the engine (`bin` for `growformer` and `growformer-llm`, `system1` for `growformer-system1`). The other roles are:
+  - the roles marketplace listings already use: `inference_toml`, `guardrails_jsonl`, `fragments_jsonl`, `topic_graph` (plus optional `topic_graph_overlay`), `grounding_toml`, `companion_ui`;
+  - growformer-llm and System 1 project files: `label_model` (`agent/label-model.json`), `system1` (`*.s1.json.gz`), `lm_checkpoint` (a chat model checkpoint) and `tokenizer`.
 
-  Unknown roles are allowed with a warning and are skipped at load time.
+  Unknown roles are allowed with a warning. Engines skip roles they do not use.
+- **Open-weight base models:**
+  - A `growformer-system1` brain can run on a third-party open-weight model (GGUF; Qwen3, Qwen2 or Llama), which is gigabytes and has its own license.
+  - Do not put the model in `files`. Declare it as `brain.base_model: { name, arch, sha256, size, license, source }`.
+  - The install screen then shows the extra download and the model's license.
 - **Lineage:** `base` records which brain this one was trained or tuned from, so a fine-tuned brain credits and depends on its base.
 - **Provenance:** `training.summary` and `data_sources` are shown on the install screen.
   - `includes_captured_conversations` must be true when the brain was trained on conversations collected through Growformer capture.
@@ -225,7 +224,18 @@ Brains for Growformer and Growformer-LLM are plugins of kind `brain`. They are a
   - Only when all files verify does it load them, weights first, then rules, guardrails, fragments, topic graph and grounding.
   - A tampered file means nothing is loaded.
   - `growformerEngine(spacekitJs)` adapts the spacekit-js Growformer runtime. Other engines implement the small `BrainEngine` interface.
-- **One brain at a time:** the browser Growformer runtime holds a single brain, so loading another replaces it. Apps that switch brains should reload. Several brains loaded at once need a multi-instance runtime (see §11).
+- **Several brains per page:** Growformer builds with the instance API hold many brains, each with its own conversation, rules, topic graph and grounding. Create one `GrowformerInstance` per brain (spacekit-js) and load it with `growformerInstanceEngine`. Older builds hold one brain; loading another replaces it.
+- **Engines:**
+  - `growformer`: GWFBRPKG brain packages, format 1 or 2, optionally gzip-wrapped as GWFCMPKG. It runs in browsers (WASM) and natively.
+  - `growformer-llm`: domain language models that use a Growformer brain as memory. Native only today.
+  - `growformer-system1`: calibrated typed decisions (`*.s1.json[.gz]`), a separate format.
+
+  `growformer_engine_info()` reports the engine name, version and the brain formats a build reads. The crate versions today are `growformer` 0.1.0, `growformer-llm` 0.2.0 and `growformer-system1` 0.1.0, so `engine_version` ranges are `^0.1.0` (or `^0.2.0` for growformer-llm).
+- **Terminology:** Growformer's own "brain plugins" (`[train].brain_plugins_toml`, `BrainPluginsManifest`) are inference settings embedded in the `.bin` (format 2). They are part of a brain's weights file, not SpaceKit plugins, and need no separate descriptor. To avoid confusion in Growformer's docs, consider renaming them to "brain settings".
+- **How several brains share one runtime:**
+  - Growformer keeps inference rules, the topic graph and the domain grounding graph process-wide.
+  - Each instance (`growformer/src/brain_instances.rs`) saves its own copies, together with its brain, and makes them active before every call. Switching is by reference, with no re-parsing.
+  - Id 0 is the single-brain API, which keeps working unchanged.
 
 ### 8.1 Where brains stand today
 
@@ -257,26 +267,91 @@ spacekit-plugin sign --key publisher.seed     # brains/contracts: descriptor sig
 spacekit app package … --sign-key publisher.seed   # ui/service: signed .spkg with the descriptor inside
 ```
 
-## 11. Status and next steps
+The Rust CLI has the same commands plus brain and listing support:
 
-The following are done in this version:
+```bash
+spacekit plugin brain-descriptor pets.bin --inference-toml inference.toml --topic-graph topics.toml \
+  --publisher did:key:z6Mk… --price-astra 5 --license CC-BY-4.0 --training-summary "Public pet-care guides"
+spacekit plugin sign --key publisher.seed
+spacekit plugin verify
+spacekit plugin publish --app-id <listing id>              # attach descriptor + signature to the listing
+spacekit storage deploy … --publish --plugin-key publisher.seed   # publish a brain with a signed descriptor in one step
+```
 
-- the descriptor format and validator;
-- install rules: permission intersection, per-install data owned by the app owner, payments refused;
+`brain-descriptor` reads the brain package header (name, version, description, base brain) so the descriptor matches the brain.
+
+For a Growformer project, point it at the manifest instead:
+
+```bash
+spacekit plugin brain-descriptor --project crypto-sentiment-analysis.gf.toml --publisher did:key:z6Mk… \
+  --training-summary "Labelled crypto and DeFi posts"
+```
+
+It takes the brain (`[infer].brain` or `[train].brain_output`), `[inference]` rules, guardrails, topic graph (plus `knowledge_graph_sentiment_overlay.toml` when it sits next to the graph), grounding, and the project name and description from the manifest. Explicit flags win. With `--engine growformer-llm`, it also pins `agent/label-model.json` and the `[system1]` brain.
+
+## 11. Calls between an app and its plugins
+
+An app calls a `service` plugin through the host, never frame to frame:
+
+```text
+app    → host    plugins.call    { plugin, method, params }
+host   → plugin  event "__plugins:request" { requestId, method, params }
+plugin → host    plugins.respond { requestId, result } | { requestId, error }
+```
+
+- **Checked by the host:** `PluginRouter` (`@spacekit/sdk/plugins`) checks that the plugin is installed in this app, that `method` is in `service.methods`, and that `params` match the declared fields (types, required, no extras).
+- **Answers:** only the plugin a request went to can answer it. Calls time out after 30 seconds and fail if the plugin frame stops.
+- **In the guest:**
+  - Apps use `spacekit.plugins.call(id, method, params)` and `spacekit.plugins.list()`.
+  - Service plugins register handlers with `spacekit.plugins.serve(method, handler)`.
+  - Any plugin reads its settings with `spacekit.plugins.config()`.
+- **v1 limit:** plugins cannot call other plugins.
+- **Host wiring:** hosts pass the same router to `mountSpacekitApp({ plugins: { router } })` for the app and for each plugin (plugins also get `install`).
+
+## 12. Website API
+
+Listings carry the plugin as `plugin: { descriptor, signature }`, attached by `spacekit plugin publish`.
+
+**Listing status.** When serving a listing, the API adds `plugin.status`: `verified`, `signer`, `publisher_matches_listing`, `descriptor_sha256`, `id`, `version`, `kind` and `reason`. The status is computed on every read; a stored document cannot set it.
+
+**Install routes.** All are under `/api/apps/:app_id/plugins`. Records are stored in the `plugin_installs` collection.
+
+| Route | Who | What |
+|---|---|---|
+| `PUT …/:plugin_app_id` `{ version, descriptor_sha256, config? }` | Host app owner (full session) | Installs or updates. It is refused with 409 if the listing changed since the owner reviewed it, and with 402 `{ price_wei }` if the plugin is priced and the owner has no active purchase. Unverified plugins are refused unless `PLUGINS_ALLOW_UNVERIFIED=true` (development). |
+| `GET …` | Host app owner | Lists the installs. |
+| `GET …/:plugin_app_id` | Anyone | Returns the record plus a live `licensed` check, `currentVersion`, `currentDescriptorSha256` and `updateAvailable`. |
+| `DELETE …/:plugin_app_id` | Host app owner | Uninstalls. |
+
+**SDK helpers.**
+
+- `createPluginInstallClient({ apiBase, authorization })` wraps these routes.
+- `requirePluginLicense({ hostAppId, client })` is a `trustPolicy` that refuses to mount a plugin that is not installed, not licensed, or changed since install.
+
+## 13. Status
+
+Done:
+
+- the descriptor format, validator and signatures;
+- install rules (permission intersection, per-install data owned by the app owner, no payments inside plugins);
 - brain verification and loading;
-- descriptor signatures;
-- the `spacekit-plugin` command;
-- ASTRA-only payments in the embed SDK.
+- plugin calls (§11);
+- the website API (§12) and license checks;
+- the `spacekit-plugin` (Node) and `spacekit plugin` (Rust CLI) commands, including `brain-descriptor`, which reads a Growformer brain's own header, and signed brain publishing (`spacekit storage deploy … --publish --plugin-key`);
+- kit.space plugin pages:
+  - trust badges;
+  - an install screen with a generated settings form;
+  - "Check files";
+  - loading a brain in the browser when `VITE_GROWFORMER_PKG_URL` is set;
+- a multi-instance Growformer WASM runtime (`growformer_instance_*` and `*_i` exports), with `GrowformerInstance` in spacekit-js and `growformerInstanceEngine` in the SDK.
 
 Next:
 
-1. **Website API:** store descriptors with listings (`app_listings.plugin`), verify the signature on publish, and record installs `{ host app, plugin, version, hash, settings }` in the app owner's namespace.
-2. **Entitlement check helper:** `requirePluginLicense()` for `trustPolicy`, using the entitlement ledger's read-only verify call.
-3. **Rust CLI:** `spacekit plugin publish` (descriptor in the package, listing mirror) and descriptor generation for brains.
-4. **kit.space:**
-   - install screen and settings form;
-   - a "verified brain" badge;
-   - load brains through `loadBrainPlugin`.
-5. **Plugin-to-app calls for `service` plugins:** a `plugins.call(id, method, params)` bridge module that routes between frames through the host, checked against `service.methods`.
-6. **Multi-instance Growformer runtime:** for apps that use more than one brain at a time.
-7. **Templates and `plugins:` in the app spec.**
+1. **Templates and `plugins:` in the app spec.**
+2. **Install-time checks in the API:** check settings against the descriptor's `config` fields, and check the permission intersection against the host app's manifest.
+3. **Entitlement-ledger licenses:** today the API checks marketplace purchases; it should also accept entitlement-ledger licenses via a read-only `verify` call.
+4. **Growformer engine details:**
+   - Guardrails JSONL loads only in native Growformer; the browser build has no loader yet.
+   - `growformer-llm` has no WASM build and runs on Node or a compute node only, so its brains should say `runs_on: ["node"]`.
+   - `growformer-system1` has a WASM build (`--features wasm`) but no spacekit-js loader yet. Add a `BrainEngine` for it so its brains can load in browsers.
+5. **Rebuild `growformer-pkg`:** the multi-instance exports need a fresh `wasm-pack` build of growformer with the `wasm-bindgen` feature. Until then, pages fall back to one brain at a time.

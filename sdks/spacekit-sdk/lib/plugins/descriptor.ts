@@ -127,6 +127,11 @@ export interface BrainSpec {
   abilities?: BrainAbility[];
   /** The brain this one was trained or tuned from. */
   base?: PluginDependency;
+  /**
+   * An open-weight model the brain needs but does not ship (e.g. a GGUF for a
+   * growformer-system1 brain). It is downloaded separately, under its own license.
+   */
+  base_model?: BaseModel;
   /** Provenance, shown to people choosing a brain. */
   training?: {
     summary?: string;
@@ -134,6 +139,20 @@ export interface BrainSpec {
     /** True when user conversations were captured for training. */
     includes_captured_conversations?: boolean;
   };
+}
+
+/** A third-party open-weight model, pinned by hash. */
+export interface BaseModel {
+  /** File or model name, e.g. "Qwen3-0.6B-Q8_0.gguf". */
+  name: string;
+  /** Architecture the engine needs to know, e.g. "qwen3". */
+  arch?: string;
+  sha256: string;
+  size: number;
+  /** The model's own license (SPDX id or name), shown before download. */
+  license: string;
+  /** Where to get it (https). */
+  source?: string;
 }
 
 export interface PluginDescriptor {
@@ -166,7 +185,10 @@ export interface PluginDescriptor {
   brain?: BrainSpec;
 }
 
-/** Known brain file roles (the same roles marketplace listings use). */
+/**
+ * Known brain file roles. The first eight are the roles marketplace listings
+ * use; the rest come from growformer-llm and growformer-system1 projects.
+ */
 export const BRAIN_FILE_ROLES: Record<string, string> = {
   bin: "Brain",
   inference_toml: "Inference rules",
@@ -176,7 +198,30 @@ export const BRAIN_FILE_ROLES: Record<string, string> = {
   topic_graph_overlay: "Topic graph overlay",
   grounding_toml: "Grounding",
   companion_ui: "Companion UI",
+  /** growformer-llm label classifier (`label-model.json`). */
+  label_model: "Label model",
+  /** growformer-system1 decision brain (`*.s1.json.gz`). */
+  system1: "System 1 decisions",
+  /** growformer-llm chat language model checkpoint. */
+  lm_checkpoint: "Chat model",
+  /** Tokenizer for the chat model. */
+  tokenizer: "Tokenizer",
 };
+
+/**
+ * The file that holds a brain's weights, by engine. Engines not listed use "bin".
+ * A brain must ship exactly one.
+ */
+export const ENGINE_WEIGHTS_ROLE: Record<string, string> = {
+  growformer: "bin",
+  "growformer-llm": "bin",
+  "growformer-system1": "system1",
+};
+
+/** The weights role for an engine. */
+export function weightsRole(engine: string | undefined): string {
+  return (engine && ENGINE_WEIGHTS_ROLE[engine]) || "bin";
+}
 
 export class PluginDescriptorError extends Error {
   constructor(readonly errors: string[]) {
@@ -559,6 +604,28 @@ export function validatePluginDescriptor(input: unknown): PluginValidation {
         } else spec.abilities = list as BrainAbility[];
       }
       if (b.base !== undefined) spec.base = validateDependency(b.base, "brain.base", errors);
+      if (b.base_model !== undefined) {
+        const m = b.base_model;
+        if (!isObject(m)) errors.push("brain.base_model must be an object");
+        else {
+          const name = str(m.name);
+          const sha = typeof m.sha256 === "string" ? m.sha256.toLowerCase() : "";
+          const license = str(m.license);
+          if (!name) errors.push("brain.base_model.name is required");
+          if (!SHA256_RE.test(sha)) errors.push("brain.base_model.sha256 must be 64 hex characters");
+          if (typeof m.size !== "number" || !Number.isSafeInteger(m.size) || m.size <= 0) {
+            errors.push("brain.base_model.size must be a byte count");
+          }
+          if (!license) errors.push("brain.base_model.license is required: people must see the model's own license");
+          const source = str(m.source);
+          if (source && !/^https:\/\//.test(source)) errors.push("brain.base_model.source must be an https URL");
+          if (name && SHA256_RE.test(sha) && typeof m.size === "number" && license) {
+            spec.base_model = { name, sha256: sha, size: m.size, license };
+            if (str(m.arch)) spec.base_model.arch = str(m.arch);
+            if (source) spec.base_model.source = source;
+          }
+        }
+      }
       if (b.training !== undefined) {
         if (!isObject(b.training)) errors.push("brain.training must be an object");
         else {
@@ -578,8 +645,11 @@ export function validatePluginDescriptor(input: unknown): PluginValidation {
     }
     if (permissions?.length) errors.push("brains are data: they cannot declare permissions");
     if (descriptor.uses?.some((u) => u !== "ai")) errors.push('brains can only list "ai" in uses');
-    const brainFiles = (files ?? []).filter((f) => f.role === "bin");
-    if (brainFiles.length !== 1) errors.push('a brain needs exactly one files entry with role "bin" (the weights)');
+    const weights = weightsRole(descriptor.brain?.engine);
+    const brainFiles = (files ?? []).filter((f) => f.role === weights);
+    if (brainFiles.length !== 1) {
+      errors.push(`a brain needs exactly one files entry with role "${weights}" (the weights)`);
+    }
     for (const f of files ?? []) {
       if (!(f.role in BRAIN_FILE_ROLES)) {
         warnings.push(`files: role "${f.role}" is not a known brain role; engines will ignore it`);

@@ -8,6 +8,7 @@ mod identity_cmd;
 mod keymaster_cmd;
 mod migration_cmd;
 mod operator_cmd;
+mod plugin_cmd;
 mod repo_cmd;
 mod sdkgen;
 mod workspace_cmd;
@@ -532,6 +533,10 @@ enum Commands {
     /// SKTCS tool manifest utilities (embed into WASM, validate JSON).
     #[command(subcommand)]
     Tools(ToolsCommands),
+
+    /// Plugin descriptors: hash files, sign/verify `spacekit-plugin.json`, brain descriptors, publish to a listing
+    #[command(subcommand)]
+    Plugin(plugin_cmd::PluginCommands),
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1370,6 +1375,19 @@ enum StorageCommands {
         /// Agent Hub output layout: growformer (default) or plain
         #[arg(long, default_value = "growformer")]
         hub_response_format: Option<String>,
+
+        /// With --publish: Ed25519 seed (hex file) to sign a `kind: brain` plugin descriptor built
+        /// from the uploaded brain files; stored as `plugin: { descriptor, signature }` on the listing
+        #[arg(long)]
+        plugin_key: Option<String>,
+
+        /// Publisher DID for the plugin descriptor (default: the --plugin-key did:key)
+        #[arg(long)]
+        plugin_publisher: Option<String>,
+
+        /// Plugin id for the descriptor (default: `<publisher handle or "brain">.<brain header id>`)
+        #[arg(long)]
+        plugin_id: Option<String>,
     },
 
     /// Manage storage node
@@ -4603,6 +4621,9 @@ async fn handle_storage_command(
             tag_label,
             tag_color,
             hub_response_format,
+            plugin_key,
+            plugin_publisher,
+            plugin_id,
         } => {
             let resolved = resolve_storage_deploy_params(
                 package.as_deref(),
@@ -4658,6 +4679,9 @@ async fn handle_storage_command(
                 resolved.hub_op,
                 resolved.hub_input_format.as_deref(),
                 resolved.prompts.as_ref(),
+                plugin_key.as_deref(),
+                plugin_publisher.as_deref(),
+                plugin_id.as_deref(),
             )
             .await
         }
@@ -6862,6 +6886,9 @@ async fn handle_storage_deploy(
     hub_op: Option<u8>,
     hub_input_format: Option<&str>,
     prompts: Option<&serde_json::Value>,
+    plugin_key: Option<&str>,
+    plugin_publisher: Option<&str>,
+    plugin_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Deploying WASM + binary bundle to remote storage node...");
     println!("   WASM: {}", wasm_path.cyan());
@@ -6898,6 +6925,71 @@ async fn handle_storage_deploy(
     if !Path::new(bin_path).is_file() {
         return Err(format!("BIN path is not a file: {}", bin_path).into());
     }
+
+    // Optional signed `kind: brain` plugin descriptor for the listing. Hash the local files and
+    // dry-run the descriptor before uploading so bad flags fail early.
+    let plugin_draft = match plugin_key {
+        None => {
+            if plugin_publisher.is_some() || plugin_id.is_some() {
+                return Err("--plugin-publisher / --plugin-id need --plugin-key".into());
+            }
+            None
+        }
+        Some(_) if !publish => {
+            eprintln!(
+                "\n{}",
+                "⚠️  --plugin-key only applies with --publish (the descriptor is stored on the listing); ignoring"
+                    .yellow()
+            );
+            None
+        }
+        Some(key_path) => {
+            let key = crate::spkg_signature::load_signing_key(Path::new(key_path))?;
+            let header = plugin_cmd::read_brain_header_file(bin_path)?;
+            let mut files = vec![plugin_cmd::hash_file("bin", bin_path)?];
+            for (role, p) in [
+                ("inference_toml", inference_toml_path),
+                ("guardrails_jsonl", guardrails_jsonl_path),
+                ("fragments_jsonl", fragments_jsonl_path),
+                ("topic_graph", topic_graph_path),
+                ("grounding_toml", grounding_toml_path),
+                ("companion_ui", companion_ui_path),
+            ] {
+                if let Some(p) = p.filter(|p| Path::new(p).is_file()) {
+                    files.push(plugin_cmd::hash_file(role, p)?);
+                }
+            }
+            let header_has_name = header
+                .as_ref()
+                .and_then(|h| h.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| !n.trim().is_empty())
+                .unwrap_or(false);
+            let fallback_title = title
+                .map(str::to_string)
+                .or_else(|| Path::new(wasm_path).file_stem().and_then(|s| s.to_str()).map(str::to_string));
+            let opts = plugin_cmd::BrainDescriptorOptions {
+                publisher: plugin_publisher
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::spkg_signature::did_key_for(&key.verifying_key().to_bytes())),
+                id: plugin_id.map(str::to_string),
+                name: if header_has_name { None } else { fallback_title.clone() },
+                summary: description
+                    .map(str::to_string)
+                    .filter(|d| !d.trim().is_empty())
+                    .or_else(|| if header.is_none() { fallback_title.clone() } else { None }),
+                engine: "growformer".into(),
+                price_astra: price.map(str::to_string),
+                fallback_name: agent_id.map(str::to_string).or(fallback_title),
+                ..Default::default()
+            };
+            let mut notes = Vec::new();
+            plugin_cmd::build_brain_descriptor(header.as_ref(), files.clone(), &opts, &mut notes)
+                .map_err(|e| format!("plugin descriptor: {e}"))?;
+            println!("   Plugin:  {}", "signed brain descriptor (--plugin-key)".green());
+            Some((key, header, files, opts))
+        }
+    };
 
     let (base_url, used_default_local_url) = resolve_remote_storage_base_url(storage_url)?;
     if used_default_local_url {
@@ -7399,7 +7491,42 @@ async fn handle_storage_deploy(
             }));
         }
 
-        let listing = serde_json::json!({
+        let mut plugin_json: Option<serde_json::Value> = None;
+        if let Some((key, header, files, opts)) = &plugin_draft {
+            // The descriptor pins every brain file, so the listing carries all of them.
+            for role in ["guardrails_jsonl", "fragments_jsonl"] {
+                if let Some(a) = receipt.artifacts.iter().find(|a| a.role == role) {
+                    artifacts_json.push(serde_json::json!({
+                        "role": role,
+                        "file_id": a.file_id,
+                        "size_bytes": a.size_bytes
+                    }));
+                }
+            }
+            // Descriptor paths are the storage file ids (what hosts fetch).
+            let mut listed = Vec::new();
+            for f in files {
+                let a = receipt
+                    .artifacts
+                    .iter()
+                    .find(|a| a.role == f.role)
+                    .ok_or_else(|| format!("plugin descriptor: no uploaded artifact for role {}", f.role))?;
+                if a.size_bytes != f.size {
+                    return Err(format!(
+                        "plugin descriptor: {} changed during upload ({} vs {} bytes)",
+                        f.role, f.size, a.size_bytes
+                    )
+                    .into());
+                }
+                listed.push(plugin_cmd::PluginFile { path: a.file_id.clone(), ..f.clone() });
+            }
+            plugin_json = Some(
+                plugin_cmd::build_signed_listing_plugin(header.as_ref(), listed, opts, key)
+                    .map_err(|e| format!("plugin descriptor: {e}"))?,
+            );
+        }
+
+        let mut listing = serde_json::json!({
             "app_id": app_id,
             "deployment_id": deployment_id,
             "publisher_did": owner_did,
@@ -7420,6 +7547,9 @@ async fn handle_storage_deploy(
             "rating_count": 0,
             "status": "published"
         });
+        if let Some(p) = plugin_json {
+            listing["plugin"] = p;
+        }
 
         let listing_url = format!(
             "{}/api/documents/app_listings/{}",
@@ -16450,7 +16580,8 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Encapsulate { .. }
         | Commands::Decapsulate { .. }
         | Commands::Encrypt { .. }
-        | Commands::Decrypt { .. } => CliContext::load_sync().ok(),
+        | Commands::Decrypt { .. }
+        | Commands::Plugin(_) => CliContext::load_sync().ok(),
         _ => Some(CliContext::load_sync()?),
     };
 
@@ -16558,6 +16689,10 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Commands::Tools(tools_command) = &cli.command {
         return handle_tools_command(tools_command).await;
+    }
+
+    if let Commands::Plugin(plugin_command) = &cli.command {
+        return plugin_cmd::handle_plugin_command(&cli, ctx.as_ref(), plugin_command).await;
     }
 
     if let Commands::Migration(mig_command) = &cli.command {
