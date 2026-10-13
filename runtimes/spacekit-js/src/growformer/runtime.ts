@@ -147,6 +147,14 @@ function defaultGrowformerScriptUrl(): string {
   return new URL("../../growformer-pkg/growformer.js", import.meta.url).href;
 }
 
+/**
+ * The loaded wasm-bindgen module, or null before `initGrowformerHost`. Used by
+ * `instances.ts` for the multi-brain API; most callers want the functions here.
+ */
+export function loadedGrowformerModule(): Record<string, unknown> | null {
+  return gf as unknown as Record<string, unknown> | null;
+}
+
 /** True after `initGrowformerHost` finished loading the Growformer wasm-bindgen module (brain optional). */
 export function isGrowformerModuleLoaded(): boolean {
   return gf !== null;

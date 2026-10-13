@@ -80,6 +80,16 @@ export interface SpacekitGuestApi {
     /** Requires "identity:write". The signed-in DID cannot be changed by apps. */
     setState(state: Partial<Omit<SpacekitIdentityState, "myDid">>): Promise<SpacekitIdentityState>;
   };
+  /** Plugins installed in this app (host app), or this plugin's own settings (plugin frame). */
+  plugins: {
+    /** Call a method of an installed service plugin. Checked against its descriptor. */
+    call<T = unknown>(plugin: string, method: string, params?: Record<string, unknown>): Promise<T>;
+    list(): Promise<Array<{ pluginAppId: string; id: string; name: string; kind: string; version: string; methods: string[] }>>;
+    /** Inside a plugin: the settings the app owner chose. */
+    config(): Promise<Record<string, unknown>>;
+    /** Inside a service plugin: answer calls to `method`. Returns an unregister function. */
+    serve(method: string, handler: (params: Record<string, unknown>) => unknown | Promise<unknown>): () => void;
+  };
   app: {
     ready(): Promise<{ ready: boolean; appId: string }>;
     isOwner(): Promise<boolean>;

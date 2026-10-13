@@ -46,6 +46,17 @@ import type { AppManifest, EmbedEndpoints, EmbedHostServices } from "./types.js"
 
 export type IsolationMode = "opaque" | "origin" | "unsafe-same-origin";
 
+/**
+ * Routes `plugins.*` calls between an app and its installed plugins
+ * (`PluginRouter` in `@spacekit/sdk/plugins`).
+ */
+export interface PluginCallRouter {
+  handleAppCall(method: string, params: Record<string, unknown>): Promise<unknown>;
+  handlePluginCall(pluginAppId: string, method: string, params: Record<string, unknown>): unknown;
+  attachFrame(pluginAppId: string, push: (topic: string, msg: unknown) => void): void;
+  detachFrame(pluginAppId: string): void;
+}
+
 export interface AppTrustInfo {
   appId: string;
   /** `creator_did` from the manifest: a claim, not proof of who published it. */
@@ -109,6 +120,12 @@ export interface MountSpacekitAppOptions {
     /** The host app owner's DID, who owns the plugin's data in this app. */
     ownerDid: string;
   };
+  /**
+   * Plugin calls. Mount the host app with `{ router }` so it can use
+   * `spacekit.plugins.call/list`; mount each plugin with the same router and
+   * `install` set, so it can serve calls and read `spacekit.plugins.config()`.
+   */
+  plugins?: { router: PluginCallRouter };
   endpoints?: EmbedEndpoints;
   /** Origin reported to the app in its embed config. Defaults to the host page origin. */
   parentOrigin?: string;
@@ -243,6 +260,7 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
     onWindowMessage = null;
     port?.close();
     port = null;
+    if (options.install && options.plugins) options.plugins.router.detachFrame(options.appId);
     iframe?.remove();
     iframe = null;
     if (bootstrapUrl) URL.revokeObjectURL(bootstrapUrl);
@@ -402,21 +420,30 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
             /* port closed */
           }
         };
+        const router = options.plugins?.router;
         Promise.resolve()
           .then(() => guard(data.module, data.method, (data.params ?? {}) as Record<string, unknown>))
-          .then((params) => activeBridge.handle(data.module, data.method, params))
+          .then((params) => {
+            if (data.module !== "plugins") return activeBridge.handle(data.module, data.method, params);
+            if (!router) throw new Error("This host has no plugins");
+            return options.install
+              ? router.handlePluginCall(options.appId, data.method, params)
+              : router.handleAppCall(data.method, params);
+          })
           .then(
             (result) => reply({ t: "res", id: data.id, result }),
             (err) => reply({ t: "res", id: data.id, error: describeError(err) }),
           );
       };
-      activeBridge.setPushHandler((topic, msg) => {
+      const push = (topic: string, msg: unknown) => {
         try {
           hostPort.postMessage({ t: "event", topic, msg } satisfies PortHostMessage);
         } catch {
           /* port closed */
         }
-      });
+      };
+      activeBridge.setPushHandler(push);
+      if (options.install && options.plugins) options.plugins.router.attachFrame(options.appId, push);
       const load: FrameLoadMessage = {
         type: FRAME_LOAD,
         v: SPACEKIT_EMBED_PROTOCOL_VERSION,

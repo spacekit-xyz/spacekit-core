@@ -16,11 +16,11 @@
  * await loadBrainPlugin(descriptor, { engine: growformerEngine(spacekit), fetchFile });
  * ```
  *
- * The browser Growformer runtime holds one brain at a time: loading another
- * replaces it.
+ * The default Growformer runtime holds one brain: loading another replaces it.
+ * Builds with the instance API hold several; see {@link growformerInstanceEngine}.
  */
 
-import { versionSatisfies, type PluginDescriptor, type PluginFile } from "./descriptor.js";
+import { versionSatisfies, weightsRole, type PluginDescriptor, type PluginFile } from "./descriptor.js";
 
 /** What an engine must offer to load brain plugins. Optional loaders handle sidecar files. */
 export interface BrainEngine {
@@ -74,7 +74,7 @@ export class BrainVerificationError extends Error {
 const DEFAULT_MAX_TOTAL = 1024 * 1024 * 1024;
 
 /** Load order: weights first, then the sidecars that configure them. */
-const LOAD_ORDER = ["bin", "inference_toml", "guardrails_jsonl", "fragments_jsonl", "topic_graph", "grounding_toml"];
+const SIDECAR_ORDER = ["inference_toml", "guardrails_jsonl", "fragments_jsonl", "topic_graph", "grounding_toml"];
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes)));
@@ -112,7 +112,8 @@ export async function fetchVerifiedBrainFiles(
     }
     out.set(file.role, bytes);
   }
-  if (!out.has("bin")) throw new BrainVerificationError('brain has no "bin" (weights) file', "bin");
+  const weights = weightsRole(descriptor.brain?.engine);
+  if (!out.has(weights)) throw new BrainVerificationError(`brain has no "${weights}" (weights) file`, weights);
   return out;
 }
 
@@ -136,7 +137,8 @@ export async function loadBrainPlugin(descriptor: PluginDescriptor, options: Loa
   const text = (role: string) => new TextDecoder("utf-8", { fatal: true }).decode(bytes.get(role)!);
   const loaded: string[] = [];
   const skipped: string[] = [];
-  const total = LOAD_ORDER.filter((r) => bytes.has(r)).length;
+  const weights = weightsRole(spec.engine);
+  const total = [weights, ...SIDECAR_ORDER].filter((r) => bytes.has(r)).length;
   let index = 0;
   const step = async (role: string, run: (() => void | Promise<void>) | null) => {
     if (!bytes.has(role)) return;
@@ -150,7 +152,7 @@ export async function loadBrainPlugin(descriptor: PluginDescriptor, options: Loa
     loaded.push(role);
   };
 
-  await step("bin", () => engine.loadBrain(bytes.get("bin")!));
+  await step(weights, () => engine.loadBrain(bytes.get(weights)!));
   await step("inference_toml", engine.loadInferenceToml ? () => engine.loadInferenceToml!(text("inference_toml")) : null);
   await step(
     "guardrails_jsonl",
@@ -172,7 +174,7 @@ export async function loadBrainPlugin(descriptor: PluginDescriptor, options: Loa
   );
   await step("grounding_toml", engine.loadGroundingToml ? () => engine.loadGroundingToml!(text("grounding_toml")) : null);
   for (const role of bytes.keys()) {
-    if (!LOAD_ORDER.includes(role) && role !== "topic_graph_overlay") skipped.push(role);
+    if (role !== weights && !SIDECAR_ORDER.includes(role) && role !== "topic_graph_overlay") skipped.push(role);
   }
   return { id: descriptor.id, version: descriptor.version, engine: engine.name, loaded, skipped };
 }
@@ -181,30 +183,70 @@ export async function loadBrainPlugin(descriptor: PluginDescriptor, options: Loa
 export interface GrowformerRuntimeExports {
   loadGrowformerBrain(data: Uint8Array): void;
   loadGrowformerInferenceToml(toml: string): void;
-  loadGrowformerInferenceGuardrailsJsonl(jsonl: string): void;
   loadGrowformerFragmentsJsonl(jsonl: string): void;
   loadGrowformerTopicGraph(baseToml: string, overlayToml?: string): void;
   loadGrowformerGroundingGraph(toml: string): void;
+  /** spacekit-js `growformerEngineInfo`, when available: supplies the engine version. */
+  growformerEngineInfo?(): { engine: string; version: string } | null;
 }
 
 /**
  * Adapt the spacekit-js Growformer runtime (`initGrowformerHost()` first) to
- * {@link BrainEngine}. Pass `name: "growformer-llm"` for brains built for that
- * engine when it is served by a compatible runtime.
+ * {@link BrainEngine}. This drives the runtime's single default brain; use
+ * {@link growformerInstanceEngine} to load several brains side by side.
+ *
+ * Guardrails files are skipped: the browser Growformer build has no
+ * guardrails loader (they apply in native Growformer only).
  */
 export function growformerEngine(
   runtime: GrowformerRuntimeExports,
   options: { name?: string; version?: string } = {},
 ): BrainEngine {
+  const info = runtime.growformerEngineInfo?.() ?? null;
   return {
-    name: options.name ?? "growformer",
-    version: options.version,
+    name: options.name ?? info?.engine ?? "growformer",
+    version: options.version ?? info?.version,
     loadBrain: (bytes) => runtime.loadGrowformerBrain(bytes),
     loadInferenceToml: (toml) => runtime.loadGrowformerInferenceToml(toml),
-    loadGuardrailsJsonl: (jsonl) => runtime.loadGrowformerInferenceGuardrailsJsonl(jsonl),
     loadFragmentsJsonl: (jsonl) => runtime.loadGrowformerFragmentsJsonl(jsonl),
     loadTopicGraph: (base, overlay) => runtime.loadGrowformerTopicGraph(base, overlay),
     loadGroundingToml: (toml) => runtime.loadGrowformerGroundingGraph(toml),
+  };
+}
+
+/** A spacekit-js `GrowformerInstance` (one of several brains on a page). */
+export interface GrowformerInstanceLike {
+  loadBrain(bytes: Uint8Array): void;
+  loadInferenceToml(toml: string): void;
+  loadFragmentsJsonl(jsonl: string): unknown;
+  loadTopicGraph(baseToml: string, overlayToml?: string): void;
+  loadGroundingGraph(toml: string): void;
+}
+
+/**
+ * Adapt one spacekit-js `GrowformerInstance` to {@link BrainEngine}, so each
+ * brain plugin gets its own instance:
+ *
+ * ```ts
+ * const inst = spacekit.GrowformerInstance.create();
+ * await loadBrainPlugin(brain, { engine: growformerInstanceEngine(inst, spacekit.growformerEngineInfo()), fetchFile });
+ * inst.converse("hello");
+ * ```
+ */
+export function growformerInstanceEngine(
+  instance: GrowformerInstanceLike,
+  info?: { engine?: string; version?: string } | null,
+): BrainEngine {
+  return {
+    name: info?.engine ?? "growformer",
+    version: info?.version,
+    loadBrain: (bytes) => instance.loadBrain(bytes),
+    loadInferenceToml: (toml) => instance.loadInferenceToml(toml),
+    loadFragmentsJsonl: (jsonl) => {
+      instance.loadFragmentsJsonl(jsonl);
+    },
+    loadTopicGraph: (base, overlay) => instance.loadTopicGraph(base, overlay),
+    loadGroundingToml: (toml) => instance.loadGroundingGraph(toml),
   };
 }
 

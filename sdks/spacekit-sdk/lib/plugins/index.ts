@@ -5,6 +5,8 @@
 
 export {
   BRAIN_FILE_ROLES,
+  ENGINE_WEIGHTS_ROLE,
+  weightsRole,
   BUILDING_BLOCKS,
   PLUGIN_DESCRIPTOR_FILE,
   PLUGIN_DESCRIPTOR_VERSION,
@@ -14,6 +16,7 @@ export {
   parsePluginDescriptor,
   validatePluginDescriptor,
   versionSatisfies,
+  type BaseModel,
   type BrainAbility,
   type BrainSpec,
   type BuildingBlock,
@@ -48,11 +51,13 @@ export {
   BrainVerificationError,
   fetchVerifiedBrainFiles,
   growformerEngine,
+  growformerInstanceEngine,
   httpBrainFileFetcher,
   loadBrainPlugin,
   type BrainEngine,
   type BrainFileFetcher,
   type BrainLoadProgress,
+  type GrowformerInstanceLike,
   type GrowformerRuntimeExports,
   type LoadBrainPluginOptions,
   type LoadedBrain,
@@ -64,3 +69,20 @@ export {
   verifyPluginDescriptorSignature,
   type PluginSignatureResult,
 } from "./signature.js";
+
+export {
+  PLUGIN_REQUEST_TOPIC,
+  PluginCallError,
+  PluginRouter,
+  checkServiceParams,
+  type InstalledPlugin,
+} from "./router.js";
+
+export {
+  PluginInstallError,
+  createPluginInstallClient,
+  requirePluginLicense,
+  type PluginApiOptions,
+  type PluginInstallClient,
+  type PluginInstallRecord,
+} from "./license.js";
