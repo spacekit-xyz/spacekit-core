@@ -2,7 +2,7 @@
 
 **Version 0.2: Draft.** Companion to *The Spacekit Specification v0.2*.
 
-A **profile** binds a pattern-free Spacekit document to a concrete stack: datastore, transport, frontend framework, orchestration engine, and the architectural patterns `spacekit-cli` should emit. One spec + many profiles = many generated apps that behave identically and are built differently.
+A **profile** binds a pattern-free Spacekit document to a concrete stack: datastore, transport, frontend framework, orchestration engine, and the architectural patterns the `spacekit` CLI should emit. One spec + many profiles = many generated apps that behave identically and are built differently.
 
 ---
 
@@ -10,7 +10,7 @@ A **profile** binds a pattern-free Spacekit document to a concrete stack: datast
 
 > **A profile changes the *realization* of an app, never its *meaning*.**
 
-A profile MUST NOT alter the set of capabilities, the fields or identity of an entity, the effect of a `write`, a `policy`, an `emit`, a `transition`, or new in v0.2, the steps, compensation, or outcomes of a `workflow`. It MAY only choose how those become code and infrastructure. `spacekit-cli` rejects a profile that attempts to change behavior; §8 makes that checkable.
+A profile MUST NOT alter the set of capabilities, the fields or identity of an entity, the effect of a `write`, a `policy`, an `emit`, a `transition`, or new in v0.2, the steps, compensation, or outcomes of a `workflow`. It MAY only choose how those become code and infrastructure. `spacekit spec` rejects a profile that attempts to change behavior; §8 makes that checkable.
 
 ---
 
@@ -20,7 +20,7 @@ A profile MUST NOT alter the set of capabilities, the fields or identity of an e
 
 - `business.workflows`: choose the orchestration engine that realizes the spec's new `workflows`. (§4)
 - `extends` **+** `environments`: profile inheritance and dev/prod layering. (§2, §7)
-- **Conformance checking**: `spacekit-cli conform` verifies two profiles produce behaviorally-equivalent apps. (§8)
+- **Conformance checking**: `spacekit spec conform` verifies two profiles produce behaviorally-equivalent apps. (§8)
 - **Token interop**: emit `tokens` as W3C Design Tokens, Style Dictionary, Tailwind config, or CSS variables. (§5)
 - Per-environment `binding`. (§7)
 
@@ -144,7 +144,7 @@ environments:
     view:     { locale: en }
 ```
 
-`spacekit-cli generate --env prod` applies the matching layer over the base profile. Environments may only override realization keys; an environment that tries to change behavior is rejected by the same §1 rule.
+`spacekit spec generate --env prod` applies the matching layer over the base profile. Environments may only override realization keys; an environment that tries to change behavior is rejected by the same §1 rule.
 
 ---
 
@@ -152,7 +152,7 @@ environments:
 
 ## 8. Conformance v0.2
 
-The §1 invariant is now checkable. `spacekit-cli conform <profileA> <profileB>` generates both against the same spec and asserts behavioral equivalence: identical capability signatures and error sets, identical workflow step/compensation graphs, identical policies, identical view transitions and data bindings. Differences in stack, file layout, orchestration engine, or token format are expected and ignored; any difference in the spec-derived behavior is a conformance failure.
+The §1 invariant is now checkable. `spacekit spec conform <profileA> <profileB>` generates both against the same spec and asserts behavioral equivalence: identical capability signatures and error sets, identical workflow step/compensation graphs, identical policies, identical view transitions and data bindings. Differences in stack, file layout, orchestration engine, or token format are expected and ignored; any difference in the spec-derived behavior is a conformance failure.
 
 This is what makes "swap the profile, same app" a tested guarantee rather than a claim.
 
@@ -163,6 +163,8 @@ This is what makes "swap the profile, same app" a tested guarantee rather than a
 ## 9. Worked example: two profiles, one spec
 
 Both target `bookshop.spacekit.yaml`. The `FulfillOrder` workflow, `PlaceOrder` contract, policies, and view flow are identical under both; only the stack and orchestration differ.
+
+> **Generator status.** Profile A below illustrates the format; the current `spacekit spec` preview generates TypeScript with Next.js or a React SPA over Postgres/MySQL/SQLite (Prisma) or spacekit-storage-node, so it rejects `vue` and `mongo` with a "not yet implemented" message. `examples/postgres.profile.yaml` and `examples/storage-node.profile.yaml` are a runnable pair: `spacekit spec conform` passes on them.
 
 ### Profile A: `flux-vue-mongo`
 
@@ -221,7 +223,7 @@ environments:
   prod: { business: { binding: compile, workflows: { engine: temporal, retries: 5 } } }
 ```
 
-Run `spacekit-cli generate --spec bookshop.spacekit.yaml --profile flux-vue-mongo`: Vue + Pinia, RPC, Mongo with embedded lines, `FulfillOrder` as an in-process saga. Run it with `react-postgres`: React Server Components, server actions over a hexagonal layer, Postgres, `FulfillOrder` as a Temporal workflow, plus an OpenAPI doc. `spacekit-cli conform flux-vue-mongo react-postgres` passes — same app, two stacks.
+Run `spacekit spec generate --spec bookshop.spacekit.yaml --profile flux-vue-mongo.profile.yaml`: Vue + Pinia, RPC, Mongo with embedded lines, `FulfillOrder` as an in-process saga. Run it with `react-postgres`: React Server Components, server actions over a hexagonal layer, Postgres, `FulfillOrder` as a Temporal workflow, plus an OpenAPI doc. `spacekit spec conform flux-vue-mongo.profile.yaml react-postgres.profile.yaml` passes — same app, two stacks.
 
 ---
 
@@ -234,12 +236,12 @@ Run `spacekit-cli generate --spec bookshop.spacekit.yaml --profile flux-vue-mong
             +
   <profile>.profile.yaml --env <env>   (how to build it — stack + patterns + orchestration)
             ↓
-        spacekit-cli  →  validate → conform → generate
+        spacekit spec  →  check → conform → generate
             ↓
   data layer + business layer (+ workflow engine, + OpenAPI) + frontend
 ```
 
-`spacekit-cli` validates the pairing before emitting: a profile referencing a definition not in the spec is an error; a profile or environment that tries to alter behavior fails conformance (§8).
+`spacekit spec` validates the pairing before emitting: a profile referencing a definition not in the spec is an error; a profile or environment that tries to alter behavior fails conformance (§8).
 
 ---
 
@@ -249,10 +251,10 @@ Run `spacekit-cli generate --spec bookshop.spacekit.yaml --profile flux-vue-mong
 
 - Added `business.workflows` orchestration realization (§4), matching the spec's new `workflows`.
 - Added `extends` inheritance and `environments` layering (§2, §7).
-- Added `spacekit-cli conform` conformance checking (§8).
+- Added `spacekit spec conform` conformance checking (§8).
 - Added `view.tokens` interop targets including W3C Design Tokens (§5).
 - Per-environment `binding`.
-- Aligned naming/version to the Spacekit brand and `spacekit-cli`.
+- Aligned naming/version to the SpaceKit brand and the `spacekit` CLI.
 
 
 

@@ -53,7 +53,7 @@ entities:
       duration:  { type: decimal }                          # seconds, for video
       takenAt:   { type: timestamp }
       status:    { type: enum, values: [uploading, processing, ready, failed], default: uploading }
-      uploadedAt:{ type: timestamp, generated: true }
+      uploadedAt: { type: timestamp, generated: true }
     relations:
       album:      { belongsTo: Album }
       uploader:   { belongsTo: User }
@@ -77,37 +77,37 @@ entities:
 capabilities:
   ListAlbums:
     kind: read
-    output: { albums: { list: @Album } }
+    output: { albums: { list: "@Album" } }
     reads: [Album]
     policy: authenticated
 
   ListMedia:
     kind: read
     input:  { albumId: { type: id, required: true }, cursor: { type: text } }   # cursor = pagination
-    output: { media: { list: @Media }, nextCursor: { type: text } }
+    output: { media: { list: "@Media" }, nextCursor: { type: text } }
     reads: [Media]
-    policy: @MediaVisible
+    policy: "@MediaVisible"
 
   CreateAlbum:
     input: { title: { type: text, required: true }, visibility: { type: enum, values: [private, unlisted, public] } }
-    output: { album: @Album }
+    output: { album: "@Album" }
     writes: [{ creates: Album }]
     policy: authenticated
 
   RequestUpload:
     kind: upload                      # lifecycle capability (see note below)
-    bucket: @storage.originals
+    bucket: "@storage.originals"
     input:  { albumId: { type: id, required: true }, filename: { type: text }, contentType: { type: text }, size: { type: integer } }
-    output: { media: @Media }         # created in status: uploading + a presigned target (realization)
+    output: { media: "@Media" }         # created in status: uploading + a presigned target (realization)
     writes: [{ creates: Media }]
     emits:  [MediaUploaded]           # fired when the byte upload completes (status -> processing)
-    policy: @OwnsAlbum
+    policy: "@OwnsAlbum"
 
   # processing steps (background jobs invoked by the ProcessMedia workflow)
   ExtractMetadata:   { kind: offchain, input: { mediaId: { type: id } }, writes: [{ updates: Media }] }
-  GenerateRenditions:{ kind: offchain, input: { mediaId: { type: id } }, writes: [{ creates: Rendition }] }   # thumbs/preview/poster/hls
+  GenerateRenditions: { kind: offchain, input: { mediaId: { type: id } }, writes: [{ creates: Rendition }] }   # thumbs/preview/poster/hls
   DeleteRenditions:  { kind: offchain, input: { mediaId: { type: id } }, writes: [{ deletes: Rendition }] }
-  DeleteMedia:       { input: { mediaId: { type: id } }, writes: [{ deletes: Media }], policy: @OwnsAlbum }
+  DeleteMedia:       { input: { mediaId: { type: id } }, writes: [{ deletes: Media }], policy: "@OwnsAlbum" }
 
 # ---------------------------------------------------------------------------
 # Upload lifecycle (kind: upload):
@@ -116,9 +116,9 @@ capabilities:
 # ---------------------------------------------------------------------------
 
 events:
-  MediaUploaded: { payload: { media: @Media } }
-  MediaReady:    { payload: { media: @Media } }
-  MediaFailed:   { payload: { media: @Media, reason: { type: text } } }
+  MediaUploaded: { payload: { media: "@Media" } }
+  MediaReady:    { payload: { media: "@Media" } }
+  MediaFailed:   { payload: { media: "@Media", reason: { type: text } } }
 
 workflows:
   ProcessMedia:
@@ -134,7 +134,7 @@ workflows:
 # Access rules
 # ---------------------------------------------------------------------------
 policies:
-  OwnsAlbum:     "actor.id == resource.owner.id"
+  OwnsAlbum:     "actor.id == resource.album.owner.id"   # applied to Media: owner of the containing album
   MediaVisible:  "resource.album.visibility == 'public' || actor.id == resource.album.owner.id"
 
 # ---------------------------------------------------------------------------
@@ -143,48 +143,48 @@ policies:
 widgets:
   Spinner:     { props: {} }
   EmptyState:  { props: { message: { type: text } } }
-  AlbumCard:   { props: { album: @Album } }
-  MediaTile:   { props: { media: @Media } }          # shows thumb rendition; spinner while processing
-  Lightbox:    { props: { media: @Media } }          # shows full/preview rendition
+  AlbumCard:   { props: { album: "@Album" } }
+  MediaTile:   { props: { media: "@Media" } }          # shows thumb rendition; spinner while processing
+  Lightbox:    { props: { media: "@Media" } }          # shows full/preview rendition
   Dropzone:    { props: {} }
-  UploadItem:  { props: { media: @Media } }           # per-file progress + state
+  UploadItem:  { props: { media: "@Media" } }           # per-file progress + state
 
 views:
   Gallery:
     route: /
-    data: { albums: { from: @ListAlbums } }
+    data: { albums: { from: "@ListAlbums" } }
     states:
-      loading: @Spinner
-      empty:   { when: "albums.length == 0", show: @EmptyState, props: { message: "No albums yet." } }
+      loading: "@Spinner"
+      empty:   { when: "albums.length == 0", show: "@EmptyState", props: { message: "No albums yet." } }
     layout:
       - repeat: album in albums
-        widget: @AlbumCard
+        widget: "@AlbumCard"
         props: { album: album }
-        on: { tap: -> @AlbumView(id: album.id) }
-    transitions: [{ to: @AlbumView }, { to: @Upload, label: "Upload" }]
+        on: { tap: "-> @AlbumView(id: album.id)" }
+    transitions: [{ to: "@AlbumView" }, { to: "@Upload", label: "Upload" }]
 
   AlbumView:
     route: /albums/:id
     params: { id: { type: id, required: true } }
-    data:   { media: { from: @ListMedia, with: { albumId: params.id, cursor: params.cursor } } }
-    policy: @MediaVisible
+    data:   { media: { from: "@ListMedia", with: { albumId: params.id, cursor: params.cursor } } }
+    policy: "@MediaVisible"
     states:
-      loading: @Spinner
-      empty:   { when: "media.length == 0", show: @EmptyState, props: { message: "This album is empty." } }
+      loading: "@Spinner"
+      empty:   { when: "media.length == 0", show: "@EmptyState", props: { message: "This album is empty." } }
     layout:
       - repeat: item in media                # masonry/grid is a realization detail
-        widget: @MediaTile
+        widget: "@MediaTile"
         props: { media: item }
-        on: { tap: -> @MediaDetail(id: item.id) }
-    transitions: [{ to: @MediaDetail }, { to: @Gallery, label: "All albums" }]
+        on: { tap: "-> @MediaDetail(id: item.id)" }
+    transitions: [{ to: "@MediaDetail" }, { to: "@Gallery", label: "All albums" }]
 
   MediaDetail:
     route: /media/:id
     params: { id: { type: id, required: true } }
-    data:   { item: { from: @Media, where: "id == params.id" } }
-    policy: @MediaVisible
+    data:   { item: { from: "@Media", where: "id == params.id" } }
+    policy: "@MediaVisible"
     layout:
-      - widget: @Lightbox
+      - widget: "@Lightbox"
         props: { media: item }
 
   Upload:
@@ -193,17 +193,17 @@ views:
     params: { albumId: { type: id, required: true } }
     actions:
       add:
-        invokes: @RequestUpload
+        invokes: "@RequestUpload"
         with: { albumId: params.albumId }
         # per-file lifecycle: uploading -> processing -> ready | failed
-        onReady:  -> @AlbumView(id: params.albumId)
+        onReady:  "-> @AlbumView(id: params.albumId)"
         onFailed: stay
     layout:
-      - widget: @Dropzone
+      - widget: "@Dropzone"
       - repeat: m in uploads                 # local upload queue
-        widget: @UploadItem
+        widget: "@UploadItem"
         props: { media: m }
     states:
-      uploading:  @Spinner                   # bytes in flight
-      processing: @Spinner                   # renditions being generated
-      failed:     { show: @EmptyState, props: { message: "Upload failed." } }
+      uploading:  "@Spinner"                   # bytes in flight
+      processing: "@Spinner"                   # renditions being generated
+      failed:     { show: "@EmptyState", props: { message: "Upload failed." } }

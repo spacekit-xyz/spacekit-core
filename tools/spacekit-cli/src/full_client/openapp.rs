@@ -1,26 +1,29 @@
-//! OpenApp — deterministic web-application generation (spec + profile -> full stack).
+//! SpaceKit App generation — deterministic web-application generation
+//! (app spec + profile -> data, business and view layers).
 //!
 //! Pipeline:
 //! ```text
-//!   app.openapp.yaml  ─┐
-//!                      ├─► AppModel IR ─► validate(spec) ─► validate(spec × profile)
-//!   profile.yaml ──────┘                                          │
-//!                          ┌──────────────┬─────────────────┬─────┴────────────┐
-//!                          │ data emitter │ business emitter │ view emitter     │
-//!                          │ (Prisma)     │ (TS actions)     │ (React/Tailwind) │
-//!                          └──────────────┴─────────────────┴──────────────────┘
+//!   app.yaml (spacekit: "0.2") ─┐
+//!                               ├─► AppModel IR ─► validate(spec) ─► validate(spec × profile)
+//!   profile.yaml (+ --env) ─────┘                                          │
+//!                          ┌──────────────┬──────────────────┬─────────────┴────┐
+//!                          │ data emitter │ business emitter  │ view emitter     │
+//!                          │ (Prisma or   │ (TS capabilities, │ (Next.js or      │
+//!                          │ storage node)│ policies, events, │  React SPA)      │
+//!                          │              │ workflows)        │                  │
+//!                          └──────────────┴──────────────────┴──────────────────┘
 //!                                         │
 //!                          synthesize OpenAPI ─► (reuse) parse_openapi + emit_* ─► client SDK
 //! ```
 //!
-//! OpenApp sits *above* the OpenAPI SDK generator: the transport-neutral
-//! `capabilities` are projected to an OpenAPI document, which the existing
-//! Python/TypeScript/Rust emitters turn into a typed client. The profile is the
-//! OpenApp analogue of the `--lang` flag — it chooses the stack and patterns
-//! but, by rule, never the *meaning* of the app.
+//! The transport-neutral `capabilities` are projected to an OpenAPI document,
+//! which the existing Python/TypeScript/Rust emitters turn into a typed client.
+//! The profile chooses the stack and patterns but, by rule, never the *meaning*
+//! of the app (Profile §1). Documents with the legacy `openapp: "0.1"` root key
+//! are still accepted.
 //!
-//! Spec:    `spacekit-cli/documentation/OPENAPP-SPEC-V0.1.md`
-//! Profile: `spacekit-cli/documentation/OPENAPP-PROFILE-V0.1.md`
+//! Spec:    `sdks/spacekit-apps/SPACEKITAPP-SPEC.md` (v0.2)
+//! Profile: `sdks/spacekit-apps/SPACEKITAPP-PROFILE.md` (v0.2)
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -40,6 +43,17 @@ mod business;
 mod data;
 #[path = "openapp_view.rs"]
 mod view;
+#[path = "openapp_policy.rs"]
+pub(crate) mod policy;
+#[path = "openapp_workflow.rs"]
+mod workflow;
+#[path = "openapp_diff.rs"]
+pub(crate) mod diff;
+#[path = "openapp_assist.rs"]
+pub(crate) mod assist;
+#[cfg(test)]
+#[path = "openapp_tests.rs"]
+mod tests;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -58,6 +72,33 @@ pub struct AppArgs {
     pub force: bool,
     /// Second profile to compare against for behavioral-equivalence (Phase 5).
     pub conformance: Option<PathBuf>,
+    /// Profile environment layer to apply (`environments.<env>`), e.g. `dev`.
+    pub env: Option<String>,
+    /// Regenerate even when the spec changed incompatibly without a major
+    /// `app.version` bump (Spec §14).
+    pub allow_breaking: bool,
+    /// Brain project (`*.gf.toml`) whose certified routing suggests a design
+    /// pattern for each capability handler stub.
+    pub assist: Option<PathBuf>,
+}
+
+impl AppArgs {
+    pub fn new(spec: PathBuf) -> Self {
+        AppArgs {
+            spec,
+            profile: None,
+            out: None,
+            sdk_lang: None,
+            check: false,
+            plan: false,
+            prune: false,
+            force: false,
+            conformance: None,
+            env: None,
+            allow_breaking: false,
+            assist: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +109,8 @@ pub struct AppArgs {
 pub(crate) struct AppMeta {
     pub name: String,
     pub version: String,
+    /// Spec format version from the root key (`spacekit: "0.2"`, or legacy `openapp`).
+    pub spec_version: String,
     #[allow(dead_code)]
     pub description: Option<String>,
 }
@@ -83,6 +126,27 @@ pub(crate) struct FieldDef {
     pub generated: bool,
     pub default: Option<Value>,
     pub values: Vec<String>, // enum values
+    /// Validation rules (Spec §5): enforced at the data boundary and on forms.
+    pub rules: Rules,
+    /// For `file`/`image` fields: the logical storage bucket the bytes live in.
+    pub bucket: Option<String>,
+}
+
+/// Field validation rules (Spec v0.2 §5). Properties, not patterns.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Rules {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub pattern: Option<String>,
+    pub one_of: Vec<Value>,
+}
+
+impl Rules {
+    pub fn is_empty(&self) -> bool {
+        *self == Rules::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +216,8 @@ pub(crate) struct Capability {
     pub policy: Option<String>,
     pub idempotent: Option<bool>,
     pub errors: Vec<String>,
+    /// Optional lifecycle hint (`read`, `upload`, `offchain`, …). Informational.
+    pub kind: Option<String>,
 }
 
 impl Capability {
@@ -198,6 +264,19 @@ pub(crate) struct ViewAction {
     pub with: BTreeMap<String, String>,
     pub on_success: Option<String>,
     pub on_error: Option<String>,
+    /// Outcome keys other than `onSuccess`/`onError` (not realized; reported).
+    pub other_outcomes: Vec<String>,
+}
+
+/// A declared view state (Spec v0.2 §10): `loading`, `empty`, or `error`.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewState {
+    pub name: String,
+    /// Boolean expression (only meaningful for `empty`).
+    pub when: Option<String>,
+    /// The widget shown (`@Spinner`).
+    pub show: Option<String>,
+    pub props: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +297,7 @@ pub(crate) struct View {
     pub actions: Vec<ViewAction>,
     pub transitions: Vec<Transition>,
     pub policy: Option<String>,
+    pub states: Vec<ViewState>,
     pub layout: Value, // kept raw; the view emitter walks it
 }
 
@@ -228,11 +308,39 @@ pub(crate) struct Flow {
     pub steps: Vec<Value>,
 }
 
+/// One step of a workflow (Spec v0.2 §7).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowStep {
+    pub capability: String,
+    pub with: BTreeMap<String, String>,
+    pub compensate: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Workflow {
+    pub name: String,
+    pub summary: Option<String>,
+    /// Triggering event.
+    pub on: String,
+    pub steps: Vec<WorkflowStep>,
+    pub on_complete: Option<String>,
+    pub on_failure: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Policy {
+    pub name: String,
+    pub source: String,
+    /// Parsed expression, or the parse error (reported by validation).
+    pub expr: Result<policy::Expr, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Kind {
     Entity,
     Capability,
     Event,
+    Workflow,
     Policy,
     Widget,
     View,
@@ -245,11 +353,18 @@ pub(crate) struct AppModel {
     pub entities: Vec<Entity>,
     pub capabilities: Vec<Capability>,
     pub events: Vec<Event>,
-    pub policies: Vec<(String, String)>,
+    pub workflows: Vec<Workflow>,
+    pub policies: Vec<Policy>,
     pub widgets: Vec<Widget>,
     pub views: Vec<View>,
     pub flows: Vec<Flow>,
     pub tokens: Option<Value>,
+    /// i18n registry: key -> locale -> string.
+    pub text: BTreeMap<String, BTreeMap<String, String>>,
+    /// Logical storage buckets: name -> access (`private` | `public`).
+    pub storage: BTreeMap<String, String>,
+    /// Non-fatal notes about constructs this generator reads but does not realize.
+    pub notes: Vec<String>,
     /// Flat registry: @Name -> kind. Names are unique across all registries.
     pub registry: BTreeMap<String, Kind>,
 }
@@ -260,6 +375,12 @@ impl AppModel {
     }
     pub fn capability(&self, name: &str) -> Option<&Capability> {
         self.capabilities.iter().find(|c| c.name == name)
+    }
+    pub fn event(&self, name: &str) -> Option<&Event> {
+        self.events.iter().find(|e| e.name == name)
+    }
+    pub fn policy(&self, name: &str) -> Option<&Policy> {
+        self.policies.iter().find(|p| p.name == name)
     }
 }
 
@@ -274,6 +395,13 @@ pub(crate) struct Profile {
     pub business: LayerCfg,
     pub view: LayerCfg,
     pub output: LayerCfg,
+    /// Other realization blocks (`storage`, `media`, …) kept for the emitters
+    /// that understand them; never meaning-bearing.
+    pub extra: BTreeMap<String, LayerCfg>,
+    /// The environment layer applied (`--env`), if any.
+    pub env: Option<String>,
+    /// The `spec:` path the profile names, resolved against the profile file.
+    pub spec: Option<PathBuf>,
 }
 
 /// A profile layer is just a string keymap plus per-`@Name` overrides — every
@@ -343,6 +471,9 @@ impl Profile {
             business,
             view,
             output,
+            extra: BTreeMap::new(),
+            env: None,
+            spec: None,
         }
     }
 }
@@ -351,93 +482,122 @@ impl Profile {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn handle_app(args: &AppArgs) -> Result<(), Box<dyn Error>> {
-    let model = load_model(&args.spec)?;
+/// Files produced by one generation, in memory.
+pub(crate) struct Generated {
+    /// Generator-owned files (tracked; regenerated; hand-edits detected).
+    pub files: BTreeMap<String, String>,
+    /// Scaffolds written once and then owned by the developer (handlers, auth).
+    pub scaffold: BTreeMap<String, String>,
+    pub lang: Lang,
+    pub client_pkg: String,
+}
 
-    // Spec-level cross-reference validation (the headline feature).
+/// Load + validate the spec and profile. Prints validation failures and
+/// realization notes; returns an error when either document is invalid.
+pub(crate) fn prepare(
+    spec: &PathBuf,
+    profile: Option<&PathBuf>,
+    env: Option<&str>,
+) -> Result<(AppModel, Profile), Box<dyn Error>> {
+    let model = load_model(spec)?;
+
     let issues = validate_spec(&model);
     if !issues.is_empty() {
         eprintln!(
-            "✗ OpenApp spec validation failed ({} issue(s)):",
+            "✗ {} is not a valid SpaceKit app spec ({} issue(s)):",
+            spec.display(),
             issues.len()
         );
         for i in &issues {
             eprintln!("    - {i}");
         }
-        return Err("invalid OpenApp document".into());
+        return Err("invalid app spec".into());
     }
 
-    let profile = match &args.profile {
-        Some(p) => load_profile(p, &model)?,
-        None => Profile::default_for(&model),
+    let profile = match profile {
+        Some(p) => load_profile(p, &model, env)?,
+        None => {
+            if env.is_some() {
+                return Err("--env needs a --profile that defines `environments`".into());
+            }
+            Profile::default_for(&model)
+        }
     };
 
     // Profile must realize, never re-mean (rule §1).
     let pissues = validate_profile(&model, &profile);
     if !pissues.is_empty() {
-        eprintln!("✗ profile rejected ({} issue(s)):", pissues.len());
+        eprintln!("✗ profile `{}` rejected ({} issue(s)):", profile.name, pissues.len());
         for i in &pissues {
             eprintln!("    - {i}");
         }
-        return Err("invalid OpenApp profile".into());
+        return Err("invalid profile".into());
     }
+    Ok((model, profile))
+}
 
-    // ----- Phase 5: conformance (behavioral equivalence across profiles) -----
-    if let Some(other_path) = &args.conformance {
-        let other = load_profile(other_path, &model)?;
-        let opissues = validate_profile(&model, &other);
-        if !opissues.is_empty() {
-            eprintln!("✗ comparison profile rejected:");
-            for i in &opissues {
-                eprintln!("    - {i}");
-            }
-            return Err("invalid comparison profile".into());
+fn print_notes(model: &AppModel, profile: &Profile) {
+    let mut notes = realization_notes(model);
+    notes.extend(profile_notes(profile));
+    if !notes.is_empty() {
+        println!("  notes:");
+        for n in notes {
+            println!("    · {n}");
         }
-        let fp_a = behavioral_fingerprint(&model);
-        let fp_b = behavioral_fingerprint(&model); // meaning is profile-independent by construction
-        let ha = super::sha256_hex(canonical_json(&fp_a).as_bytes());
-        let hb = super::sha256_hex(canonical_json(&fp_b).as_bytes());
-        println!("Conformance: '{}' vs '{}'", profile.name, other.name);
-        println!("  behavioral fingerprint A: {}", &ha[..16]);
-        println!("  behavioral fingerprint B: {}", &hb[..16]);
-        if ha == hb {
-            println!("  ✓ PASS — both profiles realize identical behavior");
-        } else {
-            eprintln!("  ✗ FAIL — profiles diverge in meaning (must not happen)");
-            return Err("conformance failed".into());
-        }
-        return Ok(());
     }
+}
 
+/// Realization choices the profile makes that this generator only partly honors.
+fn profile_notes(p: &Profile) -> Vec<String> {
+    let mut notes = Vec::new();
+    let engine = workflow_engine(p);
+    if engine != "in-process" {
+        notes.push(format!(
+            "business.workflows.engine `{engine}` is not generated yet; workflows use the \
+             in-process saga runner (same steps and compensation)"
+        ));
+    }
+    for (block, cfg) in &p.extra {
+        if !cfg.values.is_empty() {
+            notes.push(format!("profile block `{block}` is recorded but not realized yet"));
+        }
+    }
+    let tokens = p.view.get("tokens", "css-variables");
+    if tokens != "css-variables" {
+        notes.push(format!("view.tokens `{tokens}` is not generated yet; tokens are emitted as CSS variables"));
+    }
+    notes
+}
+
+pub(crate) fn workflow_engine(p: &Profile) -> String {
+    p.business.get("workflows.engine", "in-process").to_string()
+}
+
+/// Run every emitter in memory.
+pub(crate) fn generate(
+    model: &AppModel,
+    profile: &Profile,
+    sdk_lang: Option<&str>,
+    assist: Option<&assist::Assist>,
+) -> Result<Generated, Box<dyn Error>> {
     let pkg = sanitize_pkg(&model.app.name);
-    let out_root = args
-        .out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("./{pkg}_app")));
-
-    // Decide the client-SDK language from the flag, else the business language.
-    let sdk_lang = args
-        .sdk_lang
-        .clone()
+    let sdk_lang = sdk_lang
+        .map(|s| s.to_string())
         .unwrap_or_else(|| profile.business.get("language", "typescript").to_string());
     let lang = match sdk_lang.to_lowercase().as_str() {
         "python" | "py" => Lang::Python,
         "typescript" | "ts" | "js" | "javascript" => Lang::TypeScript,
-        "rust" | "rs" | "go" => Lang::Rust, // go falls back to rust client for now
-        _ => Lang::TypeScript,
+        "rust" | "rs" => Lang::Rust,
+        other => return Err(format!("unknown --sdk-lang `{other}` (python, typescript, rust)").into()),
     };
 
-    // ----- Assemble every emitted file, keyed by path relative to out_root -----
-    let mut emitted: BTreeMap<String, String> = BTreeMap::new();
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut scaffold: BTreeMap<String, String> = BTreeMap::new();
 
     // Phase 1: capabilities -> OpenAPI -> existing SDK generator.
-    let openapi = synthesize_openapi(&model, &profile);
-    let emit_openapi = profile.business.get("emit_openapi", "true") == "true";
-    if emit_openapi {
-        emitted.insert(
-            "openapi.json".to_string(),
-            serde_json::to_string_pretty(&openapi)? + "\n",
-        );
+    let openapi = synthesize_openapi(model, profile);
+    if profile.business.get("emit_openapi", "true") == "true" {
+        files.insert("openapi.json".to_string(), serde_json::to_string_pretty(&openapi)? + "\n");
     }
     let spec_model = parse_openapi(&openapi)?;
     let client_pkg = format!("{pkg}_client");
@@ -447,57 +607,132 @@ pub fn handle_app(args: &AppArgs) -> Result<(), Box<dyn Error>> {
         Lang::Rust => sdkgen_rust::emit_rust(&spec_model, &client_pkg),
     };
     for (rel, contents) in &client_files {
-        emitted.insert(format!("client/{client_pkg}/{rel}"), contents.clone());
+        files.insert(format!("client/{client_pkg}/{rel}"), contents.clone());
     }
-    emitted.insert(
+    files.insert(
         format!("client/{client_pkg}/README.md"),
         render_readme(&spec_model, &client_pkg, lang),
     );
 
-    // Phase 2: entities -> data layer (Prisma).
-    for (rel, contents) in data::emit_data(&model, &profile) {
-        emitted.insert(rel, contents);
+    // Phase 2: entities -> data layer.
+    for (rel, contents) in data::emit_data(model, profile) {
+        files.insert(rel, contents);
     }
 
-    // Phase 3: capabilities/events -> business layer (TS server actions).
-    for (rel, contents) in business::emit_business(&model, &profile, &client_pkg) {
-        emitted.insert(rel, contents);
+    // Phase 3: capabilities/events/policies/workflows -> business layer.
+    let business = business::emit_business(model, profile, assist);
+    files.extend(business.files);
+    scaffold.extend(business.scaffold);
+    for (rel, contents) in workflow::emit_workflows(model, profile) {
+        files.insert(rel, contents);
     }
 
-    // Phase 4: widgets/views/flows/tokens -> view layer (React).
-    for (rel, contents) in view::emit_view(&model, &profile, &client_pkg) {
-        emitted.insert(rel, contents);
+    // Phase 4: widgets/views/flows/text/tokens -> view layer.
+    for (rel, contents) in view::emit_view(model, profile, &client_pkg) {
+        files.insert(rel, contents);
     }
 
     // Phase 5 artifact: the behavioral fingerprint (meaning, profile-independent).
-    let fp = behavioral_fingerprint(&model);
+    let fp = behavioral_fingerprint(model);
     let fp_hash = super::sha256_hex(canonical_json(&fp).as_bytes());
-    emitted.insert(
-        ".openapp-fingerprint.json".to_string(),
+    files.insert(
+        FINGERPRINT_FILE.to_string(),
         serde_json::to_string_pretty(&json!({
-            "version": 1,
+            "version": 2,
             "app": model.app.name,
+            "appVersion": model.app.version,
             "hash": fp_hash,
             "behavior": fp,
         }))? + "\n",
     );
 
-    // Top-level README tying the layers together.
-    emitted.insert(
+    files.insert(
         "README.md".to_string(),
-        render_app_readme(&model, &profile, &pkg, lang),
+        render_app_readme(model, profile, &pkg, lang),
     );
+    files.insert(".gitignore".to_string(), "node_modules/\n.next/\ndist/\n.env\n*.db\n".to_string());
+
+    Ok(Generated {
+        files,
+        scaffold,
+        lang,
+        client_pkg,
+    })
+}
+
+/// Where the fingerprint of the last generation lives in the output tree.
+pub(crate) const FINGERPRINT_FILE: &str = ".spacekit-app.fingerprint.json";
+
+pub fn handle_app(args: &AppArgs) -> Result<(), Box<dyn Error>> {
+    let (model, profile) = prepare(&args.spec, args.profile.as_ref(), args.env.as_deref())?;
+
+    // Conformance (Profile §8): compare the realized behavior of two profiles.
+    if let Some(other_path) = &args.conformance {
+        let other = load_profile(other_path, &model, args.env.as_deref())?;
+        let opissues = validate_profile(&model, &other);
+        if !opissues.is_empty() {
+            eprintln!("✗ comparison profile `{}` rejected:", other.name);
+            for i in &opissues {
+                eprintln!("    - {i}");
+            }
+            return Err("invalid comparison profile".into());
+        }
+        return run_conformance(&model, &profile, &other);
+    }
+
+    let pkg = sanitize_pkg(&model.app.name);
+    let out_root = args
+        .out
+        .clone()
+        .or_else(|| profile.output.values.get("dir").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(format!("./{pkg}_app")));
+
+    let assist = match &args.assist {
+        Some(project) => {
+            let mut a = assist::Assist::load(project)?;
+            a.route_all(&model)?;
+            Some(a)
+        }
+        None => None,
+    };
+    let generated = generate(&model, &profile, args.sdk_lang.as_deref(), assist.as_ref())?;
+
+    // Spec §14: refuse to regenerate across an unflagged breaking change.
+    if let Some(prev) = read_previous_fingerprint(&out_root) {
+        let new_fp = behavioral_fingerprint(&model);
+        let report = diff::compare(&prev.behavior, &new_fp);
+        if !report.breaking.is_empty() {
+            let bumped = diff::major(&model.app.version) > diff::major(&prev.app_version);
+            if !bumped && !args.allow_breaking {
+                eprintln!(
+                    "✗ the spec changed incompatibly since the last generation ({} breaking change(s)),",
+                    report.breaking.len()
+                );
+                eprintln!(
+                    "  but app.version went {} -> {} without a major bump (Spec §14):",
+                    prev.app_version, model.app.version
+                );
+                for b in report.breaking.iter().take(20) {
+                    eprintln!("    - {b}");
+                }
+                eprintln!("  Bump the major version, or re-run with --allow-breaking.");
+                return Err("breaking spec change without a major version bump".into());
+            }
+        }
+    }
 
     // ----- Report + incremental write (reusing the SDK regen engine) -----
     let verb = if args.plan { "Planned" } else { "Generated" };
-    println!("{verb} {} webapp -> {}", model.app.name, out_root.display());
+    println!("{verb} {} -> {}", model.app.name, out_root.display());
     println!(
-        "  {} entities · {} capabilities · {} events · {} views · profile: {}",
+        "  {} entities · {} capabilities · {} events · {} workflows · {} views · profile: {}{}",
         model.entities.len(),
         model.capabilities.len(),
         model.events.len(),
+        model.workflows.len(),
         model.views.len(),
         profile.name,
+        profile.env.as_deref().map(|e| format!(" (env: {e})")).unwrap_or_default(),
     );
     let store = profile.data.get("store", "postgres");
     let data_realization = if is_storage_node(store) {
@@ -513,13 +748,34 @@ pub fn handle_app(args: &AppArgs) -> Result<(), Box<dyn Error>> {
         profile.view.get("framework", "next"),
         profile.view.get("styling", "tailwind"),
     );
+    print_notes(&model, &profile);
 
     let opts = RegenOpts {
         plan: args.plan,
         prune: args.prune,
     };
-    let plan = plan_regen(&out_root, &emitted, args.force)?;
-    let outcome = apply_regen(&out_root, &emitted, &plan, opts)?;
+    let plan = plan_regen(&out_root, &generated.files, args.force)?;
+    let outcome = apply_regen(&out_root, &generated.files, &plan, opts)?;
+
+    // Scaffolds: written once, then the developer's.
+    let mut scaffolded = 0;
+    for (rel, contents) in &generated.scaffold {
+        let abs = out_root.join(rel);
+        if abs.exists() {
+            continue;
+        }
+        println!("    + {rel}  (scaffold: yours to edit, never overwritten)");
+        scaffolded += 1;
+        if !args.plan {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&abs, contents)?;
+        }
+    }
+    if scaffolded > 0 {
+        println!("  {scaffolded} scaffold file(s) created");
+    }
     if args.plan {
         return Ok(());
     }
@@ -532,9 +788,175 @@ pub fn handle_app(args: &AppArgs) -> Result<(), Box<dyn Error>> {
     }
 
     if args.check {
-        run_checks(&out_root, &client_pkg, lang)?;
+        run_checks(&out_root, &generated.client_pkg, generated.lang)?;
     }
 
+    Ok(())
+}
+
+struct PreviousFingerprint {
+    app_version: String,
+    behavior: Value,
+}
+
+fn read_previous_fingerprint(out_root: &PathBuf) -> Option<PreviousFingerprint> {
+    let raw = fs::read_to_string(out_root.join(FINGERPRINT_FILE)).ok()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    Some(PreviousFingerprint {
+        app_version: str_field(&doc, "appVersion").unwrap_or_else(|| "0.0.0".into()),
+        behavior: doc.get("behavior")?.clone(),
+    })
+}
+
+/// The realized-behavior manifests each emitter writes: what the generated code
+/// actually enforces, as opposed to what the spec says.
+const CONFORMANCE_FILES: &[&str] = &["server/contract.json", "web/routes.json"];
+
+/// Generate both profiles in memory and compare what their code realizes.
+pub(crate) fn conformance_report(
+    model: &AppModel,
+    a: &Profile,
+    b: &Profile,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let ga = generate(model, a, None, None)?;
+    let gb = generate(model, b, None, None)?;
+    let mut diffs = Vec::new();
+    for f in CONFORMANCE_FILES {
+        let va: Value = ga
+            .files
+            .get(*f)
+            .map(|s| serde_json::from_str(s))
+            .transpose()?
+            .unwrap_or(Value::Null);
+        let vb: Value = gb
+            .files
+            .get(*f)
+            .map(|s| serde_json::from_str(s))
+            .transpose()?
+            .unwrap_or(Value::Null);
+        diff::json_differences(f, &va, &vb, &mut diffs);
+    }
+    Ok(diffs)
+}
+
+fn run_conformance(model: &AppModel, a: &Profile, b: &Profile) -> Result<(), Box<dyn Error>> {
+    println!("Conformance: `{}` vs `{}` on {}", a.name, b.name, model.app.name);
+    let diffs = conformance_report(model, a, b)?;
+    let checked = format!(
+        "{} capabilities, {} policies, {} workflows, {} views",
+        model.capabilities.len(),
+        model.policies.len(),
+        model.workflows.len(),
+        model.views.len()
+    );
+    if diffs.is_empty() {
+        println!("  ✓ PASS — both realizations enforce the same behavior ({checked})");
+        Ok(())
+    } else {
+        eprintln!("  ✗ FAIL — the generated code differs in behavior:");
+        for d in &diffs {
+            eprintln!("    - {d}");
+        }
+        Err("conformance failed".into())
+    }
+}
+
+/// The `spec:` path a profile names (resolved against the profile's folder).
+pub fn profile_spec_path(profile: &PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let doc = read_doc(profile)?;
+    let base = profile.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    Ok(str_field(&doc, "spec").map(|s| base.join(s)))
+}
+
+/// `spacekit spec check`: validate only.
+pub fn handle_check(
+    spec: &PathBuf,
+    profile: Option<&PathBuf>,
+    env: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let (model, prof) = prepare(spec, profile, env)?;
+    println!(
+        "✓ {} is a valid SpaceKit app spec (v{}, app {} {})",
+        spec.display(),
+        model.app.spec_version,
+        model.app.name,
+        model.app.version
+    );
+    println!(
+        "  {} entities · {} capabilities · {} events · {} workflows · {} policies · {} views",
+        model.entities.len(),
+        model.capabilities.len(),
+        model.events.len(),
+        model.workflows.len(),
+        model.policies.len(),
+        model.views.len()
+    );
+    if profile.is_some() {
+        println!("✓ profile `{}` realizes it without changing meaning", prof.name);
+    }
+    print_notes(&model, &prof);
+    Ok(())
+}
+
+/// `spacekit spec conform`: behavioral equivalence of two profiles.
+pub fn handle_conform(
+    spec: &PathBuf,
+    a: &PathBuf,
+    b: &PathBuf,
+    env: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let (model, pa) = prepare(spec, Some(a), env)?;
+    let pb = load_profile(b, &model, env)?;
+    let issues = validate_profile(&model, &pb);
+    if !issues.is_empty() {
+        eprintln!("✗ profile `{}` rejected:", pb.name);
+        for i in &issues {
+            eprintln!("    - {i}");
+        }
+        return Err("invalid profile".into());
+    }
+    run_conformance(&model, &pa, &pb)
+}
+
+/// `spacekit spec diff`: compatibility of two spec versions (Spec §14).
+pub fn handle_diff(old: &PathBuf, new: &PathBuf) -> Result<(), Box<dyn Error>> {
+    let a = load_model(old)?;
+    let b = load_model(new)?;
+    let report = diff::compare(&behavioral_fingerprint(&a), &behavioral_fingerprint(&b));
+    println!(
+        "{} {} -> {} {}",
+        a.app.name, a.app.version, b.app.name, b.app.version
+    );
+    if report.breaking.is_empty() && report.compatible.is_empty() {
+        println!("  no behavioral changes");
+        return Ok(());
+    }
+    for c in &report.compatible {
+        println!("  + compatible: {c}");
+    }
+    for c in &report.breaking {
+        println!("  ! breaking:   {c}");
+    }
+    let (ma, mb) = (diff::major(&a.app.version), diff::major(&b.app.version));
+    let (na, nb) = (diff::minor(&a.app.version), diff::minor(&b.app.version));
+    if !report.breaking.is_empty() {
+        if mb > ma {
+            println!("  ✓ major version bumped ({} -> {})", a.app.version, b.app.version);
+        } else {
+            eprintln!(
+                "  ✗ {} breaking change(s) need a major version bump (app.version {} -> {})",
+                report.breaking.len(),
+                a.app.version,
+                b.app.version
+            );
+            return Err("breaking changes without a major version bump".into());
+        }
+    } else if mb == ma && nb <= na {
+        println!(
+            "  · compatible changes usually take a minor bump (app.version {} -> {})",
+            a.app.version, b.app.version
+        );
+    }
     Ok(())
 }
 
@@ -581,9 +1003,22 @@ fn read_doc(path: &PathBuf) -> Result<Value, Box<dyn Error>> {
         .map(|e| e.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
     let doc: Value = if is_json {
-        serde_json::from_str(&raw).map_err(|e| format!("invalid JSON: {e}"))?
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("{}: invalid JSON: {e}", path.display()))?
     } else {
-        serde_yaml::from_str(&raw).map_err(|e| format!("invalid YAML: {e}"))?
+        serde_yaml::from_str(&raw).map_err(|e| {
+            let msg = e.to_string();
+            let hint = if msg.contains("cannot start any token") {
+                "\n  hint: YAML reserves `@` at the start of a value. Quote references and \
+                 navigation, e.g. `policy: \"@OwnsOrder\"`, `tap: \"-> @Catalog\"` (Spec §3)."
+            } else if msg.contains("mapping values are not allowed") {
+                "\n  hint: put a space after every `key:` (e.g. `uploadedAt: { … }`), and quote \
+                 values that contain `: `."
+            } else {
+                ""
+            };
+            format!("{}: invalid YAML: {msg}{hint}", path.display())
+        })?
     };
     Ok(doc)
 }
@@ -653,18 +1088,41 @@ fn parse_type_token(s: &str) -> (String, bool) {
 }
 
 fn parse_model(doc: &Value) -> Result<AppModel, Box<dyn Error>> {
-    let root = as_map(doc).ok_or("OpenApp document must be a map")?;
+    let root = as_map(doc).ok_or("a SpaceKit app document must be a YAML/JSON map")?;
 
-    if root.get("openapp").is_none() {
-        return Err("missing `openapp` version key (is this an OpenApp document?)".into());
+    let spec_version = match (root.get("spacekit"), root.get("openapp")) {
+        (Some(v), _) | (None, Some(v)) => scalar_to_string(v),
+        (None, None) => {
+            return Err(
+                "missing the `spacekit: \"0.2\"` version key (is this a SpaceKit app spec?)".into(),
+            )
+        }
+    };
+    if !matches!(spec_version.as_str(), "0.1" | "0.2") {
+        return Err(format!(
+            "unsupported spec version `{spec_version}` (this generator reads 0.1 and 0.2)"
+        )
+        .into());
+    }
+    if root.contains_key("dapp") {
+        return Err(
+            "this is a dApp document (`dapp:` key). dApp generation (contracts, indexer, wallet, \
+             on-chain transactions) is not in this release; see SPACEKIT-DAPP-SPEC.md for the plan"
+                .into(),
+        );
     }
 
     let app_v = root.get("app").ok_or("missing required `app` block")?;
     let app = AppMeta {
         name: str_field(app_v, "name").unwrap_or_else(|| "App".to_string()),
-        version: str_field(app_v, "version").unwrap_or_else(|| "0.1.0".to_string()),
+        version: app_v
+            .get("version")
+            .map(scalar_to_string)
+            .unwrap_or_else(|| "0.1.0".to_string()),
+        spec_version,
         description: str_field(app_v, "description"),
     };
+    let mut notes: Vec<String> = Vec::new();
 
     let mut entities = Vec::new();
     if let Some(map) = root.get("entities").and_then(as_map) {
@@ -695,10 +1153,71 @@ fn parse_model(doc: &Value) -> Result<AppModel, Box<dyn Error>> {
         }
     }
 
+    let mut workflows = Vec::new();
+    if let Some(map) = root.get("workflows").and_then(as_map) {
+        for (name, body) in map {
+            workflows.push(parse_workflow(name, body, &mut notes));
+        }
+    }
+
     let mut policies = Vec::new();
     if let Some(map) = root.get("policies").and_then(as_map) {
         for (name, body) in map {
-            policies.push((name.clone(), body.as_str().unwrap_or("").to_string()));
+            let source = body.as_str().unwrap_or("").to_string();
+            let expr = policy::parse(&source);
+            policies.push(Policy {
+                name: name.clone(),
+                source,
+                expr,
+            });
+        }
+    }
+
+    let mut text = BTreeMap::new();
+    if let Some(map) = root.get("text").and_then(as_map) {
+        for (key, body) in map {
+            let mut locales = BTreeMap::new();
+            match body {
+                Value::Object(m) => {
+                    for (loc, v) in m {
+                        locales.insert(loc.clone(), scalar_to_string(v));
+                    }
+                }
+                other => {
+                    locales.insert("en".to_string(), scalar_to_string(other));
+                }
+            }
+            text.insert(key.clone(), locales);
+        }
+    }
+
+    let mut storage = BTreeMap::new();
+    if let Some(map) = root.get("storage").and_then(as_map) {
+        for (bucket, body) in map {
+            let access = str_field(body, "access").unwrap_or_else(|| "private".to_string());
+            storage.insert(bucket.clone(), access);
+        }
+    }
+
+    for key in root.keys() {
+        if !matches!(
+            key.as_str(),
+            "spacekit"
+                | "openapp"
+                | "app"
+                | "entities"
+                | "capabilities"
+                | "events"
+                | "workflows"
+                | "policies"
+                | "widgets"
+                | "views"
+                | "flows"
+                | "text"
+                | "tokens"
+                | "storage"
+        ) {
+            notes.push(format!("top-level `{key}` is not part of the spec and was ignored"));
         }
     }
 
@@ -763,8 +1282,11 @@ fn parse_model(doc: &Value) -> Result<AppModel, Box<dyn Error>> {
     for e in &events {
         registry.insert(e.name.clone(), Kind::Event);
     }
-    for (n, _) in &policies {
-        registry.insert(n.clone(), Kind::Policy);
+    for w in &workflows {
+        registry.insert(w.name.clone(), Kind::Workflow);
+    }
+    for p in &policies {
+        registry.insert(p.name.clone(), Kind::Policy);
     }
     for w in &widgets {
         registry.insert(w.name.clone(), Kind::Widget);
@@ -780,7 +1302,8 @@ fn parse_model(doc: &Value) -> Result<AppModel, Box<dyn Error>> {
     entities.sort_by(|a, b| a.name.cmp(&b.name));
     capabilities.sort_by(|a, b| a.name.cmp(&b.name));
     events.sort_by(|a, b| a.name.cmp(&b.name));
-    policies.sort_by(|a, b| a.0.cmp(&b.0));
+    workflows.sort_by(|a, b| a.name.cmp(&b.name));
+    policies.sort_by(|a, b| a.name.cmp(&b.name));
     widgets.sort_by(|a, b| a.name.cmp(&b.name));
     views.sort_by(|a, b| a.name.cmp(&b.name));
     flows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -790,13 +1313,85 @@ fn parse_model(doc: &Value) -> Result<AppModel, Box<dyn Error>> {
         entities,
         capabilities,
         events,
+        workflows,
         policies,
         widgets,
         views,
         flows,
         tokens,
+        text,
+        storage,
+        notes,
         registry,
     })
+}
+
+fn parse_workflow(name: &str, body: &Value, notes: &mut Vec<String>) -> Workflow {
+    let on = match body.get("on") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(m)) => m
+            .get("event")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    };
+    let mut steps = Vec::new();
+    if let Some(arr) = body.get("steps").and_then(|x| x.as_array()) {
+        for st in arr {
+            if st.get("bundle").is_some() {
+                notes.push(format!(
+                    "workflow `{name}` uses an on-chain `bundle` step (dApp spec); it is not generated"
+                ));
+                continue;
+            }
+            let mut with = BTreeMap::new();
+            if let Some(wm) = st.get("with").and_then(as_map) {
+                for (k, v) in wm {
+                    with.insert(k.clone(), value_to_expr(v));
+                }
+            }
+            steps.push(WorkflowStep {
+                capability: str_field(st, "do").unwrap_or_default(),
+                with,
+                compensate: str_field(st, "compensate"),
+            });
+        }
+    }
+    let outcome = |key: &str| -> Option<String> {
+        body.get(key).and_then(|o| match o {
+            Value::String(s) => Some(s.clone()),
+            other => str_field(other, "emit"),
+        })
+    };
+    Workflow {
+        name: name.to_string(),
+        summary: str_field(body, "summary"),
+        on,
+        steps,
+        on_complete: outcome("onComplete"),
+        on_failure: outcome("onFailure"),
+    }
+}
+
+fn parse_rules(v: Option<&Value>) -> Rules {
+    let Some(v) = v else {
+        return Rules::default();
+    };
+    let num = |k: &str| v.get(k).and_then(|x| x.as_f64());
+    let int = |k: &str| v.get(k).and_then(|x| x.as_u64());
+    Rules {
+        min: num("min"),
+        max: num("max"),
+        min_length: int("minLength"),
+        max_length: int("maxLength"),
+        pattern: str_field(v, "pattern"),
+        one_of: v
+            .get("oneOf")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
 
 fn parse_entity(name: &str, body: &Value) -> Entity {
@@ -829,6 +1424,8 @@ fn parse_entity(name: &str, body: &Value) -> Entity {
                     .unwrap_or(false),
                 default: fv.get("default").cloned(),
                 values,
+                rules: parse_rules(fv.get("rules")),
+                bucket: str_field(fv, "bucket"),
             });
         }
     }
@@ -935,6 +1532,7 @@ fn parse_capability(name: &str, body: &Value) -> Capability {
         policy: str_field(body, "policy"),
         idempotent: body.get("idempotent").and_then(|x| x.as_bool()),
         errors,
+        kind: str_field(body, "kind"),
     }
 }
 
@@ -973,12 +1571,22 @@ fn parse_view(name: &str, body: &Value) -> View {
                     with.insert(k.clone(), value_to_expr(v));
                 }
             }
+            let other_outcomes = av
+                .as_object()
+                .map(|m| {
+                    m.keys()
+                        .filter(|k| k.starts_with("on") && *k != "onSuccess" && *k != "onError")
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             actions.push(ViewAction {
                 name: aname.clone(),
                 invokes: str_field(av, "invokes").unwrap_or_default(),
                 with,
                 on_success: str_field(av, "onSuccess"),
                 on_error: str_field(av, "onError"),
+                other_outcomes,
             });
         }
     }
@@ -996,6 +1604,30 @@ fn parse_view(name: &str, body: &Value) -> View {
         }
     }
 
+    let mut states = Vec::new();
+    if let Some(map) = body.get("states").and_then(as_map) {
+        for (sname, sv) in map {
+            let (show, when, props) = match sv {
+                Value::String(s) => (Some(s.clone()), None, BTreeMap::new()),
+                other => (
+                    str_field(other, "show"),
+                    str_field(other, "when"),
+                    other
+                        .get("props")
+                        .and_then(as_map)
+                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default(),
+                ),
+            };
+            states.push(ViewState {
+                name: sname.clone(),
+                when,
+                show,
+                props,
+            });
+        }
+    }
+
     View {
         name: name.to_string(),
         route: str_field(body, "route"),
@@ -1004,7 +1636,9 @@ fn parse_view(name: &str, body: &Value) -> View {
         data,
         actions,
         transitions,
-        policy: str_field(body, "policy"),
+        // `requires:` is accepted as a synonym for a view `policy:`.
+        policy: str_field(body, "policy").or_else(|| str_field(body, "requires")),
+        states,
         layout: body.get("layout").cloned().unwrap_or(Value::Null),
     }
 }
@@ -1021,26 +1655,107 @@ fn value_to_expr(v: &Value) -> String {
 // Profile loading
 // ---------------------------------------------------------------------------
 
-fn load_profile(path: &PathBuf, model: &AppModel) -> Result<Profile, Box<dyn Error>> {
-    let doc = read_doc(path)?;
-    let root = as_map(&doc).ok_or("profile must be a map")?;
+fn load_profile(
+    path: &PathBuf,
+    model: &AppModel,
+    env: Option<&str>,
+) -> Result<Profile, Box<dyn Error>> {
     let mut prof = Profile::default_for(model);
-    prof.name = str_field(&doc, "name").unwrap_or_else(|| "custom".to_string());
-
-    for (layer_key, target) in [("data", 0u8), ("business", 1), ("view", 2), ("output", 3)] {
-        if let Some(block) = root.get(layer_key).and_then(as_map) {
-            let cfg = parse_layer(block);
-            match target {
-                0 => merge_layer(&mut prof.data, cfg),
-                1 => merge_layer(&mut prof.business, cfg),
-                2 => merge_layer(&mut prof.view, cfg),
-                _ => merge_layer(&mut prof.output, cfg),
-            }
-        }
+    let mut chain = Vec::new();
+    apply_profile_file(path, &mut prof, env, &mut chain)?;
+    if let Some(e) = env {
+        prof.env = Some(e.to_string());
     }
     Ok(prof)
 }
 
+/// Load a profile document onto `prof`: its `extends` base first, then its own
+/// blocks, then the requested environment layer (Profile §2, §7).
+fn apply_profile_file(
+    path: &PathBuf,
+    prof: &mut Profile,
+    env: Option<&str>,
+    chain: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    if chain.contains(&canon) {
+        return Err(format!("profile `extends` cycle through {}", path.display()).into());
+    }
+    chain.push(canon);
+    let doc = read_doc(path)?;
+    let root = as_map(&doc).ok_or("profile must be a map")?;
+    let base_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+
+    if let Some(ext) = str_field(&doc, "extends") {
+        apply_profile_file(&base_dir.join(ext), prof, env, chain)?;
+    }
+    if let Some(name) = str_field(&doc, "name") {
+        prof.name = name;
+    } else if prof.name == "default" {
+        prof.name = "custom".to_string();
+    }
+    if let Some(spec) = str_field(&doc, "spec") {
+        prof.spec = Some(base_dir.join(spec));
+    }
+    apply_layers(prof, root)?;
+
+    if let Some(e) = env {
+        let envs = root.get("environments").and_then(as_map);
+        match envs.and_then(|m| m.get(e)).and_then(as_map) {
+            Some(layer) => apply_layers(prof, layer)?,
+            None => {
+                // Only an error when this profile defines environments at all and
+                // no ancestor supplied the requested one either.
+                if envs.is_some() && prof.env.as_deref() != Some(e) {
+                    let names: Vec<&String> = envs.map(|m| m.keys().collect()).unwrap_or_default();
+                    return Err(format!(
+                        "profile {} has no environment `{e}` (defined: {})",
+                        path.display(),
+                        names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                    .into());
+                }
+            }
+        }
+        if envs.map(|m| m.contains_key(e)).unwrap_or(false) {
+            prof.env = Some(e.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Profile keys that are document metadata rather than realization layers.
+const PROFILE_META_KEYS: &[&str] = &[
+    "spacekit-profile",
+    "openapp-profile",
+    "name",
+    "spec",
+    "extends",
+    "environments",
+];
+
+fn apply_layers(prof: &mut Profile, root: &Map<String, Value>) -> Result<(), Box<dyn Error>> {
+    for (key, block) in root {
+        if PROFILE_META_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let Some(block) = block.as_object() else {
+            return Err(format!("profile `{key}` must be a map of realization choices").into());
+        };
+        let cfg = parse_layer(block);
+        match key.as_str() {
+            "data" => merge_layer(&mut prof.data, cfg),
+            "business" => merge_layer(&mut prof.business, cfg),
+            "view" => merge_layer(&mut prof.view, cfg),
+            "output" => merge_layer(&mut prof.output, cfg),
+            other => merge_layer(prof.extra.entry(other.to_string()).or_default(), cfg),
+        }
+    }
+    Ok(())
+}
+
+/// Flatten a layer block: nested maps become dotted keys
+/// (`workflows: { engine: inngest }` -> `workflows.engine = inngest`).
 fn parse_layer(block: &Map<String, Value>) -> LayerCfg {
     let mut cfg = LayerCfg::default();
     for (k, v) in block {
@@ -1049,18 +1764,37 @@ fn parse_layer(block: &Map<String, Value>) -> LayerCfg {
                 for (name, ov) in om {
                     if let Some(ovm) = ov.as_object() {
                         let mut entry = BTreeMap::new();
-                        for (ok, ovv) in ovm {
-                            entry.insert(ok.clone(), scalar_to_string(ovv));
-                        }
+                        flatten_into(&mut entry, "", ovm);
                         cfg.overrides.insert(name.clone(), entry);
                     }
                 }
             }
             continue;
         }
-        cfg.values.insert(k.clone(), scalar_to_string(v));
+        match v.as_object() {
+            Some(inner) => flatten_into(&mut cfg.values, k, inner),
+            None => {
+                cfg.values.insert(k.clone(), scalar_to_string(v));
+            }
+        }
     }
     cfg
+}
+
+fn flatten_into(out: &mut BTreeMap<String, String>, prefix: &str, map: &Map<String, Value>) {
+    for (k, v) in map {
+        let key = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v.as_object() {
+            Some(inner) => flatten_into(out, &key, inner),
+            None => {
+                out.insert(key, scalar_to_string(v));
+            }
+        }
+    }
 }
 
 fn merge_layer(into: &mut LayerCfg, from: LayerCfg) {
@@ -1068,7 +1802,7 @@ fn merge_layer(into: &mut LayerCfg, from: LayerCfg) {
         into.values.insert(k, v);
     }
     for (k, v) in from.overrides {
-        into.overrides.insert(k, v);
+        into.overrides.entry(k).or_default().extend(v);
     }
 }
 
@@ -1110,7 +1844,8 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
     m.entities.iter().for_each(|e| bump(&e.name));
     m.capabilities.iter().for_each(|c| bump(&c.name));
     m.events.iter().for_each(|e| bump(&e.name));
-    m.policies.iter().for_each(|p| bump(&p.0));
+    m.workflows.iter().for_each(|w| bump(&w.name));
+    m.policies.iter().for_each(|p| bump(&p.name));
     m.widgets.iter().for_each(|w| bump(&w.name));
     m.views.iter().for_each(|v| bump(&v.name));
     m.flows.iter().for_each(|f| bump(&f.name));
@@ -1142,6 +1877,15 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
                     "entity `{}` field `{}` is enum but lists no `values`",
                     e.name, f.name
                 ));
+            }
+            check_rules(e, f, &mut issues);
+            if let Some(b) = &f.bucket {
+                if !m.storage.contains_key(b) {
+                    issues.push(format!(
+                        "entity `{}` field `{}` uses bucket `{b}`, which `storage` does not declare",
+                        e.name, f.name
+                    ));
+                }
             }
         }
         for r in &e.relations {
@@ -1190,6 +1934,9 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
         }
         if let Some(p) = &c.policy {
             check_policy(m, p, &format!("capability `{}`", c.name), &mut issues);
+            if let (Some(pol), Some(ent)) = (named_policy(m, p), c.primary_entity()) {
+                check_policy_paths(m, pol, &ent, &format!("capability `{}`", c.name), &mut issues);
+            }
         }
         for io in c.input.iter().chain(c.output.iter()) {
             if io.ty.starts_with('@') && !is_entity(strip_ref(&io.ty)) {
@@ -1197,6 +1944,99 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
                     "capability `{}` param `{}` references unknown entity `{}`",
                     c.name, io.name, io.ty
                 ));
+            }
+        }
+    }
+
+    // Policies must parse (Spec §9 grammar).
+    for p in &m.policies {
+        if let Err(e) = &p.expr {
+            issues.push(format!("policy `{}` is not a valid expression: {e}", p.name));
+        }
+    }
+
+    // Workflows (Spec §7).
+    for w in &m.workflows {
+        let trigger = m.event(strip_ref(&w.on));
+        if w.on.is_empty() {
+            issues.push(format!("workflow `{}` has no `on` event", w.name));
+        } else if trigger.is_none() {
+            issues.push(format!("workflow `{}` is triggered by unknown event `{}`", w.name, w.on));
+        }
+        if w.steps.is_empty() {
+            issues.push(format!("workflow `{}` has no steps", w.name));
+        }
+        for (i, st) in w.steps.iter().enumerate() {
+            let ctx = format!("workflow `{}` step {}", w.name, i + 1);
+            match m.capability(strip_ref(&st.capability)) {
+                None => issues.push(format!("{ctx} does unknown capability `{}`", st.capability)),
+                Some(cap) => {
+                    for k in st.with.keys() {
+                        if !cap.input.iter().any(|inp| &inp.name == k) {
+                            issues.push(format!("{ctx} passes `{k}` not in capability `{}` input", cap.name));
+                        }
+                    }
+                    for inp in &cap.input {
+                        if inp.required && !st.with.contains_key(&inp.name) {
+                            issues.push(format!("{ctx} omits required input `{}` of `{}`", inp.name, cap.name));
+                        }
+                    }
+                }
+            }
+            for expr in st.with.values() {
+                if let Some(rest) = expr.strip_prefix("event.") {
+                    let head = rest.split('.').next().unwrap_or("");
+                    if let Some(ev) = trigger {
+                        if !ev.payload.iter().any(|p| p.name == head) {
+                            issues.push(format!(
+                                "{ctx} reads `event.{head}`, which event `{}` does not carry",
+                                ev.name
+                            ));
+                        }
+                    }
+                } else if !is_literal_expr(expr) {
+                    issues.push(format!(
+                        "{ctx} maps `{expr}`; workflow inputs may only read `event.…` or literals"
+                    ));
+                }
+            }
+            if let Some(comp) = &st.compensate {
+                match m.capability(strip_ref(comp)) {
+                    None => issues.push(format!("{ctx} compensates with unknown capability `{comp}`")),
+                    Some(cc) => {
+                        // Compensations receive the step's own inputs.
+                        for inp in &cc.input {
+                            if inp.required && !st.with.contains_key(&inp.name) {
+                                issues.push(format!(
+                                    "{ctx}: compensation `{}` needs `{}`, which the step does not pass",
+                                    cc.name, inp.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (key, ev) in [("onComplete", &w.on_complete), ("onFailure", &w.on_failure)] {
+            if let Some(ev) = ev {
+                match m.event(strip_ref(ev)) {
+                    None => issues.push(format!("workflow `{}` {key} emits unknown event `{ev}`", w.name)),
+                    Some(out_ev) => {
+                        for p in &out_ev.payload {
+                            let from_trigger = trigger
+                                .map(|t| t.payload.iter().any(|tp| tp.name == p.name))
+                                .unwrap_or(false);
+                            let is_reason = p.name == "reason" && key == "onFailure";
+                            if p.required && !from_trigger && !is_reason {
+                                issues.push(format!(
+                                    "workflow `{}` {key} emits `{}`, but its required `{}` is not in the \
+                                     triggering event's payload",
+                                    w.name, out_ev.name, p.name
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1297,9 +2137,40 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
         }
         if let Some(p) = &v.policy {
             check_policy(m, p, &format!("view `{}`", v.name), &mut issues);
+            if let (Some(pol), Some(ent)) = (named_policy(m, p), view_resource_entity(m, v)) {
+                check_policy_paths(m, pol, &ent.name, &format!("view `{}`", v.name), &mut issues);
+            }
+        }
+        // States (Spec §10).
+        for st in &v.states {
+            if let Some(w) = &st.show {
+                let name = strip_ref(w);
+                if !m.widgets.iter().any(|x| x.name == name) {
+                    issues.push(format!(
+                        "view `{}` state `{}` shows unknown widget `{w}`",
+                        v.name, st.name
+                    ));
+                }
+            }
+            if st.name == "empty" && st.when.is_none() {
+                issues.push(format!("view `{}` state `empty` needs a `when` expression", v.name));
+            }
         }
         // Layout widget/view refs.
         check_layout_refs(m, &v.layout, &v.name, &mut issues);
+        // Text references (Spec §11) anywhere in the view.
+        let mut texts = Vec::new();
+        collect_text_refs(&v.layout, &mut texts);
+        for st in &v.states {
+            for val in st.props.values() {
+                collect_text_refs(val, &mut texts);
+            }
+        }
+        for key in texts {
+            if !m.text.contains_key(&key) {
+                issues.push(format!("view `{}` uses `@text.{key}`, which `text` does not define", v.name));
+            }
+        }
     }
 
     // Flows: each step `at: @View`.
@@ -1321,13 +2192,178 @@ fn validate_spec(m: &AppModel) -> Vec<String> {
 }
 
 fn check_policy(m: &AppModel, p: &str, ctx: &str, issues: &mut Vec<String>) {
-    if p == "public" || p == "authenticated" {
+    if is_builtin_policy(p) {
         return;
     }
     let name = strip_ref(p);
-    if !m.policies.iter().any(|(n, _)| n == name) {
+    if m.policy(name).is_none() {
         issues.push(format!("{ctx} references unknown policy `{p}`"));
     }
+}
+
+/// `public` and `authenticated` are keywords, not named policies (Spec §9).
+pub(crate) fn is_builtin_policy(p: &str) -> bool {
+    matches!(strip_ref(p), "public" | "authenticated")
+}
+
+/// The named policy a `policy:` reference points at (None for keywords/unknown).
+pub(crate) fn named_policy<'a>(m: &'a AppModel, p: &str) -> Option<&'a Policy> {
+    if is_builtin_policy(p) {
+        return None;
+    }
+    m.policy(strip_ref(p))
+}
+
+/// The entity a view's policy is evaluated against: its first entity-bound `data`.
+pub(crate) fn view_resource_entity<'a>(m: &'a AppModel, v: &View) -> Option<&'a Entity> {
+    v.data.iter().find_map(|d| m.entity(strip_ref(&d.from)))
+}
+
+/// Every `resource.a.b` path must walk declared relations and end on a field.
+fn check_policy_paths(m: &AppModel, pol: &Policy, entity: &str, ctx: &str, issues: &mut Vec<String>) {
+    let Ok(expr) = &pol.expr else { return };
+    let mut paths = Vec::new();
+    policy::resource_paths(expr, &mut paths);
+    for path in paths {
+        if let Err(e) = walk_resource_path(m, entity, &path) {
+            issues.push(format!(
+                "{ctx} uses policy `{}` on `{entity}`, but `resource.{}` {e}",
+                pol.name,
+                path.join(".")
+            ));
+        }
+    }
+}
+
+/// Resolve `resource.<path>` from `entity`; returns the relation names walked.
+pub(crate) fn walk_resource_path(m: &AppModel, entity: &str, path: &[String]) -> Result<Vec<String>, String> {
+    let mut cur = m.entity(entity).ok_or_else(|| format!("(unknown entity `{entity}`)"))?;
+    let mut rels = Vec::new();
+    for (i, seg) in path.iter().enumerate() {
+        if let Some(r) = cur.relations.iter().find(|r| &r.name == seg) {
+            rels.push(seg.clone());
+            match m.entity(&r.target) {
+                Some(t) => cur = t,
+                None => return Err(format!("walks to unknown entity `{}`", r.target)),
+            }
+            if i == path.len() - 1 {
+                return Err(format!("ends on relation `{seg}`; compare a field such as `{seg}.id`"));
+            }
+            continue;
+        }
+        if cur.field(seg).is_some() {
+            if i != path.len() - 1 {
+                return Err(format!("reads into `{seg}`, which is a field of `{}`, not a relation", cur.name));
+            }
+            return Ok(rels);
+        }
+        return Err(format!("is not a field or relation of `{}` (at `{seg}`)", cur.name));
+    }
+    Err("must name a field".into())
+}
+
+/// Prisma `include` tree for the relations a policy walks on `entity`.
+pub(crate) fn policy_include(m: &AppModel, pol: &Policy, entity: &str) -> policy::IncludeTree {
+    let mut tree = policy::IncludeTree::default();
+    if let Ok(expr) = &pol.expr {
+        let mut paths = Vec::new();
+        policy::resource_paths(expr, &mut paths);
+        for path in paths {
+            if let Ok(rels) = walk_resource_path(m, entity, &path) {
+                let mut node = &mut tree;
+                for r in rels {
+                    node = node.0.entry(r).or_default();
+                }
+            }
+        }
+    }
+    tree
+}
+
+fn check_rules(e: &Entity, f: &FieldDef, issues: &mut Vec<String>) {
+    let r = &f.rules;
+    if r.is_empty() {
+        return;
+    }
+    let numeric = matches!(f.ty.as_str(), "integer" | "decimal" | "money");
+    let textual = matches!(f.ty.as_str(), "text" | "longtext" | "email" | "url" | "phone");
+    let ctx = format!("entity `{}` field `{}`", e.name, f.name);
+    if (r.min.is_some() || r.max.is_some()) && !numeric {
+        issues.push(format!("{ctx}: `min`/`max` apply to number fields, not `{}`", f.ty));
+    }
+    if (r.min_length.is_some() || r.max_length.is_some() || r.pattern.is_some()) && !textual {
+        issues.push(format!("{ctx}: `minLength`/`maxLength`/`pattern` apply to text fields, not `{}`", f.ty));
+    }
+    if let (Some(a), Some(b)) = (r.min, r.max) {
+        if a > b {
+            issues.push(format!("{ctx}: `min` ({a}) is greater than `max` ({b})"));
+        }
+    }
+    if let (Some(a), Some(b)) = (r.min_length, r.max_length) {
+        if a > b {
+            issues.push(format!("{ctx}: `minLength` ({a}) is greater than `maxLength` ({b})"));
+        }
+    }
+    if let Some(p) = &r.pattern {
+        if regex::Regex::new(p).is_err() {
+            issues.push(format!("{ctx}: `pattern` is not a valid regular expression"));
+        }
+    }
+}
+
+/// A workflow `with` value that is a literal (number, bool, quoted string).
+fn is_literal_expr(s: &str) -> bool {
+    let t = s.trim();
+    t.parse::<f64>().is_ok()
+        || t == "true"
+        || t == "false"
+        || (t.starts_with('\'') && t.ends_with('\''))
+        || (t.starts_with('"') && t.ends_with('"'))
+}
+
+fn collect_text_refs(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            if let Some(key) = s.trim().strip_prefix("@text.") {
+                out.push(key.to_string());
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_text_refs(x, out)),
+        Value::Object(m) => m.values().for_each(|x| collect_text_refs(x, out)),
+        _ => {}
+    }
+}
+
+/// Constructs the generator reads but does not (yet) realize. Printed as notes,
+/// never silently dropped.
+pub(crate) fn realization_notes(m: &AppModel) -> Vec<String> {
+    let mut notes = m.notes.clone();
+    for v in &m.views {
+        for st in &v.states {
+            if !matches!(st.name.as_str(), "loading" | "empty" | "error") {
+                notes.push(format!(
+                    "view `{}` state `{}` is not realized (supported states: loading, empty, error)",
+                    v.name, st.name
+                ));
+            }
+        }
+        for a in &v.actions {
+            for o in &a.other_outcomes {
+                notes.push(format!(
+                    "view `{}` action `{}` outcome `{o}` is not realized (supported: onSuccess, onError)",
+                    v.name, a.name
+                ));
+            }
+        }
+    }
+    if !m.storage.is_empty() {
+        notes.push(
+            "`storage` buckets are validated and recorded; file fields are stored as object keys. \
+             Upload/presign adapters are not generated yet"
+                .to_string(),
+        );
+    }
+    notes
 }
 
 /// A navigation outcome is either `stay` or `-> @View(args)`.
@@ -1339,12 +2375,55 @@ fn check_navigation(m: &AppModel, nav: Option<&str>, ctx: &str, issues: &mut Vec
     if nav == "stay" || nav.is_empty() {
         return;
     }
-    let target = nav.trim_start_matches("->").trim();
-    let name = target.split('(').next().unwrap_or(target).trim();
-    let name = strip_ref(name);
-    if !m.views.iter().any(|v| v.name == name) {
+    let Some((name, args)) = parse_navigation(nav) else {
+        issues.push(format!("{ctx}: `{nav}` is not `stay` or `-> @View(arg: value)`"));
+        return;
+    };
+    let Some(target) = m.views.iter().find(|v| v.name == name) else {
         issues.push(format!("{ctx} navigates to unknown view `{name}`"));
+        return;
+    };
+    for (k, _) in &args {
+        if !target.params.iter().any(|p| &p.name == k) {
+            issues.push(format!("{ctx} passes `{k}`, which view `{name}` has no param for"));
+        }
     }
+    for p in &target.params {
+        let in_route = target
+            .route
+            .as_deref()
+            .map(|r| r.split('/').any(|seg| seg == format!(":{}", p.name)))
+            .unwrap_or(false);
+        if (p.required || in_route) && !args.iter().any(|(k, _)| k == &p.name) {
+            issues.push(format!("{ctx} navigates to `{name}` without its `{}` param", p.name));
+        }
+    }
+}
+
+/// `-> @View(a: x, b: y)` -> ("View", [("a","x"), ("b","y")]).
+pub(crate) fn parse_navigation(nav: &str) -> Option<(String, Vec<(String, String)>)> {
+    let t = nav.trim().strip_prefix("->")?.trim();
+    let (head, rest) = match t.find('(') {
+        Some(i) => (&t[..i], Some(&t[i + 1..])),
+        None => (t, None),
+    };
+    let name = strip_ref(head.trim()).to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let mut args = Vec::new();
+    if let Some(rest) = rest {
+        let inner = rest.strip_suffix(')')?;
+        for part in inner.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (k, v) = part.split_once(':')?;
+            args.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    Some((name, args))
 }
 
 fn check_layout_refs(m: &AppModel, node: &Value, view: &str, issues: &mut Vec<String>) {
@@ -1355,6 +2434,18 @@ fn check_layout_refs(m: &AppModel, node: &Value, view: &str, issues: &mut Vec<St
             }
         }
         Value::Object(map) => {
+            if let Some(on) = map.get("on").and_then(|x| x.as_object()) {
+                for (evt, nav) in on {
+                    if let Some(nav) = nav.as_str() {
+                        check_navigation(
+                            m,
+                            Some(nav),
+                            &format!("view `{view}` layout `on.{evt}`"),
+                            issues,
+                        );
+                    }
+                }
+            }
             for key in ["widget", "view"] {
                 if let Some(r) = map.get(key).and_then(|x| x.as_str()) {
                     let name = strip_ref(r);
@@ -1398,15 +2489,23 @@ fn validate_profile(m: &AppModel, p: &Profile) -> Vec<String> {
         "views",
         "reads",
         "emits",
+        "steps",
+        "compensate",
+        "onComplete",
+        "onFailure",
     ];
-    for (layer_name, layer) in [
+    let mut layers: Vec<(&str, &LayerCfg)> = vec![
         ("data", &p.data),
         ("business", &p.business),
         ("view", &p.view),
         ("output", &p.output),
-    ] {
+    ];
+    for (k, v) in &p.extra {
+        layers.push((k.as_str(), v));
+    }
+    for (layer_name, layer) in layers {
         for k in layer.values.keys() {
-            if FORBIDDEN.contains(&k.as_str()) {
+            if k.split('.').any(|seg| FORBIDDEN.contains(&seg)) {
                 issues.push(format!(
                     "profile `{layer_name}.{k}` would change app meaning — not allowed (rule §1)"
                 ));
@@ -1430,9 +2529,10 @@ fn validate_profile(m: &AppModel, p: &Profile) -> Vec<String> {
                 "data.orm `{orm}` not yet implemented (supported: prisma, none, or store: spacekit-storage-node)"
             ));
         }
-        if orm == "prisma" && !matches!(store, "postgres" | "mysql" | "sqlite") {
+        if orm == "prisma" && !matches!(store, "postgres" | "postgresql" | "mysql" | "sqlite") {
             issues.push(format!(
-                "data.store `{store}` unsupported (use postgres/mysql/sqlite with prisma, or spacekit-storage-node)"
+                "data.store `{store}` not yet implemented (supported: postgres, mysql, sqlite with prisma, \
+                 or spacekit-storage-node)"
             ));
         }
     }
@@ -1795,6 +2895,8 @@ pub(crate) fn behavioral_fingerprint(m: &AppModel) -> Value {
                             "unique": f.unique,
                             "generated": f.generated,
                             "values": f.values,
+                            "rules": rules_fp(&f.rules),
+                            "bucket": f.bucket,
                         }),
                     )
                 })
@@ -1820,17 +2922,29 @@ pub(crate) fn behavioral_fingerprint(m: &AppModel) -> Value {
         .capabilities
         .iter()
         .map(|c| {
+            let mut writes: Vec<Value> = c
+                .writes
+                .iter()
+                .map(|w| json!({ "effect": w.effect, "entity": w.entity }))
+                .collect();
+            writes.sort_by_key(|v| v.to_string());
+            let mut errors = c.errors.clone();
+            errors.sort();
+            let mut emits = c.emits.clone();
+            emits.sort();
+            let mut reads = c.reads.clone();
+            reads.sort();
             (
                 c.name.clone(),
                 json!({
                     "input": io_fp(&c.input),
                     "output": io_fp(&c.output),
-                    "reads": c.reads,
-                    "writes": c.writes.iter().map(|w| json!({ "effect": w.effect, "entity": w.entity })).collect::<Vec<_>>(),
-                    "emits": c.emits,
-                    "policy": c.policy,
+                    "reads": reads,
+                    "writes": writes,
+                    "emits": emits,
+                    "policy": c.policy.as_deref().map(strip_ref).unwrap_or("public"),
                     "idempotent": c.idempotent,
-                    "errors": c.errors,
+                    "errors": errors,
                 }),
             )
         })
@@ -1842,10 +2956,42 @@ pub(crate) fn behavioral_fingerprint(m: &AppModel) -> Value {
         .map(|e| (e.name.clone(), json!({ "payload": io_fp(&e.payload) })))
         .collect();
 
+    let workflows: Map<String, Value> = m
+        .workflows
+        .iter()
+        .map(|w| {
+            (
+                w.name.clone(),
+                json!({
+                    "on": strip_ref(&w.on),
+                    "steps": w.steps.iter().map(|s| json!({
+                        "do": strip_ref(&s.capability),
+                        "with": s.with,
+                        "compensate": s.compensate.as_deref().map(strip_ref),
+                    })).collect::<Vec<_>>(),
+                    "onComplete": w.on_complete.as_deref().map(strip_ref),
+                    "onFailure": w.on_failure.as_deref().map(strip_ref),
+                }),
+            )
+        })
+        .collect();
+
     let policies: Map<String, Value> = m
         .policies
         .iter()
-        .map(|(n, r)| (n.clone(), json!(r)))
+        .map(|p| {
+            let canon = match &p.expr {
+                Ok(e) => policy::canonical(e),
+                Err(_) => p.source.trim().to_string(),
+            };
+            (p.name.clone(), json!(canon))
+        })
+        .collect();
+
+    let widgets: Map<String, Value> = m
+        .widgets
+        .iter()
+        .map(|w| (w.name.clone(), json!({ "props": io_fp(&w.props), "slots": w.slots })))
         .collect();
 
     let views: Map<String, Value> = m
@@ -1856,23 +3002,52 @@ pub(crate) fn behavioral_fingerprint(m: &AppModel) -> Value {
                 v.name.clone(),
                 json!({
                     "route": v.route,
-                    "policy": v.policy,
-                    "data": v.data.iter().map(|d| json!({ "name": d.name, "from": d.from })).collect::<Vec<_>>(),
-                    "actions": v.actions.iter().map(|a| json!({ "name": a.name, "invokes": a.invokes, "onSuccess": a.on_success, "onError": a.on_error })).collect::<Vec<_>>(),
-                    "transitions": v.transitions.iter().map(|t| json!({ "to": t.to, "when": t.when })).collect::<Vec<_>>(),
+                    "params": io_fp(&v.params),
+                    "policy": v.policy.as_deref().map(strip_ref),
+                    "data": v.data.iter().map(|d| json!({ "name": d.name, "from": strip_ref(&d.from), "where": d.where_expr, "with": d.with })).collect::<Vec<_>>(),
+                    "actions": v.actions.iter().map(|a| json!({ "name": a.name, "invokes": strip_ref(&a.invokes), "with": a.with, "onSuccess": a.on_success, "onError": a.on_error })).collect::<Vec<_>>(),
+                    "transitions": v.transitions.iter().map(|t| json!({ "to": strip_ref(&t.to), "when": t.when })).collect::<Vec<_>>(),
+                    "states": v.states.iter().map(|s| json!({ "name": s.name, "when": s.when, "show": s.show.as_deref().map(strip_ref) })).collect::<Vec<_>>(),
                 }),
             )
         })
         .collect();
 
     json!({
-        "app": { "name": m.app.name, "version": m.app.version },
+        "app": { "name": m.app.name },
         "entities": entities,
         "capabilities": capabilities,
         "events": events,
+        "workflows": workflows,
         "policies": policies,
+        "widgets": widgets,
         "views": views,
+        "text": m.text.keys().collect::<Vec<_>>(),
+        "storage": m.storage,
     })
+}
+
+fn rules_fp(r: &Rules) -> Value {
+    let mut o = Map::new();
+    if let Some(v) = r.min {
+        o.insert("min".into(), json!(v));
+    }
+    if let Some(v) = r.max {
+        o.insert("max".into(), json!(v));
+    }
+    if let Some(v) = r.min_length {
+        o.insert("minLength".into(), json!(v));
+    }
+    if let Some(v) = r.max_length {
+        o.insert("maxLength".into(), json!(v));
+    }
+    if let Some(v) = &r.pattern {
+        o.insert("pattern".into(), json!(v));
+    }
+    if !r.one_of.is_empty() {
+        o.insert("oneOf".into(), json!(r.one_of));
+    }
+    Value::Object(o)
 }
 
 fn io_fp(io: &[IoParam]) -> Map<String, Value> {

@@ -72,9 +72,9 @@ Every indexed entity gains a reserved, read-only `_status` of `pending` (indexed
 ```yaml
 views:
   OrderConfirmation:
-    data: { purchase: { from: @Purchase, where: "id == params.purchaseId" } }
+    data: { purchase: { from: "@Purchase", where: "id == params.purchaseId" } }
     states:
-      pending: { when: "purchase._status == 'pending'", show: @AwaitingFinality }
+      pending: { when: "purchase._status == 'pending'", show: "@AwaitingFinality" }
 ```
 
 Workflows triggered by on-chain events may require finality before firing, which closes the v0.1 indexing-lag gap (a confirmed-but-not-final purchase no longer triggers downstream work prematurely):
@@ -82,7 +82,7 @@ Workflows triggered by on-chain events may require finality before firing, which
 ```yaml
 workflows:
   Checkout:
-    on: { event: @abi.Bookshop.BookPurchased, confirmations: 32 }   # wait for finality
+    on: { event: "@abi.Bookshop.BookPurchased", confirmations: 32 }   # wait for finality
 ```
 
 `reorgStrategy: rollback` reverts records derived from orphaned blocks and re-derives them; the `_status` transition from `pending` to `final` is the only point at which downstream effects are safe to treat as permanent.
@@ -99,15 +99,15 @@ workflows:
 capabilities:
   BuyBook:
     kind: transaction
-    call: @abi.Bookshop.buyBook
+    call: "@abi.Bookshop.buyBook"
     signer:
       mode: smartAccount            # eoa (default) | smartAccount
       account: connectedWallet
       paymaster: sponsored          # none (default) | sponsored | @paymasters.Bookshop
     input: { bookId: { type: tokenId }, quantity: { type: integer } }
     with:  { bookId: input.bookId, quantity: input.quantity }
-    emits:  [@abi.Bookshop.BookPurchased, @abi.Receipt.Transfer]
-    errors: [@abi.Bookshop.OutOfStock, @abi.Bookshop.InsufficientAllowance]
+    emits:  ["@abi.Bookshop.BookPurchased", "@abi.Receipt.Transfer"]
+    errors: ["@abi.Bookshop.OutOfStock", "@abi.Bookshop.InsufficientAllowance"]
 ```
 
 Consequence for §7 of v0.1 (the on-chain `bundle`): under `mode: smartAccount`, a `bundle` realizes as **one UserOperation containing batched calls** — natively atomic, no permit/multicall trick required. The atomic-bundle-replaces-compensation rule is unchanged; AA just gives a cleaner realization of it. With `paymaster: sponsored`, the buyer needs no native gas token at all, removing the most common dApp onboarding wall.
@@ -135,7 +135,7 @@ The view layer gains a corresponding state so users see fee conditions before si
 views:
   Checkout:
     states:
-      feeTooHigh: { when: "tx.estimatedFee > BuyBook.fees.cap", show: @FeeWarning }
+      feeTooHigh: { when: "tx.estimatedFee > BuyBook.fees.cap", show: "@FeeWarning" }
 ```
 
 The profile (§7) picks the fee oracle and the bundler/paymaster endpoints; the spec never hardcodes gas numbers.
@@ -160,7 +160,7 @@ workflows:
         chain: onchain
         network: mainnet
         awaits: bridged              # blocks until the cross-chain message is confirmed
-        onTimeout: -> RecoverPayment # forward recovery; NOT a compensation/undo
+        onTimeout: "-> RecoverPayment" # forward recovery; NOT a compensation/undo
       - do: SendReceiptEmail
         chain: offchain
         compensate: VoidReceipt
@@ -220,7 +220,7 @@ chain:
     bundling: erc4337-batch       # erc4337-batch | permit-multicall | multicall3 | state-machine
 ```
 
-The §1-style invariant holds across all of these: swapping `bundler`, `engine`, or `bridge` provider changes realization, never the saga/atomic/forward-recovery semantics or the finality thresholds — checkable by `spacekit-cli conform`.
+The §1-style invariant holds across all of these: swapping `bundler`, `engine`, or `bridge` provider changes realization, never the saga/atomic/forward-recovery semantics or the finality thresholds — checkable by `spacekit spec conform`.
 
 ---
 

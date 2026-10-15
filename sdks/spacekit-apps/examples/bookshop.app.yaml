@@ -60,7 +60,7 @@ capabilities:
   ListBooks:
     summary: Return books available for purchase.
     input:  { query: { type: text } }
-    output: { books: { list: @Book } }
+    output: { books: { list: "@Book" } }
     reads:  [Book]
     policy: public
 
@@ -69,11 +69,11 @@ capabilities:
     input:
       orderId:       { type: id, required: true }
       paymentMethod: { type: enum, values: [card, paypal], required: true }
-    output: { order: @Order }
+    output: { order: "@Order" }
     reads:  [Book, Order, OrderLine]
     writes: [{ updates: Order }]
     emits:  [OrderPlaced]
-    policy: @OwnsOrder
+    policy: "@OwnsOrder"
     errors: [EmptyCart, OutOfStock]
 
   ReserveStock:     { input: { orderId: { type: id, required: true } }, writes: [{ updates: Book }],  errors: [OutOfStock] }
@@ -86,9 +86,9 @@ capabilities:
 # Events + fulfillment workflow (saga with compensation)
 # ---------------------------------------------------------------------------
 events:
-  OrderPlaced:    { payload: { order: @Order, at: { type: timestamp } } }
-  OrderFulfilled: { payload: { order: @Order } }
-  OrderFailed:    { payload: { order: @Order, reason: { type: text } } }
+  OrderPlaced:    { payload: { order: "@Order", at: { type: timestamp } } }
+  OrderFulfilled: { payload: { order: "@Order" } }
+  OrderFailed:    { payload: { order: "@Order", reason: { type: text } } }
 
 workflows:
   FulfillOrder:
@@ -113,7 +113,7 @@ policies:
 # ---------------------------------------------------------------------------
 widgets:
   Button:      { props: { label: { type: text, required: true }, variant: { type: enum, values: [primary, ghost], default: primary } } }
-  BookCard:    { props: { book: @Book }, slots: [actions] }
+  BookCard:    { props: { book: "@Book" }, slots: [actions] }
   Spinner:     { props: {} }
   EmptyState:  { props: { message: { type: text } } }
   ErrorBanner: { props: { message: { type: text } } }
@@ -123,58 +123,58 @@ views:
     route: /
     summary: Browse and search books.
     params: { q: { type: text } }
-    data:   { books: { from: @ListBooks, with: { query: params.q } } }
+    data:   { books: { from: "@ListBooks", with: { query: params.q } } }
     states:
-      loading: @Spinner
-      empty:   { when: "books.length == 0", show: @EmptyState, props: { message: @text.noBooks } }
-      error:   @ErrorBanner
+      loading: "@Spinner"
+      empty:   { when: "books.length == 0", show: "@EmptyState", props: { message: "@text.noBooks" } }
+      error:   "@ErrorBanner"
     layout:
       - repeat: book in books
-        widget: @BookCard
+        widget: "@BookCard"
         props: { book: book }
         slots:
           actions:
-            - widget: @Button
-              props: { label: @text.view }
-              on: { tap: -> @BookDetail(id: book.id) }
+            - widget: "@Button"
+              props: { label: "@text.view" }
+              on: { tap: "-> @BookDetail(id: book.id)" }
     transitions:
-      - { to: @BookDetail, label: "Open a book" }
+      - { to: "@BookDetail", label: "Open a book" }
 
   BookDetail:
     route: /books/:id
     params: { id: { type: id, required: true } }
-    data:   { book: { from: @Book, where: "id == params.id" } }
+    data:   { book: { from: "@Book", where: "id == params.id" } }
     states:
-      loading: @Spinner
-      error:   @ErrorBanner
+      loading: "@Spinner"
+      error:   "@ErrorBanner"
     layout:
-      - widget: @BookCard
+      - widget: "@BookCard"
         props: { book: book }
     actions:
       addToCart:
-        invokes: @PlaceOrder
+        invokes: "@PlaceOrder"
         with: { orderId: book.id, paymentMethod: card }
-        onSuccess: -> @OrderConfirmation(orderId: result.order.id)
+        onSuccess: "-> @OrderConfirmation(orderId: result.order.id)"
         onError:   stay
     transitions:
-      - { to: @Catalog, label: "Back to catalog" }
+      - { to: "@Catalog", label: "Back to catalog" }
 
   OrderConfirmation:
     route: /orders/:orderId
     params: { orderId: { type: id, required: true } }
-    data:   { order: { from: @Order, where: "id == params.orderId" } }
-    policy: @OwnsOrder
+    data:   { order: { from: "@Order", where: "id == params.orderId" } }
+    policy: "@OwnsOrder"
     layout:
-      - widget: @Button
-        props: { label: @text.continueShopping }
-        on: { tap: -> @Catalog }
+      - widget: "@Button"
+        props: { label: "@text.continueShopping" }
+        on: { tap: "-> @Catalog" }
 
 flows:
   Purchase:
     steps:
-      - { at: @Catalog }
-      - { at: @BookDetail }
-      - { at: @OrderConfirmation, on: { OrderPlaced: complete } }
+      - { at: "@Catalog" }
+      - { at: "@BookDetail" }
+      - { at: "@OrderConfirmation", on: { OrderPlaced: complete } }
 
 # ---------------------------------------------------------------------------
 # i18n + design tokens

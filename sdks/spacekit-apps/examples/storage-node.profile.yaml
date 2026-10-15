@@ -1,0 +1,24 @@
+# storage-node: SpaceKit target profile
+# Conforms to: SpaceKit Target Profile v0.2
+# Realizes bookshop.app.yaml on Next.js + spacekit-storage-node (DID-scoped
+# documents, no database server), returning errors as values instead of throwing.
+# `spacekit spec conform postgres.profile.yaml storage-node.profile.yaml` passes:
+# same app, two stacks.
+
+spacekit-profile: "0.2"
+name: storage-node
+spec: ./bookshop.app.yaml
+
+data:
+  store: spacekit-storage-node
+
+business:
+  language: typescript
+  binding: compile
+  transport: server-actions
+  errors: result-type
+  workflows: { engine: in-process }
+
+view:
+  framework: next
+  styling: css-modules
