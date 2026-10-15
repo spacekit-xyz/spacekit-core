@@ -2,14 +2,14 @@
 
 > One declarative description of an application, **data**, **business**, and **view**; that compiles to any stack. On the web, and on-chain.
 
-SpaceKit Apps Specifications describes an entire application, its data model, its business logic, and its user interface, in a single, versioned document. A companion **target profile** says which stack to build it on. The `spacekit-cli` tool reads both and generates the data layer, the API/SDK, and the frontend from one source of truth.
+The SpaceKit App Specification describes an entire application, its data model, its business logic, and its user interface, in a single, versioned document. A companion **target profile** says which stack to build it on. The `spacekit` CLI reads both and generates the data layer, the API/SDK, and the frontend from one source of truth.
 
 A **dApp extension** carries the same model on-chain: it binds to contract ABIs, builds an indexed read model from events, and treats transactions as first-class — without abandoning the spec/profile separation.
 
 ```
-  app.spacekit.yaml  (what the app is)  +  profile.yaml  (how to build it)
+  bookshop.app.yaml  (what the app is)  +  profile.yaml  (how to build it)
                               │
-                         spacekit-cli
+                   spacekit spec generate
                               │
         data layer   +   business layer   +   frontend
 ```
@@ -31,7 +31,7 @@ Spacekit's bet is the **seam between layers**. What none of the above gives you 
 Two design choices follow:
 
 1. **One document, three layers, explicit links.** Every definition is referenceable by name via `@Name`. Break a reference and generation fails before any code is emitted.
-2. **The spec says *what*; the profile says *how*, and the profile can never change *what*.** The same description generates a Vue + Pinia + Mongo app or a React Server Components + Postgres app by swapping profiles. The invariant: **a profile changes realization, never behavior.** `spacekit-cli conform` tests it.
+2. **The spec says *what*; the profile says *how*, and the profile can never change *what*.** The same description generates a Vue + Pinia + Mongo app or a React Server Components + Postgres app by swapping profiles. The invariant: **a profile changes realization, never behavior.** `spacekit spec conform` tests it.
 
 ---
 
@@ -63,7 +63,7 @@ The gap none of them fills is a **unified, cross-layer dApp description**. Space
 ```yaml
 spacekit: "0.2"
 capabilities:
-  PlaceOrder: { writes: [{ updates: Order }], emits: [OrderPlaced], policy: @OwnsOrder }
+  PlaceOrder: { writes: [{ updates: Order }], emits: [OrderPlaced], policy: "@OwnsOrder" }
 workflows:
   FulfillOrder:                 # saga with compensation
     on: OrderPlaced
@@ -76,17 +76,17 @@ workflows:
 
 ```yaml
 spacekit: "0.2"
-dapp: "0.1"
+dapp: "0.2"
 contracts:
-  Bookshop: { abi: ./abi/Bookshop.json, addresses: { mainnet: "0x…" } }
+  Bookshop: { abi: ./abi/Bookshop.json, addresses: { main: "0x…" } }
 entities:
   Book: { source: { index: Bookshop, from: [BookListed, Restocked, BookPurchased] } }
 capabilities:
-  BuyBook: { kind: transaction, call: @abi.Bookshop.buyBook, signer: connectedWallet }
+  BuyBook: { kind: transaction, call: "@abi.Bookshop.buyBook", signer: connectedWallet, value: input.price }  # ASTRA
 workflows:
-  Checkout:
+  Purchase:
     steps:
-      - { bundle: [PermitSpending, BuyBook], chain: onchain }   # atomic, no compensation
+      - { do: BuyBook, chain: onchain }                                   # atomic, no compensation
       - { do: SendReceiptEmail, chain: offchain, compensate: VoidReceipt }
 ```
 
@@ -99,14 +99,16 @@ Same bookshop, same three-layer model, one of them decentralized.
 ## Repository contents
 
 
-| File                                                           | What it is                                                                                                                                                                                                             |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[SPACEKIT-SPEC.md](./SPACEKIT-SPEC.md)`                       | **The Spacekit Specification.** The base format across data, business, and view; entities, capabilities, events, workflows, policies, widgets, views, flows, text, tokens — with reference and compatibility rules.    |
-| `[SPACEKIT-PROFILE.md](./SPACEKIT-PROFILE.md)`                 | **The Spacekit Target Profile.** How a profile binds a spec to a concrete stack, with inheritance, environments, and conformance.                                                                                      |
-| `[SPACEKIT-PLUGIN-SPEC.md](./SPACEKIT-PLUGIN-SPEC.md)`         | **SpaceKit Plugins.** Features one author publishes and others add to their apps (UI, services, contracts, brains): descriptor, install rules, data ownership, ASTRA pricing, signatures. |
-| `[SPACEKIT-DAPP-SPEC.md](./SPACEKIT-DAPP-SPEC.md)`             | **The Spacekit dApp Specification.** The on-chain extension: networks, ABI import, indexed entities, transaction capabilities, finality/reorg handling, account abstraction, cross-chain workflows, on-chain policies. |
-| `[examples/bookshop.app.yaml](./examples/bookshop.app.yaml)`   | Complete web example; the bookshop as an off-chain app.                                                                                                                                                                |
-| `[examples/bookshop.dapp.yaml](./examples/bookshop.dapp.yaml)` | Complete dApp example; the bookshop on-chain, paid in USDC with an NFT receipt.                                                                                                                                        |
+| File | What it is |
+| --- | --- |
+| [SPACEKITAPP-SPEC.md](./SPACEKITAPP-SPEC.md) | **The SpaceKit App Specification.** The base format across data, business, and view: entities, capabilities, events, workflows, policies, widgets, views, flows, text, tokens, with reference and compatibility rules. |
+| [SPACEKITAPP-PROFILE.md](./SPACEKITAPP-PROFILE.md) | **The SpaceKit Target Profile.** How a profile binds a spec to a concrete stack, with inheritance, environments, and conformance. |
+| [SPACEKIT-PLUGIN-SPEC.md](./SPACEKIT-PLUGIN-SPEC.md) | **SpaceKit Plugins.** Features one author publishes and others add to their apps (UI, services, contracts, brains): descriptor, install rules, data ownership, ASTRA pricing, signatures. |
+| [SPACEKIT-DAPP-SPEC.md](./SPACEKIT-DAPP-SPEC.md) | **The SpaceKit dApp Specification (draft).** The on-chain extension: networks, ABI import, indexed entities, transaction capabilities, finality/reorg handling, account abstraction, cross-chain workflows, on-chain policies. |
+| [examples/bookshop.app.yaml](./examples/bookshop.app.yaml) | Complete web example: the bookshop as an off-chain app, with a fulfillment saga. |
+| [examples/gallery.app.yaml](./examples/gallery.app.yaml) | Complete web example: a media gallery with albums, uploads and storage buckets. |
+| [examples/nextjs-storage.profile.yaml](./examples/nextjs-storage.profile.yaml) | A profile for the gallery: Next.js + Postgres, with dev/prod environments. |
+| [examples/bookshop.dapp.yaml](./examples/bookshop.dapp.yaml) | dApp example (draft): the bookshop on the SpaceKit network, paid in ASTRA with an NFT receipt. |
 
 
 ---
@@ -115,25 +117,48 @@ Same bookshop, same three-layer model, one of them decentralized.
 
 ## Quick start
 
+The generator is part of the `spacekit` CLI (in `spacekit-core/tools/spacekit-cli`). It runs offline; no account or `spacekit init` is needed.
+
 ```bash
-# install the generator
-# install spacekit-cli from website spacekit.xyz
+# build the CLI from source
+cargo install --path tools/spacekit-cli        # from a spacekit-core checkout
 
-# validate a spec + profile pairing + example profile
-spacekit validate --spec bookshop.app.yaml --profile react-postgres.profile.yaml
+cd sdks/spacekit-apps/examples
 
-# generate the app + example profile
-spacekit generate --spec bookshop.app.yaml --profile react-postgres.profile.yaml --env prod
+# validate a spec (and optionally a profile)
+spacekit spec check --spec bookshop.app.yaml
+spacekit spec check --profile nextjs-storage.profile.yaml --env dev     # spec comes from the profile's `spec:`
 
-# generate the dApp (spec + dApp example profile)
-spacekit generate --spec bookshop.dapp.yaml --profile react-thegraph.profile.yaml
+# generate the app (Next.js + Postgres/Prisma by default)
+spacekit spec generate --spec bookshop.app.yaml --out ./bookshop
+spacekit spec generate --profile nextjs-storage.profile.yaml --env dev --out ./gallery
 
-# prove two profiles produce the same app on different stacks
-spacekit conform flux-vue-mongo.profile.yaml react-postgres.profile.yaml
+# check that two profiles realize the same behavior on different stacks
+spacekit spec conform --spec bookshop.app.yaml postgres.profile.yaml storage-node.profile.yaml
 
-# diff two spec versions for breaking changes
-spacekit diff bookshop@1.0.yaml bookshop@1.1.yaml
+# classify the changes between two spec versions (exit code 1 on an unbumped breaking change)
+spacekit spec diff bookshop-1.2.yaml bookshop-1.3.yaml
 ```
+
+Then, in the generated app:
+
+```bash
+cd bookshop/server && npm install && npx prisma generate --schema ../prisma/schema.prisma && npm run typecheck
+cd ../web && npm install && npm run dev
+```
+
+Business logic goes in `server/handlers/*.ts` (generated once, then yours). Everything else is regenerated from the spec; hand edits to generated files are detected and kept unless you pass `--force`.
+
+### What the generator does today
+
+| Area | Generated |
+| --- | --- |
+| Data | Prisma schema (Postgres, MySQL, SQLite) or a spacekit-storage-node document backend; field `rules` enforced on every write. |
+| Business | One typed contract per capability: input validation, the policy (compiled from the §9 grammar), the closed error set, declared events. Handler scaffolds for the logic. Workflows as in-process sagas with compensation. An OpenAPI document and a typed client SDK (TypeScript, Python or Rust). |
+| View | Next.js app router (server components, server-action forms, `loading`/`empty`/`error` states, `@text` i18n, design tokens) or a Vite + React SPA. |
+| Tooling | `check`, `generate` (incremental, with a refusal on unbumped breaking changes), `conform`, `diff`, and `--assist` (a certified brain suggests a design pattern per handler). |
+
+Not yet: dApp generation, durable workflow engines (Temporal, Inngest, queues; the in-process runner is used and a note is printed), Vue and other frameworks, MongoDB, upload/presign adapters for `storage` buckets, view states other than loading/empty/error. The CLI prints a note whenever a spec or profile uses something it does not realize.
 
 ---
 
@@ -149,9 +174,9 @@ Spacekit capabilities are **transport-neutral**, they describe use cases, not en
 
 ## Status & roadmap
 
-**Base spec & profile: v0.2 (draft).** Workflows with saga compensation, field validation, view loading/empty/error states, a policy grammar, i18n, and compatibility/diffing rules.
+**Base spec & profile: v0.2 (draft), generator preview.** Workflows with saga compensation, field validation, view loading/empty/error states, a policy grammar, i18n, and compatibility/diffing rules, all generated by `spacekit spec` (see "What the generator does today").
 
-**dApp spec: v0.2 (draft).** ABI import, indexed read model, transaction lifecycle, upgradeable contracts with version-aware indexing, finality/reorg handling, ERC-4337 account abstraction and sponsored transactions, cross-chain workflows, and on-chain access-control policies.
+**dApp spec: v0.2 (draft, not generated yet).** ABI import, indexed read model, transaction lifecycle, upgradeable contracts with version-aware indexing, finality/reorg handling, ERC-4337 account abstraction and sponsored transactions, cross-chain workflows, and on-chain access-control policies.
 
 **Deferred to v0.3.** Base: workflow branching, policy functions, optimistic UI, constraint-based responsive layout, deployment targets. dApp: intent/solver execution, ZK/private-state flows, multi-sig/timelock signer modes, indexer backfill strategy, L2 finality nuances.
 

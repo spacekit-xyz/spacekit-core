@@ -1,0 +1,33 @@
+# postgres: SpaceKit target profile
+# Conforms to: SpaceKit Target Profile v0.2
+# Realizes bookshop.app.yaml on Next.js (app router) + Postgres via Prisma.
+
+spacekit-profile: "0.2"
+name: postgres
+spec: ./bookshop.app.yaml
+
+data:
+  store: postgres
+  orm: prisma
+  identity: uuid
+  relations: referenced
+  migrations: true
+
+business:
+  language: typescript
+  binding: compile
+  transport: server-actions
+  errors: problem-json
+  emit_openapi: true
+  workflows: { engine: in-process, retries: 2 }
+
+view:
+  framework: next
+  router: app-router
+  data_fetching: rsc
+  styling: tailwind
+  locale: en
+
+environments:
+  dev:  { view: { locale: en } }
+  prod: { business: { workflows: { retries: 5 } } }

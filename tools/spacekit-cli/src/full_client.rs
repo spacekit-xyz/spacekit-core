@@ -537,6 +537,84 @@ enum Commands {
     /// Plugin descriptors: hash files, sign/verify `spacekit-plugin.json`, brain descriptors, publish to a listing
     #[command(subcommand)]
     Plugin(plugin_cmd::PluginCommands),
+
+    /// Spec-driven apps: validate a SpaceKit app spec and generate the app (data, business, view)
+    #[command(subcommand)]
+    Spec(SpecCommands),
+}
+
+/// `spacekit spec …` — SpaceKit App Spec v0.2 tooling (works offline; no `spacekit init` needed).
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SpecCommands {
+    /// Generate an app from a spec and a profile
+    #[command(after_help = "Examples:\n  \
+        spacekit spec generate --spec bookshop.app.yaml --out ./bookshop\n  \
+        spacekit spec generate --profile nextjs-storage.profile.yaml --env dev   # spec from the profile's `spec:`\n  \
+        spacekit spec generate --spec bookshop.app.yaml --assist ../spacekit-projects/coding/python/python.gf.toml")]
+    Generate {
+        /// App spec (`spacekit: \"0.2\"` YAML or JSON). Defaults to the profile's `spec:`.
+        #[arg(long, value_name = "SPEC")]
+        spec: Option<PathBuf>,
+        /// Target profile (stack + patterns). Default: Next.js + Postgres + Prisma.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<PathBuf>,
+        /// Profile environment layer to apply (e.g. dev, prod)
+        #[arg(long)]
+        env: Option<String>,
+        /// Output directory (default: the profile's output.dir, else ./<app>_app)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Client SDK language (typescript, python, rust; default: the profile's business.language)
+        #[arg(long)]
+        sdk_lang: Option<String>,
+        /// Type-check the generated client SDK after writing
+        #[arg(long)]
+        check: bool,
+        /// Dry-run: print the incremental plan without writing files
+        #[arg(long)]
+        plan: bool,
+        /// Delete previously generated files that are no longer emitted
+        #[arg(long)]
+        prune: bool,
+        /// Overwrite generated files that were edited by hand
+        #[arg(long)]
+        force: bool,
+        /// Regenerate across a breaking spec change without a major app.version bump
+        #[arg(long)]
+        allow_breaking: bool,
+        /// Brain project (`*.gf.toml` with [certified_routing]) to suggest a design pattern per handler
+        #[arg(long, value_name = "GF_TOML")]
+        assist: Option<PathBuf>,
+    },
+    /// Validate a spec (and optionally a profile) without generating
+    Check {
+        /// App spec. Defaults to the profile's `spec:`.
+        #[arg(long, value_name = "SPEC")]
+        spec: Option<PathBuf>,
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        env: Option<String>,
+    },
+    /// Check that two profiles realize the same behavior (Profile §8)
+    Conform {
+        /// App spec. Defaults to the first profile's `spec:`.
+        #[arg(long, value_name = "SPEC")]
+        spec: Option<PathBuf>,
+        /// First profile
+        profile_a: PathBuf,
+        /// Second profile
+        profile_b: PathBuf,
+        #[arg(long)]
+        env: Option<String>,
+    },
+    /// Classify the changes between two spec versions as compatible or breaking (Spec §14)
+    Diff {
+        /// The earlier spec
+        old: PathBuf,
+        /// The newer spec
+        new: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -3622,9 +3700,9 @@ enum AgentCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Generate a full webapp from an OpenApp v0.1 spec + profile (data + business + view)
+    /// Generate a full webapp from a SpaceKit app spec + profile (same as `spacekit spec generate`)
     Webapp {
-        /// Path to an OpenApp v0.1 document (.yaml/.yml/.json)
+        /// Path to a SpaceKit app spec (`spacekit: "0.2"`, or legacy `openapp: "0.1"`)
         #[arg(long, value_name = "SPEC")]
         spec: PathBuf,
         /// Target profile (stack + patterns). Defaults to react + postgres + prisma.
@@ -3651,6 +3729,9 @@ enum AgentCommands {
         /// Compare behavioral equivalence against a second profile (conformance), then exit
         #[arg(long, value_name = "PROFILE")]
         conformance: Option<PathBuf>,
+        /// Profile environment layer to apply (e.g. dev, prod)
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
@@ -16497,20 +16578,79 @@ async fn handle_agent_command(
             prune,
             force,
             conformance,
+            env,
         } => {
-            let args = sdkgen::openapp::AppArgs {
-                spec: spec.clone(),
-                profile: profile.clone(),
-                out: out.clone(),
-                sdk_lang: sdk_lang.clone(),
-                check: *check,
-                plan: *plan,
-                prune: *prune,
-                force: *force,
-                conformance: conformance.clone(),
-            };
+            let mut args = sdkgen::openapp::AppArgs::new(spec.clone());
+            args.profile = profile.clone();
+            args.out = out.clone();
+            args.sdk_lang = sdk_lang.clone();
+            args.check = *check;
+            args.plan = *plan;
+            args.prune = *prune;
+            args.force = *force;
+            args.conformance = conformance.clone();
+            args.env = env.clone();
             sdkgen::openapp::handle_app(&args)
         }
+    }
+}
+
+/// Resolve `--spec`, falling back to the profile's `spec:` key.
+fn resolve_spec_path(spec: &Option<PathBuf>, profile: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(s) = spec {
+        return Ok(s.clone());
+    }
+    if let Some(p) = profile {
+        if let Some(s) = sdkgen::openapp::profile_spec_path(p)? {
+            return Ok(s);
+        }
+        return Err(format!("{} has no `spec:`; pass --spec", p.display()).into());
+    }
+    Err("pass --spec <app.yaml> (or a --profile whose `spec:` names it)".into())
+}
+
+fn handle_spec_command(cmd: &SpecCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        SpecCommands::Generate {
+            spec,
+            profile,
+            env,
+            out,
+            sdk_lang,
+            check,
+            plan,
+            prune,
+            force,
+            allow_breaking,
+            assist,
+        } => {
+            let mut args = sdkgen::openapp::AppArgs::new(resolve_spec_path(spec, profile.as_ref())?);
+            args.profile = profile.clone();
+            args.env = env.clone();
+            args.out = out.clone();
+            args.sdk_lang = sdk_lang.clone();
+            args.check = *check;
+            args.plan = *plan;
+            args.prune = *prune;
+            args.force = *force;
+            args.allow_breaking = *allow_breaking;
+            args.assist = assist.clone();
+            sdkgen::openapp::handle_app(&args)
+        }
+        SpecCommands::Check { spec, profile, env } => {
+            let spec = resolve_spec_path(spec, profile.as_ref())?;
+            sdkgen::openapp::handle_check(&spec, profile.as_ref(), env.as_deref())
+        }
+        SpecCommands::Conform {
+            spec,
+            profile_a,
+            profile_b,
+            env,
+        } => {
+            let spec = resolve_spec_path(spec, Some(profile_a))?;
+            sdkgen::openapp::handle_conform(&spec, profile_a, profile_b, env.as_deref())
+        }
+        SpecCommands::Diff { old, new } => sdkgen::openapp::handle_diff(old, new),
     }
 }
 
@@ -16575,7 +16715,10 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
         // configuration loading. In particular, `network init` and `network
         // test` must work from an empty HOME on a clean developer machine.
         | Commands::Network(_)
-        | Commands::Governance(_) => None,
+        | Commands::Governance(_)
+        // Spec tooling and offline code generation never need an account.
+        | Commands::Spec(_) => None,
+        Commands::Agent(_) => CliContext::load_sync().ok(),
         Commands::Keypair { .. }
         | Commands::Encapsulate { .. }
         | Commands::Decapsulate { .. }
@@ -16689,6 +16832,10 @@ pub async fn run_full_client() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Commands::Tools(tools_command) = &cli.command {
         return handle_tools_command(tools_command).await;
+    }
+
+    if let Commands::Spec(spec_command) = &cli.command {
+        return handle_spec_command(spec_command);
     }
 
     if let Commands::Plugin(plugin_command) = &cli.command {

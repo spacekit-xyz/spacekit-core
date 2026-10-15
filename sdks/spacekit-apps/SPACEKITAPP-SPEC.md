@@ -2,7 +2,7 @@
 
 **Version 0.2 — Draft**
 
-A single, versioned, declarative description of a web application across all three layers of the stack; **data**, **business**, and **view**, so one source of truth can drive code generation (via `spacekit-cli`) for the database, the API/SDK, and the frontend simultaneously.
+A single, versioned, declarative description of a web application across all three layers of the stack; **data**, **business**, and **view**, so one source of truth can drive code generation (via the `spacekit` CLI) for the database, the API/SDK, and the frontend simultaneously.
 
 ---
 
@@ -56,6 +56,8 @@ tokens:       { ... }   # view layer — design tokens
 
 
 ## 3. References and scope
+
+> **Writing references in YAML.** YAML reserves `@` at the start of a value, so references and navigation targets are quoted: `policy: "@OwnsOrder"`, `output: { order: "@Order" }`, `tap: "-> @BookDetail(id: book.id)"`. Inside a quoted string the meaning is unchanged. (Plain names without `@`, as in `reads: [Book]`, need no quotes.)
 
 `@Name` resolves to any top-level definition. Bare identifiers inside a view's `data`, `params`, an action's `with`, or a workflow step refer to local scope. Dotted access (`cart.owner.email`) walks declared relations. New in v0.2: `@text.<key>` resolves into the `text` registry, and inside workflows `event.<field>` refers to the triggering event's payload.
 
@@ -139,7 +141,7 @@ capabilities:
   ListBooks:
     summary: Return books available for purchase.
     input:  { query: { type: text } }
-    output: { books: { list: @Book } }
+    output: { books: { list: "@Book" } }
     reads:  [Book]
     policy: public
 
@@ -148,11 +150,11 @@ capabilities:
     input:
       orderId:       { type: id, required: true }
       paymentMethod: { type: enum, values: [card, paypal], required: true }
-    output: { order: @Order }
+    output: { order: "@Order" }
     reads:  [Book, Order, OrderLine]
     writes: [{ updates: Order }]
     emits:  [OrderPlaced]
-    policy: @OwnsOrder
+    policy: "@OwnsOrder"
     errors: [EmptyCart, OutOfStock]
 
   # Capabilities that the FulfillOrder workflow orchestrates:
@@ -219,9 +221,9 @@ A generator must realize these guarantees but chooses the orchestration mechanis
 
 ```yaml
 events:
-  OrderPlaced:    { payload: { order: @Order, at: { type: timestamp } } }
-  OrderFulfilled: { payload: { order: @Order } }
-  OrderFailed:    { payload: { order: @Order, reason: { type: text } } }
+  OrderPlaced:    { payload: { order: "@Order", at: { type: timestamp } } }
+  OrderFulfilled: { payload: { order: "@Order" } }
+  OrderFailed:    { payload: { order: "@Order", reason: { type: text } } }
 ```
 
 ---
@@ -264,7 +266,7 @@ No function calls in v0.2; a function library is deferred to v0.3. Policies may 
 ```yaml
 widgets:
   Button:      { props: { label: { type: text, required: true }, variant: { type: enum, values: [primary, ghost], default: primary } } }
-  BookCard:    { props: { book: @Book }, slots: [actions] }
+  BookCard:    { props: { book: "@Book" }, slots: [actions] }
   Spinner:     { props: {} }
   EmptyState:  { props: { message: { type: text } } }
   ErrorBanner: { props: { message: { type: text } } }
@@ -275,53 +277,53 @@ views:
     summary: Browse and search books.
     params: { q: { type: text } }
     data:
-      books: { from: @ListBooks, with: { query: params.q } }
+      books: { from: "@ListBooks", with: { query: params.q } }
     states:                                   # NEW
-      loading: @Spinner
-      empty:   { when: "books.length == 0", show: @EmptyState, props: { message: @text.noBooks } }
-      error:   @ErrorBanner
+      loading: "@Spinner"
+      empty:   { when: "books.length == 0", show: "@EmptyState", props: { message: "@text.noBooks" } }
+      error:   "@ErrorBanner"
     layout:
       - repeat: book in books
-        widget: @BookCard
+        widget: "@BookCard"
         props: { book: book }
         slots:
           actions:
-            - widget: @Button
-              props: { label: @text.view }
-              on: { tap: -> @BookDetail(id: book.id) }
+            - widget: "@Button"
+              props: { label: "@text.view" }
+              on: { tap: "-> @BookDetail(id: book.id)" }
     transitions:
-      - to: @BookDetail
+      - to: "@BookDetail"
         label: "Open a book"
 
   BookDetail:
     route: /books/:id
     params: { id: { type: id, required: true } }
-    data:  { book: { from: @Book, where: "id == params.id" } }
+    data:  { book: { from: "@Book", where: "id == params.id" } }
     states:
-      loading: @Spinner
-      error:   @ErrorBanner
+      loading: "@Spinner"
+      error:   "@ErrorBanner"
     layout:
-      - widget: @BookCard
+      - widget: "@BookCard"
         props: { book: book }
     actions:
       addToCart:
-        invokes: @PlaceOrder
+        invokes: "@PlaceOrder"
         with: { orderId: book.id, paymentMethod: card }
-        onSuccess: -> @OrderConfirmation(orderId: result.order.id)
+        onSuccess: "-> @OrderConfirmation(orderId: result.order.id)"
         onError:   stay
     transitions:
-      - to: @Catalog
+      - to: "@Catalog"
         label: "Back to catalog"
 
   OrderConfirmation:
     route: /orders/:orderId
     params: { orderId: { type: id, required: true } }
-    data:   { order: { from: @Order, where: "id == params.orderId" } }
-    policy: @OwnsOrder
+    data:   { order: { from: "@Order", where: "id == params.orderId" } }
+    policy: "@OwnsOrder"
     layout:
-      - widget: @Button
-        props: { label: @text.continueShopping }
-        on: { tap: -> @Catalog }
+      - widget: "@Button"
+        props: { label: "@text.continueShopping" }
+        on: { tap: "-> @Catalog" }
 ```
 
 
@@ -363,9 +365,9 @@ Unchanged from v0.1: named, optionally-branching journeys over views.
 flows:
   Purchase:
     steps:
-      - at: @Catalog
-      - at: @BookDetail
-      - at: @OrderConfirmation
+      - at: "@Catalog"
+      - at: "@BookDetail"
+      - at: "@OrderConfirmation"
         on: { OrderPlaced: complete }
 ```
 
@@ -391,7 +393,7 @@ tokens:
 
 ## 14. Compatibility and diffing v0.2
 
-Defines what changes between two spec versions are safe. This is the basis for the diff tooling (`spacekit-cli diff`) and for the contract floor in §6.
+Defines what changes between two spec versions are safe. This is the basis for the diff tooling (`spacekit spec diff`) and for the contract floor in §6.
 
 **Compatible (minor bump):** add an entity, capability, event, workflow, view, widget, or policy; add an *optional* field or input; widen an enum; add a `text` key; relax a validation rule.
 
@@ -417,6 +419,14 @@ Defines what changes between two spec versions are safe. This is the basis for t
 
 
 
-## 16. Still deferred to v0.3+
+## 16. Implementation status (`spacekit spec`, preview)
+
+The `spacekit` CLI reads this format (`spacekit spec check | generate | conform | diff`). Everything in §2–§14 is validated. Generation realizes entities and `rules`, capabilities (contract, policy, closed error set, events), events, `workflows` (in-process saga runner), the §9 policy grammar, views with `loading`/`empty`/`error` states, `text`, `tokens`, and §14 compatibility (generation refuses an unbumped breaking change). `flows` are emitted as documentation. Constructs outside the spec (such as the gallery example's `storage` convention and extra view states) are validated where possible and reported as not realized. dApp documents are not generated yet.
+
+---
+
+
+
+## 17. Still deferred to v0.3+
 
 Workflow branching beyond linear-with-compensation; policy functions; optimistic updates; constraint-based responsive layout; i18n pluralization/interpolation; field-level read policies.
