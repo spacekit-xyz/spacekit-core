@@ -1,30 +1,31 @@
 #!/usr/bin/env bash
 #
-# Rebuild spacekit-js/growformer-pkg/ (growformer.js + growformer_bg.wasm) from the Neurokit
-# Growformer Rust crate. Browser inference loads these via SpacekitVmContext / bundledWasm (?url).
+# Rebuild spacekit-js/growformer-pkg/ (growformer.js + growformer_bg.wasm) from the
+# Growformer Rust crate in the spacekit-ai repo. Browser inference loads these via
+# SpacekitVmContext / bundledWasm (?url).
 #
 # Layout (typical):
-#   …/2026/neurokit/growformer   ← Rust source, wasm-bindgen lib (src/wasm.rs, Cargo.toml)
-#   …/2026/spacekit/spacekit-js/growformer-pkg   ← output of this script
+#   …/2026/spacekit/spacekit-ai/growformer                  ← Rust source (src/wasm.rs, Cargo.toml)
+#   …/2026/spacekit/spacekit-core/runtimes/spacekit-js      ← this package
+#   …/2026/spacekit/spacekit-core/runtimes/spacekit-js/growformer-pkg  ← output of this script
 #
 # Override source tree:
-#   GROWFORMER_ROOT=/Users/astor/Projects/2026/neurokit/growformer npm run build:growformer-wasm
+#   GROWFORMER_ROOT=/path/to/spacekit-ai/growformer npm run build:growformer-wasm
 #
-# Default GROWFORMER_ROOT = <parent of spacekit repo>/../neurokit/growformer
-# (MONOREPO_ROOT is the directory containing spacekit-js/, i.e. the spacekit checkout).
+# Default GROWFORMER_ROOT = <spacekit-core>/../spacekit-ai/growformer
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPACEKIT_JS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MONOREPO_ROOT="$(cd "$SPACEKIT_JS_ROOT/.." && pwd)"
-GROWFORMER_ROOT="${GROWFORMER_ROOT:-$MONOREPO_ROOT/../neurokit/growformer}"
+SPACEKIT_CORE_ROOT="$(cd "$SPACEKIT_JS_ROOT/../.." && pwd)"
+GROWFORMER_ROOT="${GROWFORMER_ROOT:-$SPACEKIT_CORE_ROOT/../spacekit-ai/growformer}"
 OUT_PKG="$SPACEKIT_JS_ROOT/growformer-pkg"
 WBGEN_VERSION="0.2.115"
 
 if [ ! -f "$GROWFORMER_ROOT/Cargo.toml" ]; then
-  echo "Growformer repo not found at: $GROWFORMER_ROOT"
-  echo "Set GROWFORMER_ROOT to your neurokit/growformer checkout."
+  echo "Growformer crate not found at: $GROWFORMER_ROOT"
+  echo "Set GROWFORMER_ROOT to your spacekit-ai/growformer checkout."
   exit 1
 fi
 
@@ -52,10 +53,25 @@ fi
 cd "$GROWFORMER_ROOT"
 cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm-bindgen,categorical --lib
 
+# growformer is a member of the spacekit-ai workspace, so the build output lands in the
+# workspace target directory (or $CARGO_TARGET_DIR), not in growformer/target.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+WASM="$TARGET_DIR/wasm32-unknown-unknown/release/growformer.wasm"
+if [ ! -f "$WASM" ]; then
+  echo "Build output not found at: $WASM"
+  exit 1
+fi
+
 mkdir -p "$OUT_PKG"
-wasm-bindgen target/wasm32-unknown-unknown/release/growformer.wasm \
+wasm-bindgen "$WASM" \
   --out-dir "$OUT_PKG" \
   --target web \
   --out-name growformer
 
-echo "Wrote $OUT_PKG/growformer.js and growformer_bg.wasm"
+# Fail loudly if the build lacks the multi-brain API that src/growformer/instances.ts uses.
+if ! grep -q "growformer_instance_create" "$OUT_PKG/growformer.d.ts"; then
+  echo "error: $OUT_PKG/growformer.d.ts has no growformer_instance_create; GrowformerInstance will not work"
+  exit 1
+fi
+
+echo "Wrote $OUT_PKG/growformer.js and growformer_bg.wasm from $GROWFORMER_ROOT"

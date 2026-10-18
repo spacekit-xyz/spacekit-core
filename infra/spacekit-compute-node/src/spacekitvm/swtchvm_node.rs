@@ -768,21 +768,46 @@ pub struct SwtchvmContext {
     pub value: u128,
 }
 
+/// One loaded Growformer brain: its byte length and skip fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrowformerBrainEntry {
+    bytes: usize,
+    tag: (u32, u32),
+}
+
+/// The worker slot for a VM brain slot (`None` = host-side inference).
+#[cfg(feature = "growformer-inference")]
+fn growformer_worker_slot(slot: Option<SwtchvmAddress>) -> super::growformer_host::GrowformerSlot {
+    match slot {
+        Some(addr) => super::growformer_host::GrowformerSlot::Contract(addr.0),
+        None => super::growformer_host::GrowformerSlot::Host,
+    }
+}
+
+/// The VM brain slot for a worker slot (inverse of [`growformer_worker_slot`]).
+#[cfg(feature = "growformer-inference")]
+fn growformer_vm_slot(slot: super::growformer_host::GrowformerSlot) -> Option<SwtchvmAddress> {
+    match slot {
+        super::growformer_host::GrowformerSlot::Contract(bytes) => Some(SwtchvmAddress(bytes)),
+        super::growformer_host::GrowformerSlot::Host => None,
+    }
+}
+
 // Main SWTCHVM Runtime
 pub struct SwtchvmRuntime {
     engine: Engine,
     gas_schedule: SwtchvmGasSchedule,
     state: Arc<RwLock<SwtchvmState>>,
     runtime_identity: Option<Arc<QuantumResistantDID>>,
-    /// Opaque Growformer brain bytes after a successful `agent_growformer_load_brain_from_storage` (host-side only).
-    growformer_brain: StdRwLock<Option<Vec<u8>>>,
-    /// Skip re-parsing when the same brain blob is reloaded (parity with `spacekit-js` `lastBrainCache`).
-    growformer_brain_cache: StdRwLock<Option<(usize, u32, u32)>>,
-    /// Background Growformer worker when feature `growformer-inference` is enabled.
+    /// Growformer brains loaded via `agent_growformer_load_brain_from_storage`, one per executing
+    /// contract (`Some(address)`) plus one for host-side inference (`None`, consensus agent).
+    /// An entry means that slot is ready; its fingerprint skips re-parsing an identical blob
+    /// (parity with `spacekit-js` `lastBrainCache`).
+    growformer_brains: StdRwLock<HashMap<Option<SwtchvmAddress>, GrowformerBrainEntry>>,
+    /// Background Growformer worker when feature `growformer-inference` is enabled. It holds one
+    /// `BrainInstance` per slot, so contracts no longer replace each other's brain.
     #[cfg(feature = "growformer-inference")]
     growformer_host: Arc<super::growformer_host::GrowformerThreadHost>,
-    #[cfg(feature = "growformer-inference")]
-    growformer_native_ready: AtomicBool,
     // Storage node for persistent AI companion storage
     #[cfg(feature = "storage-integration")]
     storage_node: Arc<RwLock<Option<Arc<spacekit_storage_node::StorageNode>>>>,
@@ -1047,12 +1072,9 @@ impl SwtchvmRuntime {
             gas_schedule: SwtchvmGasSchedule::default(),
             state: Arc::new(RwLock::new(initial_state)),
             runtime_identity: Self::init_runtime_identity(),
-            growformer_brain: StdRwLock::new(None),
-            growformer_brain_cache: StdRwLock::new(None),
+            growformer_brains: StdRwLock::new(HashMap::new()),
             #[cfg(feature = "growformer-inference")]
             growformer_host: Arc::new(super::growformer_host::GrowformerThreadHost::spawn()),
-            #[cfg(feature = "growformer-inference")]
-            growformer_native_ready: AtomicBool::new(false),
             #[cfg(feature = "storage-integration")]
             storage_node: Arc::new(RwLock::new(None)), // Will be set via set_storage_node()
             contract_policies: Arc::new(RwLock::new(Self::load_contract_policies())),
@@ -1187,68 +1209,64 @@ impl SwtchvmRuntime {
         (t0, t1)
     }
 
-    /// `agent_growformer_status`: **1** when ready — with `growformer-inference`, native runtime loaded;
-    /// otherwise non-empty brain bytes only (inference stubs return `-1`).
+    /// `agent_growformer_status` for host-side inference (consensus agent); see
+    /// [`Self::growformer_status_code_for`].
     pub fn growformer_status_code(&self) -> i32 {
-        #[cfg(feature = "growformer-inference")]
-        {
-            return if self.growformer_native_ready.load(Ordering::Acquire) {
-                1
-            } else {
-                0
-            };
-        }
-        #[cfg(not(feature = "growformer-inference"))]
-        {
-            match self.growformer_brain.read().unwrap().as_ref() {
-                Some(b) if !b.is_empty() => 1,
-                _ => 0,
-            }
+        self.growformer_status_code_for(None)
+    }
+
+    /// `agent_growformer_status` for one slot: **1** when that slot's brain is ready — with
+    /// `growformer-inference`, loaded in the native worker; otherwise non-empty brain bytes only
+    /// (inference stubs return `-1`). `slot` is the executing contract, `None` for the host.
+    pub fn growformer_status_code_for(&self, slot: Option<SwtchvmAddress>) -> i32 {
+        match self.growformer_brains.read().unwrap().get(&slot) {
+            Some(entry) if entry.bytes > 0 => 1,
+            _ => 0,
         }
     }
 
-    /// Apply brain bytes from storage. Returns byte length on success (`>0`), `-3` if missing/empty, `-2` if brain bytes are invalid for Growformer (only with `growformer-inference`).
+    /// Apply brain bytes for host-side inference (consensus agent); see
+    /// [`Self::growformer_apply_brain_bytes_for`].
     pub fn growformer_apply_brain_bytes(&self, data: Vec<u8>) -> i32 {
+        self.growformer_apply_brain_bytes_for(None, data)
+    }
+
+    /// Apply brain bytes to one slot (the executing contract, or `None` for the host). Returns
+    /// byte length on success (`>0`), `-3` if missing/empty, `-2` if brain bytes are invalid for
+    /// Growformer (only with `growformer-inference`). Other slots keep their brains.
+    pub fn growformer_apply_brain_bytes_for(&self, slot: Option<SwtchvmAddress>, data: Vec<u8>) -> i32 {
         if data.is_empty() {
             return -3;
         }
         let n = data.len();
-        let (t0, t1) = Self::growformer_brain_skip_tag(&data);
-        if let Ok(cache) = self.growformer_brain_cache.read() {
-            if let Some((len, c0, c1)) = *cache {
-                if len == n && c0 == t0 && c1 == t1 {
-                    #[cfg(feature = "growformer-inference")]
-                    if self.growformer_native_ready.load(Ordering::Acquire) {
-                        return i32::try_from(n).unwrap_or(i32::MAX);
-                    }
-                    #[cfg(not(feature = "growformer-inference"))]
-                    {
-                        return i32::try_from(n).unwrap_or(i32::MAX);
-                    }
-                }
+        let tag = Self::growformer_brain_skip_tag(&data);
+        let entry = GrowformerBrainEntry { bytes: n, tag };
+        if let Ok(brains) = self.growformer_brains.read() {
+            if brains.get(&slot) == Some(&entry) {
+                return i32::try_from(n).unwrap_or(i32::MAX);
             }
         }
         #[cfg(feature = "growformer-inference")]
         {
-            match self.growformer_host.load_brain(data.clone()) {
-                Ok(_) => {
-                    self.growformer_native_ready.store(true, Ordering::Release);
-                    *self.growformer_brain.write().unwrap() = Some(data);
-                    *self.growformer_brain_cache.write().unwrap() = Some((n, t0, t1));
+            match self.growformer_host.load_brain(growformer_worker_slot(slot), data) {
+                Ok(loaded) => {
+                    let mut brains = self.growformer_brains.write().unwrap();
+                    if let Some(evicted) = loaded.evicted {
+                        brains.remove(&growformer_vm_slot(evicted));
+                    }
+                    brains.insert(slot, entry);
                     i32::try_from(n).unwrap_or(i32::MAX)
                 }
                 Err(_) => {
-                    self.growformer_native_ready.store(false, Ordering::Release);
-                    *self.growformer_brain.write().unwrap() = None;
-                    *self.growformer_brain_cache.write().unwrap() = None;
+                    self.growformer_brains.write().unwrap().remove(&slot);
                     -2
                 }
             }
         }
         #[cfg(not(feature = "growformer-inference"))]
         {
-            *self.growformer_brain.write().unwrap() = Some(data);
-            *self.growformer_brain_cache.write().unwrap() = Some((n, t0, t1));
+            drop(data);
+            self.growformer_brains.write().unwrap().insert(slot, entry);
             i32::try_from(n).unwrap_or(i32::MAX)
         }
     }
@@ -1268,37 +1286,43 @@ impl SwtchvmRuntime {
     }
 
     #[cfg(feature = "growformer-inference")]
-    fn growformer_infer_prompt_json(&self, prompt: &str) -> Result<String, ()> {
-        self.growformer_host.prompt_json(prompt).map_err(|_| ())
+    fn growformer_infer_prompt_json(&self, slot: Option<SwtchvmAddress>, prompt: &str) -> Result<String, ()> {
+        self.growformer_host
+            .prompt_json(growformer_worker_slot(slot), prompt)
+            .map_err(|_| ())
     }
 
-    /// Host-side consensus / agent inference (no WASM guest).
+    /// Host-side consensus / agent inference (no WASM guest), on the host slot's brain.
     #[cfg(feature = "growformer-inference")]
     pub fn growformer_run_prompt_json(&self, prompt: &str) -> Result<String, ()> {
-        self.growformer_infer_prompt_json(prompt)
+        self.growformer_infer_prompt_json(None, prompt)
     }
 
     #[cfg(feature = "growformer-inference")]
-    fn growformer_infer_converse_json(&self, prompt: &str) -> Result<String, ()> {
-        self.growformer_host.converse_json(prompt).map_err(|_| ())
+    fn growformer_infer_converse_json(&self, slot: Option<SwtchvmAddress>, prompt: &str) -> Result<String, ()> {
+        self.growformer_host
+            .converse_json(growformer_worker_slot(slot), prompt)
+            .map_err(|_| ())
     }
 
     #[cfg(feature = "growformer-inference")]
-    fn growformer_infer_codegen_json(&self, prompt: &str) -> Result<String, ()> {
-        self.growformer_host.codegen_json(prompt).map_err(|_| ())
+    fn growformer_infer_codegen_json(&self, slot: Option<SwtchvmAddress>, prompt: &str) -> Result<String, ()> {
+        self.growformer_host
+            .codegen_json(growformer_worker_slot(slot), prompt)
+            .map_err(|_| ())
     }
 
-    fn growformer_brain_info_json_string(&self) -> String {
+    fn growformer_brain_info_json_string(&self, slot: Option<SwtchvmAddress>) -> String {
+        let n = self
+            .growformer_brains
+            .read()
+            .unwrap()
+            .get(&slot)
+            .map(|e| e.bytes)
+            .unwrap_or(0);
         #[cfg(feature = "growformer-inference")]
-        if self.growformer_native_ready.load(Ordering::Acquire) {
-            if let Ok(brain_json) = self.growformer_host.brain_info_json() {
-                let n = self
-                    .growformer_brain
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .map(|b| b.len())
-                    .unwrap_or(0);
+        if n > 0 {
+            if let Ok(brain_json) = self.growformer_host.brain_info_json(growformer_worker_slot(slot)) {
                 return serde_json::json!({
                     "host": "spacekit-compute-node",
                     "growformer": "native-runtime",
@@ -1309,13 +1333,6 @@ impl SwtchvmRuntime {
                 .to_string();
             }
         }
-        let n = self
-            .growformer_brain
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|b| b.len())
-            .unwrap_or(0);
         format!(
             r#"{{"host":"spacekit-compute-node","growformer":"host-buffer","inference":false,"brain_bytes":{n}}}"#
         )
@@ -2765,7 +2782,8 @@ impl SwtchvmRuntime {
             "spacekit_agent",
             "agent_growformer_status",
             |caller: Caller<'_, SwtchvmStoreData>| -> i32 {
-                unsafe { (*caller.data().runtime).growformer_status_code() }
+                let slot = Some(contract_kv_namespace(caller.data()));
+                unsafe { (*caller.data().runtime).growformer_status_code_for(slot) }
             },
         )?;
 
@@ -2809,7 +2827,8 @@ impl SwtchvmRuntime {
                     return -3;
                 }
                 let rt = unsafe { &*caller.data().runtime };
-                rt.growformer_apply_brain_bytes(bytes)
+                // One brain per contract: loading here no longer replaces other contracts' brains.
+                rt.growformer_apply_brain_bytes_for(Some(caller_addr), bytes)
             },
         )?;
 
@@ -2823,6 +2842,7 @@ impl SwtchvmRuntime {
              max_len: i32|
              -> i32 {
                 let vm_rt = unsafe { &*caller.data().runtime };
+                let slot = Some(contract_kv_namespace(caller.data()));
                 let Some(prompt_bytes) =
                     Self::read_contract_mem_vec(&mut caller, prompt_ptr, prompt_len)
                 else {
@@ -2833,10 +2853,10 @@ impl SwtchvmRuntime {
                 };
                 #[cfg(feature = "growformer-inference")]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
-                    match vm_rt.growformer_infer_prompt_json(prompt.trim()) {
+                    match vm_rt.growformer_infer_prompt_json(slot, prompt.trim()) {
                         Ok(json) => {
                             Self::growformer_write_agent_json(&mut caller, dest_ptr, max_len, &json)
                         }
@@ -2845,7 +2865,7 @@ impl SwtchvmRuntime {
                 }
                 #[cfg(not(feature = "growformer-inference"))]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
                     -1
@@ -2862,6 +2882,7 @@ impl SwtchvmRuntime {
              max_len: i32|
              -> i32 {
                 let vm_rt = unsafe { &*caller.data().runtime };
+                let slot = Some(contract_kv_namespace(caller.data()));
                 let Some(prompt_bytes) =
                     Self::read_contract_mem_vec(&mut caller, prompt_ptr, prompt_len)
                 else {
@@ -2872,10 +2893,10 @@ impl SwtchvmRuntime {
                 };
                 #[cfg(feature = "growformer-inference")]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
-                    match vm_rt.growformer_infer_converse_json(prompt.trim()) {
+                    match vm_rt.growformer_infer_converse_json(slot, prompt.trim()) {
                         Ok(json) => {
                             Self::growformer_write_agent_json(&mut caller, dest_ptr, max_len, &json)
                         }
@@ -2884,7 +2905,7 @@ impl SwtchvmRuntime {
                 }
                 #[cfg(not(feature = "growformer-inference"))]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
                     -1
@@ -2901,6 +2922,7 @@ impl SwtchvmRuntime {
              max_len: i32|
              -> i32 {
                 let vm_rt = unsafe { &*caller.data().runtime };
+                let slot = Some(contract_kv_namespace(caller.data()));
                 let Some(prompt_bytes) =
                     Self::read_contract_mem_vec(&mut caller, prompt_ptr, prompt_len)
                 else {
@@ -2911,10 +2933,10 @@ impl SwtchvmRuntime {
                 };
                 #[cfg(feature = "growformer-inference")]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
-                    match vm_rt.growformer_infer_codegen_json(prompt.trim()) {
+                    match vm_rt.growformer_infer_codegen_json(slot, prompt.trim()) {
                         Ok(json) => {
                             Self::growformer_write_agent_json(&mut caller, dest_ptr, max_len, &json)
                         }
@@ -2923,7 +2945,7 @@ impl SwtchvmRuntime {
                 }
                 #[cfg(not(feature = "growformer-inference"))]
                 {
-                    if vm_rt.growformer_status_code() != 1 {
+                    if vm_rt.growformer_status_code_for(slot) != 1 {
                         return -1;
                     }
                     -1
@@ -2936,7 +2958,8 @@ impl SwtchvmRuntime {
             "agent_growformer_brain_info",
             |mut caller: Caller<'_, SwtchvmStoreData>, dest_ptr: i32, max_len: i32| -> i32 {
                 let vm_rt = unsafe { &*caller.data().runtime };
-                let info = vm_rt.growformer_brain_info_json_string();
+                let slot = Some(contract_kv_namespace(caller.data()));
+                let info = vm_rt.growformer_brain_info_json_string(slot);
                 Self::growformer_write_agent_json(&mut caller, dest_ptr, max_len, &info)
             },
         )?;
@@ -2948,8 +2971,13 @@ impl SwtchvmRuntime {
                 let vm_rt = unsafe { &*caller.data().runtime };
                 #[cfg(feature = "growformer-inference")]
                 {
-                    vm_rt.growformer_host.reset_conversation();
+                    let slot = Some(contract_kv_namespace(caller.data()));
+                    vm_rt
+                        .growformer_host
+                        .reset_conversation(growformer_worker_slot(slot));
                 }
+                #[cfg(not(feature = "growformer-inference"))]
+                let _ = vm_rt;
             },
         )?;
 
