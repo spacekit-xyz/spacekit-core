@@ -155,6 +155,39 @@ export function loadedGrowformerModule(): Record<string, unknown> | null {
   return gf as unknown as Record<string, unknown> | null;
 }
 
+/**
+ * Fingerprint used to skip reloading an identical brain blob (length + sampled bytes).
+ * Shared with `contract_brains.ts` so per-contract brains skip the same way.
+ */
+export function growformerBrainSkipTag(data: Uint8Array): [number, number] {
+  return brainSkipTag(data);
+}
+
+/** The domain artifacts the app loaded into instance 0 (null = none loaded). */
+export interface GrowformerDomainArtifacts {
+  inferenceToml: string | null;
+  guardrailsJsonl: string | null;
+  topicGraphBase: string | null;
+  topicGraphOverlay: string | undefined;
+  groundingGraph: string | null;
+  fragmentsJsonl: string | null;
+}
+
+/**
+ * What `loadGrowformerInferenceToml` / `…TopicGraph` / `…GroundingGraph` / `…FragmentsJsonl`
+ * last applied. Per-contract brains (`contract_brains.ts`) start from these.
+ */
+export function growformerDomainArtifacts(): GrowformerDomainArtifacts {
+  return {
+    inferenceToml: lastInferenceTomlCache,
+    guardrailsJsonl: lastGuardrailsJsonlCache,
+    topicGraphBase: lastTopicGraphBase,
+    topicGraphOverlay: lastTopicGraphOverlay,
+    groundingGraph: lastGroundingGraphCache,
+    fragmentsJsonl: lastFragmentsJsonlCache,
+  };
+}
+
 /** True after `initGrowformerHost` finished loading the Growformer wasm-bindgen module (brain optional). */
 export function isGrowformerModuleLoaded(): boolean {
   return gf !== null;
@@ -741,10 +774,10 @@ export async function fetchGrowformerBrainBytes(
  * Fetch a `.bin` brain from a URL and load it into the Growformer host.
  * Initializes the Growformer WASM runtime if needed (same as `initGrowformerHost`).
  *
- * **Correlate with contracts:** Contracts that call `growformer_*` from `spacekit_contract_sdk`
- * share one global Growformer runtime. Load the brain that matches the contract you are about to
- * execute (call this after selecting / deploying that agent). Switching agents with different
- * brains should call this again with the new URL — `loadGrowformerBrain` replaces the active brain.
+ * **Correlate with contracts:** this loads the shared brain (instance 0). A contract that calls
+ * `growformer_load_brain_from_storage` gets its own brain when the Growformer build has the
+ * instance API (`contract_brains.ts`); contracts that never load one use this shared brain.
+ * Switching the shared brain: call this again with the new URL — `loadGrowformerBrain` replaces it.
  */
 export async function initGrowformerHostWithBrainFromUrl(
   brainUrl: string,

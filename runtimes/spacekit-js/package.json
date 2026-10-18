@@ -103,7 +103,7 @@
       "build": "tsc -p tsconfig.json && npm run copy:assets",
       "copy:assets": "mkdir -p dist/wasm",
       "typecheck": "tsc -p tsconfig.json --noEmit",
-      "test": "tsc -p tsconfig.json && node --test dist/*.test.js dist/spacetime/*.test.js dist/vm/*.test.js dist/messaging/*.test.js dist/chain/*.test.js dist/growformer/instances.test.js",
+      "test": "tsc -p tsconfig.json && node --test dist/*.test.js dist/spacetime/*.test.js dist/vm/*.test.js dist/messaging/*.test.js dist/chain/*.test.js dist/growformer/instances.test.js dist/growformer/contract_brains.test.js",
       "pq:wasm": "bash scripts/build-sphincs-wasm.sh",
       "prepublishOnly": "npm run build",
       "start": "npm run build && node dist/entry-node.js",

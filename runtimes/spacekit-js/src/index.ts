@@ -65,6 +65,17 @@ export {
 } from "./growformer/instances.js";
 export type { GrowformerEngineInfo } from "./growformer/instances.js";
 export {
+  clearGrowformerContractBrains,
+  growformerContractBrainIds,
+  growformerContractBrainsEnabled,
+  loadGrowformerContractBrain,
+  setGrowformerContractArtifacts,
+  setGrowformerContractBrainLimit,
+  unloadGrowformerContractBrain,
+  DEFAULT_GROWFORMER_CONTRACT_BRAIN_LIMIT,
+} from "./growformer/contract_brains.js";
+export type { GrowformerContractArtifacts } from "./growformer/contract_brains.js";
+export {
   configureGrowformerCapture,
   newGrowformerCaptureSession,
   isGrowformerCaptureEnabled,
