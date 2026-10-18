@@ -115,7 +115,7 @@ alloy-transport-http = "1.0"
 alloy-contract = "1.0"
 
 # Native Growformer inference (same `growformer::runtime::Runtime` as spacekit-cli / simulator).
-growformer = { git = "https://github.com/spacekit-xyz/spacekit-ai", rev = "d2afc97406fa04f4e5662717afd3e36465e3e5a6", default-features = false, optional = true }
+growformer = { git = "https://github.com/spacekit-xyz/spacekit-ai", rev = "c28e3ccd3d7de9febe011f9bfbe5291f642cd253", default-features = false, optional = true }
 
 # Testing utilities (needed for mock database)
 tempfile = "3.0"

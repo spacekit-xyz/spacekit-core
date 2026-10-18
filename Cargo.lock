@@ -4739,6 +4739,21 @@ dependencies = [
 [[package]]
 name = "growformer"
 version = "0.1.0"
+source = "git+https://github.com/spacekit-xyz/spacekit-ai?rev=c28e3ccd3d7de9febe011f9bfbe5291f642cd253#c28e3ccd3d7de9febe011f9bfbe5291f642cd253"
+dependencies = [
+ "aho-corasick",
+ "getrandom 0.2.17",
+ "instant",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "growformer"
+version = "0.1.0"
 source = "git+https://github.com/spacekit-xyz/spacekit-ai?rev=d2afc97406fa04f4e5662717afd3e36465e3e5a6#d2afc97406fa04f4e5662717afd3e36465e3e5a6"
 dependencies = [
  "aho-corasick",
@@ -10750,7 +10765,8 @@ dependencies = [
  "dirs 5.0.1",
  "ecies",
  "ed25519-dalek",
- "growformer",
+ "flate2",
+ "growformer 0.1.0 (git+https://github.com/spacekit-xyz/spacekit-ai?rev=d2afc97406fa04f4e5662717afd3e36465e3e5a6)",
  "hex",
  "k256",
  "percent-encoding",
@@ -10848,7 +10864,7 @@ dependencies = [
  "futures",
  "futures-intrusive",
  "futures-util",
- "growformer",
+ "growformer 0.1.0 (git+https://github.com/spacekit-xyz/spacekit-ai?rev=c28e3ccd3d7de9febe011f9bfbe5291f642cd253)",
  "hex",
  "hkdf",
  "hyper 1.11.0",
