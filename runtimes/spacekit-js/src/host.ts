@@ -3,17 +3,16 @@ import { StorageAdapter, createInMemoryStorage, bytesToHex as storageBytesToHex 
 import { sha256 } from "@noble/hashes/sha256";
 import { enforceStorageProtection } from "./vm/genesis.js";
 import { microgpt_forward } from "./llm/microgpt_forward.js";
+import { isGrowformerModuleLoaded } from "./growformer/runtime.js";
 import {
-  growformerHostBrainInfoJson,
-  growformerHostCodegenJson,
-  growformerHostConverseJson,
-  growformerHostGenerationJson,
-  growformerHostStatusCode,
-  isGrowformerHostReady,
-  isGrowformerModuleLoaded,
-  loadGrowformerBrain,
-  resetGrowformerConversation,
-} from "./growformer/runtime.js";
+  growformerContractBrainInfoJson,
+  growformerContractCodegenJson,
+  growformerContractConverseJson,
+  growformerContractGenerationJson,
+  growformerContractStatusCode,
+  loadGrowformerContractBrain,
+  resetGrowformerContractConversation,
+} from "./growformer/contract_brains.js";
 import {
   type ToolEffectManager,
   type ToolEffectRecord,
@@ -897,11 +896,13 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
   };
 
   const agentGrowformerStatus = (): number => {
-    return growformerHostStatusCode();
+    return growformerContractStatusCode(ctx.contractId);
   };
 
   /**
    * Load Growformer brain bytes from VM storage (same key space as `storage_load` / `storage_get`).
+   * The brain is this contract's own when the Growformer build has the instance API
+   * (`growformer/contract_brains.ts`), so other contracts keep theirs.
    * Returns bytes loaded (>0), or -2 error, -3 missing key, -4 Growformer module not initialized.
    */
   const agentGrowformerLoadBrainFromStorage = (keyPtr: number, keyLen: number): number => {
@@ -914,7 +915,7 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
       if (!value || value.length === 0) {
         return -3;
       }
-      loadGrowformerBrain(value);
+      loadGrowformerContractBrain(ctx.contractId, value);
       return value.length;
     } catch (e) {
       console.error("[SpacekitVM] agent_growformer_load_brain_from_storage:", e);
@@ -928,12 +929,12 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
     destPtr: number,
     maxLen: number
   ): number => {
-    if (!isGrowformerHostReady()) {
+    if (growformerContractStatusCode(ctx.contractId) !== 1) {
       return -1;
     }
     try {
       const prompt = ctx.readString(promptPtr, promptLen);
-      const json = growformerHostGenerationJson(prompt);
+      const json = growformerContractGenerationJson(ctx.contractId, prompt);
       return writeAgentJson(destPtr, maxLen, json);
     } catch (e) {
       console.error("[SpacekitVM] agent_growformer_generation:", e);
@@ -947,12 +948,12 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
     destPtr: number,
     maxLen: number
   ): number => {
-    if (!isGrowformerHostReady()) {
+    if (growformerContractStatusCode(ctx.contractId) !== 1) {
       return -1;
     }
     try {
       const prompt = ctx.readString(promptPtr, promptLen);
-      const json = growformerHostConverseJson(prompt);
+      const json = growformerContractConverseJson(ctx.contractId, prompt);
       return writeAgentJson(destPtr, maxLen, json);
     } catch (e) {
       console.error("[SpacekitVM] agent_growformer_converse:", e);
@@ -966,12 +967,12 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
     destPtr: number,
     maxLen: number
   ): number => {
-    if (!isGrowformerHostReady()) {
+    if (growformerContractStatusCode(ctx.contractId) !== 1) {
       return -1;
     }
     try {
       const prompt = ctx.readString(promptPtr, promptLen);
-      const json = growformerHostCodegenJson(prompt);
+      const json = growformerContractCodegenJson(ctx.contractId, prompt);
       return writeAgentJson(destPtr, maxLen, json);
     } catch (e) {
       console.error("[SpacekitVM] agent_growformer_codegen:", e);
@@ -980,11 +981,11 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
   };
 
   const agentGrowformerBrainInfo = (destPtr: number, maxLen: number): number => {
-    if (!isGrowformerHostReady()) {
+    if (growformerContractStatusCode(ctx.contractId) !== 1) {
       return -1;
     }
     try {
-      const json = growformerHostBrainInfoJson();
+      const json = growformerContractBrainInfoJson(ctx.contractId);
       return writeAgentJson(destPtr, maxLen, json);
     } catch (e) {
       console.error("[SpacekitVM] agent_growformer_brain_info:", e);
@@ -993,7 +994,7 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
   };
 
   const agentGrowformerResetConversation = (): void => {
-    resetGrowformerConversation();
+    resetGrowformerContractConversation(ctx.contractId);
   };
 
   const useGas = (amount: number) => {
@@ -1124,13 +1125,14 @@ export function createImports(ctx: HostContextImpl): WebAssembly.Imports {
       /**
        * Growformer brain runtime (wasm-bindgen pkg in `growformer-pkg/`).
        *
-       * **Not tied to a specific contract deployment:** the VM loads many contract WASMs, but the
-       * Growformer host is a single global instance. Initialize with `initGrowformerHost()`. Brains
-       * can be loaded via `agent_growformer_load_brain_from_storage` (reads VM `storage` keys seeded
-       * at deploy) or `loadGrowformerBrain` / `initGrowformerHostWithBrainFromUrl` from the app.
-       * If the wrong brain is loaded, or none, imports return -1 / errors.
+       * Initialize with `initGrowformerHost()`. A contract that calls
+       * `agent_growformer_load_brain_from_storage` (reads VM `storage` keys seeded at deploy) gets
+       * its own brain when the Growformer build has the instance API (`growformer/contract_brains.ts`);
+       * other contracts keep theirs. Contracts that never load one use the shared brain the app
+       * loaded with `loadGrowformerBrain` / `initGrowformerHostWithBrainFromUrl`.
+       * If no brain is loaded, imports return -1 / errors.
        *
-       * `agent_growformer_status`: 0 = not ready, 1 = ready (`growformer_ready()` after init + brain).
+       * `agent_growformer_status`: 0 = not ready, 1 = ready (the brain this contract uses).
        */
       agent_growformer_status: agentGrowformerStatus,
       agent_growformer_load_brain_from_storage: agentGrowformerLoadBrainFromStorage,

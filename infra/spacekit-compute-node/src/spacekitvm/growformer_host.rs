@@ -41,12 +41,26 @@ pub struct GrowformerLoaded {
 type Reply<T> = mpsc::Sender<Result<T, String>>;
 
 enum Call {
-    Load { data: Vec<u8>, reply: Reply<GrowformerLoaded> },
+    Load {
+        data: Vec<u8>,
+        reply: Reply<GrowformerLoaded>,
+    },
     Unload,
-    Prompt { text: String, reply: Reply<String> },
-    Converse { text: String, reply: Reply<String> },
-    Codegen { text: String, reply: Reply<String> },
-    BrainInfo { reply: Reply<String> },
+    Prompt {
+        text: String,
+        reply: Reply<String>,
+    },
+    Converse {
+        text: String,
+        reply: Reply<String>,
+    },
+    Codegen {
+        text: String,
+        reply: Reply<String>,
+    },
+    BrainInfo {
+        reply: Reply<String>,
+    },
     Reset,
 }
 
@@ -231,7 +245,11 @@ impl GrowformerThreadHost {
             .map_err(|_| "growformer worker disconnected".to_string())
     }
 
-    fn request<T>(&self, slot: GrowformerSlot, make: impl FnOnce(Reply<T>) -> Call) -> Result<T, String> {
+    fn request<T>(
+        &self,
+        slot: GrowformerSlot,
+        make: impl FnOnce(Reply<T>) -> Call,
+    ) -> Result<T, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(slot, make(reply_tx))?;
         reply_rx
@@ -240,7 +258,11 @@ impl GrowformerThreadHost {
     }
 
     /// Load (or replace) the brain for `slot`. A failed load leaves `slot` empty.
-    pub fn load_brain(&self, slot: GrowformerSlot, data: Vec<u8>) -> Result<GrowformerLoaded, String> {
+    pub fn load_brain(
+        &self,
+        slot: GrowformerSlot,
+        data: Vec<u8>,
+    ) -> Result<GrowformerLoaded, String> {
         self.request(slot, |reply| Call::Load { data, reply })
     }
 
