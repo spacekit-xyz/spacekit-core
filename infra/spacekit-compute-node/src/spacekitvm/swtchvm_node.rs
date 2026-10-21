@@ -5900,8 +5900,7 @@ fn unix_millis() -> u64 {
 impl SwtchvmNode {
     fn faucet_policy() -> FaucetPolicy {
         FaucetPolicy {
-            // The native ledger is in uASTRA (6 decimals), so 1 ASTRA = 1_000_000.
-            amount: 1_000_000u128,
+            amount: 1_000_000_000_000_000_000u128, // 1 ASTRA (18 decimals, wei-ASTRA)
             cooldown: Duration::from_secs(3600),
             max_requests: 10,
         }
