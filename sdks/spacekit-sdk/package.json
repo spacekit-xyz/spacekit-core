@@ -97,7 +97,7 @@
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint lib --ext .ts,.tsx",
-    "test": "node --test test/plugins.test.mjs"
+    "test": "node --test test/plugins.test.mjs test/viewerData.test.mjs"
   },
   "keywords": [
     "spacekit",

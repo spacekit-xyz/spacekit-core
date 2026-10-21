@@ -73,7 +73,7 @@ const CAPABILITY_LABELS: Record<string, string> = {
   "clipboard:write": "Write to your clipboard",
   notifications: "Show notifications",
   payments: "Ask you to approve payments",
-  storage: "Store data on this device",
+  storage: "Keep your data for this app in your own SpaceKit storage",
   network: "Connect to other websites",
   "identity:write": "Change your profile details on this site",
   messaging: "Send and read messages as you",

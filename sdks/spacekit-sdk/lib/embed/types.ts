@@ -1,3 +1,7 @@
+import type { AppKeyRequest } from "./viewerCrypto.js";
+
+export type { AppKeyRequest };
+
 export interface AppManifest {
   name: string;
   description: string;
@@ -97,6 +101,12 @@ export interface AppCredentialRequest {
   publisherDid: string | null;
   /** Storage origin the bridge talks to. */
   storageOrigin: string;
+  /**
+   * Whose namespace the storage credential is for. `"publisher"` (the default,
+   * and all a host that ignores this field returns) asks for
+   * `storageAuthorization`; `"viewer"` asks for `viewerStorageAuthorization`.
+   */
+  namespace?: "publisher" | "viewer";
 }
 
 /**
@@ -109,6 +119,14 @@ export interface AppCredentials {
    * token from `POST /api/auth/delegate` (`"Bearer sktok1.…"`).
    */
   storageAuthorization?: string;
+  /**
+   * For the app's private data (`storage.*` records and blobs) in the viewer's
+   * own namespace: an app-scoped node token minted *without* `act_as`, so the
+   * node files the documents under the viewer's DID. Returned only for
+   * `namespace: "viewer"` requests. Without it, records stay on this device and
+   * blobs are unavailable.
+   */
+  viewerStorageAuthorization?: string;
   /**
    * For `http.fetch` to trusted origins (the host API), e.g. a website-api app
    * token from `POST /api/auth/app-token` (`"Bearer skapp1.…"`).
@@ -139,6 +157,15 @@ export interface EmbedHostServices {
    * `payments.subscribe` fails after payment.
    */
   recordSubscription?(req: SubscriptionRecordRequest): Promise<SubscriptionStatus>;
+  /**
+   * The viewer's key-encryption key for one app (non-extractable AES-KW), for
+   * `crypto.encryptUpload` / `crypto.decryptBlob`. Hosts derive it from the
+   * identity secret they hold, typically with `deriveAppDataKey(seed, req)`, so
+   * the secret itself never reaches the bridge. Return null when the viewer is
+   * signed out or the host holds no secret for them. Called once per viewer and
+   * app; the bridge caches the key.
+   */
+  deriveAppKey?(req: AppKeyRequest): Promise<CryptoKey | null>;
 }
 
 /** Per-call context the bridge passes to the HTTP handler. */

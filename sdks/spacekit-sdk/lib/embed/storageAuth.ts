@@ -69,7 +69,10 @@ export interface StorageAuthClient {
   sessionAuthorization(): Promise<string | null>;
   /** `Bearer <app token>` for one app, acting in `actAs`'s namespace when given. */
   appAuthorization(appId: string, actAs?: string | null): Promise<string | null>;
-  /** Provider for `createLocalStorageEmbedHost({ appCredentials })`. */
+  /**
+   * Provider for `createLocalStorageEmbedHost({ appCredentials })`: a token in
+   * the publisher's namespace, or in the viewer's own for `namespace: "viewer"`.
+   */
   appCredentials(req: AppCredentialRequest): Promise<AppCredentials | null>;
   /** Forget cached tokens (call on sign-out or identity change). */
   clear(): void;
@@ -181,6 +184,11 @@ export function createStorageAuthClient(options: StorageAuthClientOptions): Stor
     appAuthorization,
     async appCredentials(req) {
       try {
+        if (req.namespace === "viewer") {
+          // No act_as: the node files these documents under the viewer's own DID.
+          const viewerStorageAuthorization = await appAuthorization(req.appId, null);
+          return viewerStorageAuthorization ? { viewerStorageAuthorization } : null;
+        }
         const storageAuthorization = await appAuthorization(req.appId, req.publisherDid);
         return storageAuthorization ? { storageAuthorization } : null;
       } catch (err) {

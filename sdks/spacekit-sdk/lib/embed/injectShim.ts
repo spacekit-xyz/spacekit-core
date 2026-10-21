@@ -190,6 +190,14 @@ export function injectSdkBridgeIntoHtml(
     window.spacekit.call("storage","delete",{key:k}).catch(function(){});
     return Promise.resolve(true);
   }
+  // Records (putRecord/deleteRecord) wait for the host, so a failed write
+  // reaches the app instead of being dropped; the cache entry is forgotten on
+  // failure so the next read asks the host again.
+  function skKvPut(method,k,v){
+    k=String(k);
+    skKv[k]=(v===undefined?null:v);
+    return window.spacekit.call("storage",method,{key:k,value:v}).catch(function(e){delete skKv[k];throw e;});
+  }
   function skRewriteEmbedUrl(url){
     if(!embedApiBase)return String(url);
     var u=String(url);
@@ -258,10 +266,12 @@ export function injectSdkBridgeIntoHtml(
       ready:function(){return window.spacekit.call("storage","ready",{})},
       putBlob:function(blob){return window.spacekit.call("storage","putBlob",{blob:blob})},
       getBlob:function(cid){return window.spacekit.call("storage","getBlob",{cid:cid})},
-      putRecord:function(k,v){return skKvSet(k,v).then(function(){return String(k)})},
+      deleteBlob:function(cid){return window.spacekit.call("storage","deleteBlob",{cid:cid})},
+      blobInfo:function(cid){return window.spacekit.call("storage","blobInfo",{cid:cid})},
+      putRecord:function(k,v){return skKvPut("putRecord",k,v).then(function(){return String(k)})},
       getRecord:function(k){return skKvGet(k)},
       listRecords:function(p){return window.spacekit.call("storage","listRecords",{prefix:p||""})},
-      deleteRecord:function(k){return skKvDelete(k)},
+      deleteRecord:function(k){return skKvPut("deleteRecord",k,null).then(function(){})},
     },
     messaging:{
       publish:function(topic,msg){return window.spacekit.call("messaging","publish",{topic:topic,msg:msg})},
@@ -299,7 +309,7 @@ export function injectSdkBridgeIntoHtml(
     },
     crypto:{
       encryptUpload:function(blob,ownerPubkey){return window.spacekit.call("crypto","encryptUpload",{blob:blob,ownerPubkey:ownerPubkey||"demo-owner"})},
-      decryptBlob:function(cid,iv,wrappedKey){return window.spacekit.call("crypto","decryptBlob",{cid:cid,iv:iv,wrappedKey:wrappedKey})},
+      decryptBlob:function(cid,iv,wrappedKey,ciphertext){return window.spacekit.call("crypto","decryptBlob",{cid:cid,iv:iv,wrappedKey:wrappedKey,ciphertext:ciphertext})},
     },
     plugins:{
       call:function(id,method,params){return window.spacekit.call("plugins","call",{plugin:id,method:method,params:params||{}})},

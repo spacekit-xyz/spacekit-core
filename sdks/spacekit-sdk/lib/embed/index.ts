@@ -1,5 +1,6 @@
 export type {
   AppCredentialRequest,
+  AppKeyRequest,
   AppCredentials,
   AppManifest,
   AppPackageJSON,
@@ -22,6 +23,7 @@ export type {
 export {
   type EmbeddedSdkBridge,
   type EmbeddedSdkBridgeWithOwner,
+  configureBridgeManifest,
   configureBridgeOwner,
   handleSdkCall,
 } from "./bridge.js";
@@ -36,6 +38,29 @@ export {
   AppDataSdkBridge,
   acquireAppDataSdkBridge,
 } from "./appDataBridge.js";
+
+export {
+  APP_DATA_KEK_SALT,
+  WRAPPED_KEY_PREFIX,
+  appKeyInfo,
+  decryptForViewer,
+  deriveAppDataKey,
+  encryptForViewer,
+  unwrapFileKey,
+  type EncryptedUpload,
+} from "./viewerCrypto.js";
+
+export {
+  DEFAULT_CHUNK_BYTES,
+  StorageRequestError,
+  VIEWER_BLOB_COLLECTION,
+  VIEWER_CHUNK_COLLECTION,
+  VIEWER_KV_COLLECTION,
+  ViewerDataStore,
+  isBlobCid,
+  type BlobManifest,
+  type ViewerStoreOptions,
+} from "./viewerStore.js";
 
 export {
   DEFAULT_DID_KEYS,

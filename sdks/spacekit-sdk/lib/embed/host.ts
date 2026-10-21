@@ -20,7 +20,7 @@
  *     origin and can read everything the host can. Only for code you wrote.
  */
 
-import { configureBridgeOwner, type EmbeddedSdkBridge } from "./bridge.js";
+import { configureBridgeManifest, configureBridgeOwner, type EmbeddedSdkBridge } from "./bridge.js";
 import {
   createCapabilityGuard,
   defaultTrustedOrigins,
@@ -318,6 +318,7 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
     const bridgeOrigin = options.bridgeStorageOrigin ?? options.storageOrigin;
     bridge = options.acquireBridge(options.appId, bridgeOrigin, manifest.name, options.install?.collectionScope);
     configureBridgeOwner(bridge, options.install?.ownerDid ?? verified.creatorDid);
+    configureBridgeManifest(bridge, manifest);
     await bridge.ensureHydrated();
     if (disposed) return;
 

@@ -198,6 +198,11 @@ export interface LocalEmbedHostOptions extends LocalIdentityHostOptions {
   appCredentials?: (req: AppCredentialRequest) => Promise<AppCredentials | null>;
   /** Verify and record app subscriptions (see `createSubscriptionRecorder`). */
   recordSubscription?: EmbedHostServices["recordSubscription"];
+  /**
+   * The viewer's per-app file key (see `EmbedHostServices.deriveAppKey` and
+   * `deriveAppDataKey`). Enables `crypto.encryptUpload` / `decryptBlob`.
+   */
+  deriveAppKey?: EmbedHostServices["deriveAppKey"];
   /** See `HttpBridgeHost.forwardViewerSession`. Defaults to true. */
   forwardViewerSession?: boolean;
 }
@@ -251,6 +256,7 @@ export function createLocalStorageEmbedHost(
     handleIdentity: identity.handleIdentity,
     ...(options.appCredentials ? { getAppCredentials: options.appCredentials } : {}),
     ...(options.recordSubscription ? { recordSubscription: options.recordSubscription } : {}),
+    ...(options.deriveAppKey ? { deriveAppKey: options.deriveAppKey } : {}),
     ...options.services,
   };
 
