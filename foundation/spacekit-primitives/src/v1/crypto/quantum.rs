@@ -68,7 +68,7 @@ pub fn generate_kem_keypair(algorithm: Algorithm) -> anyhow::Result<(Vec<u8>, Ve
 #[cfg(not(feature = "quantum"))]
 pub fn generate_kem_keypair(_algorithm: Algorithm) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let (sk, pk) = ecies::utils::generate_keypair();
-    Ok((pk.serialize().to_vec(), sk.secret_bytes().to_vec()))
+    Ok((pk.serialize().to_vec(), sk.serialize().to_vec()))
 }
 
 /// SPHINCS+ signature for quantum-resistant digital signatures
