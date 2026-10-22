@@ -97,7 +97,8 @@ The guard receives each call first. It either rejects it, which becomes a `res` 
 | Call | Permission needed | Notes |
 |---|---|---|
 | `app.ready` / `isOwner` / `ownerDid` | none | |
-| `storage.get` / `set` / `list` / `delete` | none | Key/value storage scoped to the app id. Default bridge: host `localStorage` under `spacekit:appdata:<appId>:`. |
+| `storage.get` / `set` / `list` / `delete` (and `getRecord` / `putRecord` / `listRecords` / `deleteRecord`) | none | The viewer's private records for this app. Without the `storage` permission, or when the host has no viewer credentials, they stay on this device (host `localStorage` under `spacekit:appdata:<appId>:`). With `storage`, they go to the storage node under the viewer's DID (§6.3). The `localStorage` shim's `__ls:` keys always stay on the device. |
+| `storage.putBlob` / `getBlob` / `deleteBlob` / `blobInfo` | none | The viewer's private files for this app, always on the storage node under the viewer's DID. `putBlob(blob)` returns `{ cid, size }` (`cid` is `skb1-<sha256>`); `getBlob(cid)` returns a `Blob`; `deleteBlob(cid)` returns `true`, or `false` if it was not there; `blobInfo(cid)` returns `{ cid, size, createdAt }` or `null`. Needs a signed-in viewer and `viewerStorageAuthorization` (§6.3). |
 | `documents.get` / `put` | none | Scoped to `app_<appId>_<collection>` on the storage node. |
 | `documents.list` / `delete` | none | Only when the viewer is the app owner. |
 | `identity.did` / `getState` | none | Reveals the viewer DID to the app. |
@@ -108,7 +109,7 @@ The guard receives each call first. It either rejects it, which becomes a `res` 
 | `messaging.send` / `list` | `messaging` | |
 | `http.fetch` / `sseSubscribe` / `sseClose` | see §6.2 | |
 | `contracts.*` | `contracts` | Not implemented by the default bridge. |
-| `crypto.*` | `crypto` | Not implemented by the default bridge. |
+| `crypto.encryptUpload` / `decryptBlob` | `crypto` | Runs in the host with the viewer's per-app key from `deriveAppKey` (§6.3); no key reaches the app. `encryptUpload(blob)` returns `{ ciphertext, ivB64, wrappedKey, contentHash, size }` (AES-256-GCM with a per-file key, wrapped with AES-KW as `skw1.<base64>`). Store `ciphertext` with `putBlob`. `decryptBlob(cid, ivB64, wrappedKey, ciphertext?)` returns `{ plaintext }`, reading the blob from `cid` when `ciphertext` is not passed. |
 
 A host can refuse any capability, module or single call with `capabilities.deny` (for example `["payments", "messaging.send"]`), and grant capabilities to every app with `capabilities.grant`.
 
@@ -132,6 +133,8 @@ In the package manifest, `permissions` is an array. The host accepts these shape
 
 The last three are what `spacekit app package --permission network:tiles.example.com --permission identity:write --permission camera` writes (the Rust `Permission` enum). `Camera`, `Microphone`, `Geolocation` and `Clipboard { write: true }` also turn on the matching iframe `allow` feature once the viewer grants them.
 
+`storage` asks to keep the app's records in the viewer's own SpaceKit storage (consent line: "Keep your data for this app in your own SpaceKit storage"). With it, `storage.*` records follow the viewer to other devices; without it they stay on the device. Blobs go to the viewer's storage either way.
+
 `network` with no hosts means any host. The consent prompt lists one plain-language line per entry, such as "Connect to api.example.com" or "Send and read messages as you".
 
 ### 6.2 Network policy
@@ -150,11 +153,14 @@ Orgs running third-party apps should use `"manifest"`. The default is `"open"` o
 
 Apps never receive the viewer's key or session. Credentials are attached host-side, and only where they belong.
 
-**App-scoped credentials (preferred).** A host implements `EmbedHostServices.getAppCredentials({ appId, publisherDid, storageOrigin })`, or passes `appCredentials` to `createLocalStorageEmbedHost`. It returns up to two `Authorization` values:
+**App-scoped credentials (preferred).** A host implements `EmbedHostServices.getAppCredentials({ appId, publisherDid, storageOrigin, namespace })`, or passes `appCredentials` to `createLocalStorageEmbedHost`. It returns up to three `Authorization` values:
 - `storageAuthorization`: an app token from the storage node (`POST /api/auth/delegate`). The node accepts it only for `/api/documents/app_<appId>_*`. When it acts in the publisher's namespace, only `get` and `put` work; `list` and `delete` are the owner's. The bridge uses it for `documents.*`.
+- `viewerStorageAuthorization`: returned only when the request has `namespace: "viewer"`. The same kind of app token, minted *without* `act_as`, so the node files the documents under the viewer's own DID. The bridge uses it for the viewer's `storage.*` blobs, and for records when the manifest declares `storage`. A host that ignores `namespace` returns only `storageAuthorization`; records then stay on the device and blobs are unavailable.
 - `apiAuthorization`: an app token from the host API (website-api `POST /api/auth/app-token`, one hour, app documents only). `http.fetch` to trusted origins sends it instead of the session, without cookies.
 
-`createStorageAuthClient` (`@spacekit/sdk/embed`) implements the storage side. For viewers with an Ed25519 or SLH-DSA `did:key`, it signs the node's login challenge (`getSigner`). For accounts signed in to the website API, it takes a node session from `POST /api/auth/storage-token` (`getSession: websiteStorageSession(…)`). Either way it caches the session and the per-app tokens.
+**Viewer file keys.** For `crypto.*`, a host implements `EmbedHostServices.deriveAppKey({ appId, viewerDid })` (or passes `deriveAppKey` to `createLocalStorageEmbedHost`). It returns a non-extractable AES-KW `CryptoKey`, or `null` when the viewer is signed out or the host holds no secret for them. `deriveAppDataKey(seed, req)` derives it from the viewer's identity secret with HKDF-SHA256 (salt `spacekit/app-data-kek/v1`, info `app:<appId>|did:<did>`), so the same viewer gets the same key for an app on any host that holds their secret. The bridge caches it per viewer and app.
+
+`createStorageAuthClient` (`@spacekit/sdk/embed`) implements the storage side, including `namespace: "viewer"`. For viewers with an Ed25519 or SLH-DSA `did:key`, it signs the node's login challenge (`getSigner`). For accounts signed in to the website API, it takes a node session from `POST /api/auth/storage-token` (`getSession: websiteStorageSession(…)`). Either way it caches the session and the per-app tokens.
 
 **Fallback.** Without app credentials, the host attaches the viewer's own session to **trusted origins** only: its page origin plus `capabilities.trustedOrigins` / `credentialedOrigins`, and in the React and element wrappers the origins in `endpoints`. That means the session token, the `owner-did` header and same-origin cookies. Set `forwardViewerSession: false` to stop this. The documents bridge falls back to a bare `DID <publisher>` header, which storage nodes in strict mode reject.
 

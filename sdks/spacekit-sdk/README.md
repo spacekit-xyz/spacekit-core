@@ -201,6 +201,17 @@ const host = createLocalStorageEmbedHost({
 
 A host with its own API adds `apiAuthorization`, for example from the website-api's `POST /api/auth/app-token`.
 
+`storageAuth.appCredentials` also answers `getAppCredentials({ namespace: "viewer" })` with `viewerStorageAuthorization`, a token in the viewer's own namespace. With it, an app's `storage.putBlob` / `getBlob` / `deleteBlob` / `blobInfo` keep the viewer's files on the storage node under the viewer's DID, and `storage.*` records go there too when the manifest declares the `storage` permission (otherwise they stay on the device). To let apps encrypt those files, pass `deriveAppKey`: the host derives a per-app key from the viewer's identity secret, and `crypto.encryptUpload` / `decryptBlob` run in the host, so no key enters the app frame.
+
+```ts
+import { deriveAppDataKey } from "@spacekit/sdk/embed";
+
+const host = createLocalStorageEmbedHost({
+  appCredentials: storageAuth.appCredentials,
+  deriveAppKey: async (req) => (signedIn ? deriveAppDataKey(identitySeed, req) : null),
+});
+```
+
 For viewers signed in to your API rather than holding a `did:key`, pass `getSession: websiteStorageSession({ apiBase, getBearer })` instead of `getSigner`. Paid apps need two hooks. Prices are in ASTRA, SpaceKit's only currency; apps call `payments.subscribe({ amountAstra: "2.5" })` (or `amountWei`).
 
 - `requestSubscriptionPayment: createAstraPaymentRequester({ confirm, transfer })` shows the viewer the price and payee, then sends the ASTRA transfer on the SpaceKit chain (for example with spacekit-js `ChainClient.transfer`). It never holds keys.

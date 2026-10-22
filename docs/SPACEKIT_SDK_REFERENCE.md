@@ -771,11 +771,11 @@ const embedded = Boolean(window.spacekit);
 |--------|---------|-------------|
 | `identity` | `did`, `getState`, `setState`, `authHeaders` | Who is viewing |
 | `documents` | `get`, `put`, `list`, `delete` | Per-app JSON docs (app-data default) |
-| `storage` | `ready`, `get`/`set`/`list`/`delete`, `putRecord`/`getRecord`/`listRecords`/`deleteRecord`, `putBlob`/`getBlob` | KV + blobs |
+| `storage` | `ready`, `get`/`set`/`list`/`delete`, `putRecord`/`getRecord`/`listRecords`/`deleteRecord`, `putBlob`/`getBlob`/`deleteBlob`/`blobInfo` | The viewer's private records + files |
 | `payments` | `status`, `subscribe`, `config`, `charge` | Subscriptions / one-shot pay |
 | `messaging` | `publish`, `send`, `list`, `subscribe` | Pub/sub + DMs |
 | `contracts` | `anchor`, `verify`, `createShare`, `revokeShare`, `invoke`, `call`, `status` | On-chain / WASM facets |
-| `crypto` | `encryptUpload`, `decryptBlob` | Encrypted uploads |
+| `crypto` | `encryptUpload`, `decryptBlob` | Encrypt the viewer's files (key stays in the host) |
 | `http` | `fetch`, `sseSubscribe`, `sseClose` | Parent-proxied fetch (auth injected) |
 | `app` | `ready`, `isOwner`, `ownerDid` | Package metadata |
 
@@ -826,9 +826,17 @@ await window.spacekit.storage.putRecord("ws/main", { files: [] });
 const ws = await window.spacekit.storage.getRecord("ws/main");
 
 // Binary blobs → content id
-const cid = await window.spacekit.storage.putBlob(arrayBufferOrBlob);
+const { cid, size } = await window.spacekit.storage.putBlob(arrayBufferOrBlob);
 const blob = await window.spacekit.storage.getBlob(cid);
+const info = await window.spacekit.storage.blobInfo(cid); // { cid, size, createdAt } or null
+await window.spacekit.storage.deleteBlob(cid);            // true, or false if it was not there
 ```
+
+`storage.*` is the **viewer's** private data for your app; `documents.*` is shared app data in the publisher's namespace.
+
+- **Blobs** always live on the storage node under the viewer's DID (chunked, content-addressed `skb1-<sha256>` ids, hash-checked on read). They need a signed-in viewer and a host that returns `viewerStorageAuthorization` from `getAppCredentials({ namespace: "viewer" })`; otherwise the call fails with a "Sign in" or "cannot store files" error.
+- **Records** (`set`/`putRecord` …) stay on the device unless your manifest declares the **`storage`** permission (`spacekit app package --permission storage`). With it, and a viewer token, they go to the viewer's storage on the node and follow the viewer across devices. Writes are awaited, so a failed write rejects in your app.
+- The `localStorage` shim's `__ls:` keys always stay on the device.
 
 ### Payments (Subscriptions)
 
@@ -882,9 +890,16 @@ Custom bridges may expose richer contract surfaces; the generic app-data bridge 
 
 ### Crypto
 
+Needs the `crypto` permission. Encryption runs in the host with a per-app key it derives from the viewer's identity secret (the host's `deriveAppKey` service, HKDF-SHA256 → AES-KW); the key never enters your frame.
+
 ```javascript
-const enc = await window.spacekit.crypto.encryptUpload(blob, ownerPubkey);
-const plain = await window.spacekit.crypto.decryptBlob(cid, iv, wrappedKey);
+const enc = await window.spacekit.crypto.encryptUpload(file);
+// enc → { ciphertext: Blob, ivB64, wrappedKey: "skw1.…", contentHash, size }
+const { cid } = await window.spacekit.storage.putBlob(enc.ciphertext);
+// keep { cid, ivB64, wrappedKey } in a record
+
+const { plaintext } = await window.spacekit.crypto.decryptBlob(cid, enc.ivB64, enc.wrappedKey);
+// or pass the ciphertext Blob as a 4th argument instead of reading it from cid
 ```
 
 ### HTTP (parent-proxied)
