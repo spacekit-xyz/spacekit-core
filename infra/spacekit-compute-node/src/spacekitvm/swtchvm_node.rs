@@ -5900,7 +5900,7 @@ fn unix_millis() -> u64 {
 impl SwtchvmNode {
     fn faucet_policy() -> FaucetPolicy {
         FaucetPolicy {
-            amount: 1_000_000_000_000_000_000u128, // 1 ASTRA (18 decimals)
+            amount: 1_000_000_000_000_000_000u128, // 1 ASTRA (18 decimals, wei-ASTRA)
             cooldown: Duration::from_secs(3600),
             max_requests: 10,
         }
@@ -6065,7 +6065,8 @@ impl SwtchvmNode {
             };
         }
         let policy = Self::faucet_policy();
-        let amount = amount_override.unwrap_or(policy.amount);
+        // The amount comes from the caller, so it may lower the grant but never raise it.
+        let amount = amount_override.map_or(policy.amount, |requested| requested.min(policy.amount));
         let now = Instant::now();
         let mut records = self.faucet_requests.write().await;
         if let Some(record) = records.get_mut(did) {

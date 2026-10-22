@@ -121,7 +121,30 @@ export class AppDataSdkBridge implements EmbeddedSdkBridge {
       await store.hydrate(true).catch((err) => {
         console.warn("[spacekit] could not load this app's records from storage:", err);
       });
+      await this.uploadDeviceRecords(store).catch((err) => {
+        console.warn("[spacekit] could not move this device's records to storage:", err);
+      });
     }
+  }
+
+  /**
+   * Once per app and viewer, copies records this device kept locally (from
+   * before the app synced, or before it declared `storage`) to the viewer's
+   * namespace, without overwriting records already there. The local copies are
+   * left in place.
+   */
+  private async uploadDeviceRecords(store: ViewerDataStore): Promise<void> {
+    const viewer = this.services.getViewerDid();
+    if (!viewer) return;
+    const flag = `spacekit:appdata-uploaded:${this.appId}:${this.collectionScope ?? ""}:${normalizeDid(viewer)}`;
+    if (localStorage.getItem(flag)) return;
+    for (const key of this.localList("")) {
+      if (key.startsWith(LOCAL_STORAGE_SHIM_PREFIX)) continue;
+      const value = this.localGet(key);
+      if (value === null || value === undefined) continue;
+      if ((await store.getRecord(key)) == null) await store.putRecord(key, value);
+    }
+    localStorage.setItem(flag, new Date().toISOString());
   }
 
   flush(): void {}

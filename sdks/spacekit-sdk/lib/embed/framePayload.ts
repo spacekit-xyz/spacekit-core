@@ -72,7 +72,9 @@ export function buildFramePayload(
   let kyberWasmBase64: string | undefined;
   let i = 0;
   for (const [path, file] of verified.files) {
-    const ph = `sk-asset-${nonce}-${i++}`;
+    // Closed with a suffix so no placeholder is a prefix of another: the frame
+    // replaces them one by one, and "…-1" would otherwise match inside "…-10".
+    const ph = `sk-asset-${nonce}-${i++}-end`;
     assetUrls.set(path, ph);
     files.push({ ph, mime: file.mime, bytes: copyToArrayBuffer(file.bytes) });
     if (!kyberWasmBase64 && path.endsWith(".wasm")) kyberWasmBase64 = uint8ToBase64(file.bytes);

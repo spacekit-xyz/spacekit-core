@@ -12,10 +12,10 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const { renderFrameHostHtml } = await import(resolve(here, "../dist/embed/frameBootstrap.js"));
+const { renderFrameHostHtml } = await import(pathToFileURL(resolve(here, "../dist/embed/frameBootstrap.js")).href);
 
 const args = process.argv.slice(2);
 const allowed = [];

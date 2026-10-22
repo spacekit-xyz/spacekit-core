@@ -96,7 +96,8 @@ const DEFAULT_BALANCES: Record<string, bigint> = {
   treasury: 10_000_000n,
 };
 
-const DEFAULT_NEW_USER_BALANCE = 1_000_000n;
+/** New identities hold nothing until the chain says otherwise (a faucet claim or transfer). */
+const DEFAULT_NEW_USER_BALANCE = 0n;
 
 /* ───────────────────────── Client Class ───────────────────────── */
 
