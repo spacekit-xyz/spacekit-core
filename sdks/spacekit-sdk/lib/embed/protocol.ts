@@ -31,6 +31,12 @@ export interface FrameLoadFile {
   ph: string;
   mime: string;
   bytes: ArrayBuffer;
+  /**
+   * Text (CSS) that itself contains other files' placeholders, e.g. fonts in
+   * `url(...)`. The frame mints URLs for the other files first, then fills
+   * these in before minting this file's URL.
+   */
+  rewrite?: boolean;
 }
 
 export interface FrameReadyMessage {

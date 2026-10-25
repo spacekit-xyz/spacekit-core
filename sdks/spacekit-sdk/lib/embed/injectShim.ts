@@ -66,6 +66,82 @@ function rewriteAssetRefs(html: string, assetUrls: Map<string, string>): string 
   );
 }
 
+/**
+ * Runtime resolver for package paths. Bundlers load chunks, fonts and data at
+ * run time by absolute path (Next.js: \`/_next/static/...\`, RSC \`index.txt\`),
+ * which inside the frame would resolve against the frame host, not the
+ * package. Script/link/img/media URLs, setAttribute, fetch and XHR are mapped
+ * to the frame's copies of packaged files; anything else is left alone.
+ */
+function buildPathResolverScript(assetUrls: Map<string, string>): string {
+  if (assetUrls.size === 0) return "";
+  const map = JSON.stringify(Object.fromEntries(assetUrls)).replace(/</g, "\\u003c");
+  return `<script>(function(){
+  if(window.__skPathResolver)return;
+  var M=${map};
+  var keys=Object.keys(M);
+  function lookup(u){
+    if(u==null)return null;
+    if(typeof u!=="string"){if(u&&typeof u.url==="string")u=u.url;else if(u&&typeof u.href==="string")u=u.href;else u=String(u);}
+    if(/^(blob:|data:|about:|javascript:|mailto:)/i.test(u))return null;
+    var o=location.origin;
+    if(/^[a-z][a-z0-9+.-]*:/i.test(u)){if(o&&o!=="null"&&u.indexOf(o+"/")===0)u=u.slice(o.length);else return null;}
+    var p=u.split("#")[0].split("?")[0];
+    try{p=decodeURIComponent(p);}catch(_e){}
+    while(p.indexOf("./")===0)p=p.slice(2);
+    while(p.charAt(0)==="/")p=p.slice(1);
+    if(!p)return null;
+    if(Object.prototype.hasOwnProperty.call(M,p))return M[p];
+    for(var i=0;i<keys.length;i++){var k=keys[i];if(k.length>p.length&&k.slice(-p.length-1)==="/"+p)return M[k];}
+    return null;
+  }
+  window.__skPathResolver=lookup;
+  function patchProp(proto,prop){
+    if(!proto)return;
+    var d=Object.getOwnPropertyDescriptor(proto,prop);
+    if(!d||!d.set||!d.configurable)return;
+    Object.defineProperty(proto,prop,{configurable:true,enumerable:d.enumerable,get:d.get,set:function(v){var m=lookup(v);d.set.call(this,m||v);}});
+  }
+  patchProp(window.HTMLScriptElement&&HTMLScriptElement.prototype,"src");
+  patchProp(window.HTMLLinkElement&&HTMLLinkElement.prototype,"href");
+  patchProp(window.HTMLImageElement&&HTMLImageElement.prototype,"src");
+  patchProp(window.HTMLSourceElement&&HTMLSourceElement.prototype,"src");
+  patchProp(window.HTMLMediaElement&&HTMLMediaElement.prototype,"src");
+  var setAttr=Element.prototype.setAttribute;
+  Element.prototype.setAttribute=function(n,v){
+    var a=String(n).toLowerCase();
+    if((a==="src"||a==="href")&&typeof v==="string"){var m=lookup(v);if(m)v=m;}
+    return setAttr.call(this,n,v);
+  };
+  if(window.fetch){
+    var f0=window.fetch;
+    window.fetch=function(input,init){
+      var m=lookup(typeof input==="string"?input:(input&&input.url));
+      return m?f0.call(this,m,init):f0.apply(this,arguments);
+    };
+  }
+  // A blob:/srcdoc document can't move its URL: routers (Next.js, React
+  // Router with BrowserRouter) that push "/path" would throw. Keep their state
+  // and let the URL stay put instead.
+  ["pushState","replaceState"].forEach(function(name){
+    var h=window.history&&window.history[name];
+    if(!h)return;
+    window.history[name]=function(state,title,url){
+      try{return h.call(window.history,state,title,url);}
+      catch(e){if(e&&e.name==="SecurityError")return h.call(window.history,state,title);throw e;}
+    };
+  });
+  if(window.XMLHttpRequest){
+    var open0=XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open=function(method,url){
+      var m=lookup(url);
+      if(m){var args=Array.prototype.slice.call(arguments);args[1]=m;return open0.apply(this,args);}
+      return open0.apply(this,arguments);
+    };
+  }
+})();</script>`;
+}
+
 /** Import map so blob:-origin module scripts can resolve sibling chunks (e.g. kyber_wasm-*.js). */
 function buildImportMapScript(assetUrls: Map<string, string>): string {
   const imports: Record<string, string> = {};
@@ -443,7 +519,8 @@ export function injectSdkBridgeIntoHtml(
     ? ""
     : '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">';
   const i = html.indexOf("</head>");
-  const headInjection = viewportMeta + buildImportMapScript(assetUrls) + heightFix + containFix + audioUnlock + script;
+  const headInjection =
+    viewportMeta + buildPathResolverScript(assetUrls) + buildImportMapScript(assetUrls) + heightFix + containFix + audioUnlock + script;
   if (i !== -1) {
     return injectBeforeModuleScripts(html, headInjection);
   }

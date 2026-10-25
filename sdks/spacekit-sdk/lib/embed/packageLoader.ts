@@ -1,4 +1,5 @@
 import { decodeContentRef } from "./decompress.js";
+import { rewriteCssUrls } from "./framePayload.js";
 import { injectSdkBridgeIntoHtml } from "./injectShim.js";
 import type { PackageSignature } from "./spkgSignature.js";
 import type { AppPackageJSON, ContentRef, EmbedEndpoints, LoadedWebPackage } from "./types.js";
@@ -12,10 +13,34 @@ function parseCreatorDid(value: unknown): string {
   return "";
 }
 
+const MIME_BY_EXT: Record<string, string> = {
+  svg: "image/svg+xml",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  ico: "image/x-icon",
+  woff: "font/woff",
+  woff2: "font/woff2",
+  ttf: "font/ttf",
+  otf: "font/otf",
+  json: "application/json",
+  txt: "text/plain",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  mp4: "video/mp4",
+  webm: "video/webm",
+  wasm: "application/wasm",
+};
+
 function mimeFromPath(path: string): string {
   if (/\.m?[jt]sx?$/i.test(path)) return "application/javascript";
   if (path.endsWith(".css")) return "text/css";
-  return "application/octet-stream";
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 
 function mimeFor(ct: string | Record<string, unknown>): string {
@@ -31,7 +56,11 @@ function mimeFor(ct: string | Record<string, unknown>): string {
     };
     return m[ct] || "application/octet-stream";
   }
-  if ("Image" in ct) return `image/${(ct.Image as { format: string }).format}`;
+  if ("Image" in ct) {
+    const format = String((ct.Image as { format: string }).format || "").toLowerCase();
+    // An SVG served as "image/svg" (not svg+xml) doesn't render in <img>.
+    return format === "svg" ? "image/svg+xml" : `image/${format}`;
+  }
   return "application/octet-stream";
 }
 
@@ -235,6 +264,7 @@ async function assembleWebPackage(
   const blobAssetUrls: string[] = [];
   const wasmBytes = new Map<string, Uint8Array>();
   const integrityErrors: string[] = [];
+  const cssText = new Map<string, Uint8Array>();
 
   await Promise.all(
     pkg.content_refs.map(async (ref) => {
@@ -266,6 +296,7 @@ async function assembleWebPackage(
       if (ref.path.endsWith(".wasm")) {
         wasmBytes.set(ref.path, bytes);
       }
+      if (/\.css$/i.test(ref.path)) cssText.set(ref.path, bytes);
 
       let mime = mimeFor(ref.content_type);
       if (mime === "application/octet-stream") mime = mimeFromPath(ref.path);
@@ -275,6 +306,17 @@ async function assembleWebPackage(
       assetUrls.set(ref.path, blobUrl);
     }),
   );
+
+  // Stylesheets reach packaged fonts and images through url(); point those at
+  // the blob copies (a blob: stylesheet can't resolve package paths itself).
+  for (const [path, bytes] of cssText) {
+    const css = new TextDecoder().decode(bytes);
+    const rewritten = rewriteCssUrls(css, path, assetUrls);
+    if (rewritten === css) continue;
+    const url = URL.createObjectURL(new Blob([rewritten], { type: "text/css" }));
+    blobAssetUrls.push(url);
+    assetUrls.set(path, url);
+  }
 
   const htmlEntry =
     pkg.manifest.entry_points.find(

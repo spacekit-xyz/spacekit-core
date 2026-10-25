@@ -57,6 +57,38 @@ function copyToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return out;
 }
 
+function isCss(path: string, mime: string): boolean {
+  return /\.css$/i.test(path) || /^text\/css/i.test(mime);
+}
+
+/** `a/b/../c.png` → `a/c.png`. */
+function joinPath(dir: string, ref: string): string {
+  const out: string[] = [];
+  for (const seg of `${dir}/${ref}`.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  return out.join("/");
+}
+
+/**
+ * Points `url(...)` in a stylesheet at the frame's copies of packaged files
+ * (fonts, images). Without this a blob:-loaded stylesheet can't reach them:
+ * `/_next/static/media/x.woff2` or `../fonts/x.woff2` resolve against nothing.
+ */
+export function rewriteCssUrls(css: string, cssPath: string, assetUrls: Map<string, string>): string {
+  const dir = cssPath.includes("/") ? cssPath.slice(0, cssPath.lastIndexOf("/")) : "";
+  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, q: string, raw: string) => {
+    const ref = raw.trim();
+    if (/^(data:|blob:|https?:|#|sk-asset-)/i.test(ref)) return match;
+    const clean = ref.split(/[?#]/)[0];
+    const path = clean.startsWith("/") ? joinPath("", clean) : joinPath(dir, clean);
+    const ph = assetUrls.get(path);
+    return ph ? `url(${q}${ph}${q})` : match;
+  });
+}
+
 export function buildFramePayload(
   verified: VerifiedWebPackageFiles,
   options: FramePayloadOptions,
@@ -71,11 +103,21 @@ export function buildFramePayload(
   const files: FrameLoadFile[] = [];
   let kyberWasmBase64: string | undefined;
   let i = 0;
-  for (const [path, file] of verified.files) {
+  for (const [path] of verified.files) {
     // Closed with a suffix so no placeholder is a prefix of another: the frame
     // replaces them one by one, and "…-1" would otherwise match inside "…-10".
-    const ph = `sk-asset-${nonce}-${i++}-end`;
-    assetUrls.set(path, ph);
+    assetUrls.set(path, `sk-asset-${nonce}-${i++}-end`);
+  }
+  for (const [path, file] of verified.files) {
+    const ph = assetUrls.get(path)!;
+    if (isCss(path, file.mime)) {
+      const css = new TextDecoder().decode(file.bytes);
+      const rewritten = rewriteCssUrls(css, path, assetUrls);
+      if (rewritten !== css) {
+        files.push({ ph, mime: file.mime, bytes: copyToArrayBuffer(new TextEncoder().encode(rewritten)), rewrite: true });
+        continue;
+      }
+    }
     files.push({ ph, mime: file.mime, bytes: copyToArrayBuffer(file.bytes) });
     if (!kyberWasmBase64 && path.endsWith(".wasm")) kyberWasmBase64 = uint8ToBase64(file.bytes);
   }

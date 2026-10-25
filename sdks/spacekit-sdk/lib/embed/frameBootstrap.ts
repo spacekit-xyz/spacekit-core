@@ -71,12 +71,25 @@ function bootstrapScript(cfgExpr: string): string {
     loaded=true;
     var html=String(d.html||"");
     var files=Array.isArray(d.files)?d.files:[];
+    var urls={};
+    function mint(f,bytes){
+      var url=URL.createObjectURL(new Blob([bytes],{type:String(f.mime||"application/octet-stream")}));
+      urls[f.ph]=url;
+    }
+    // Plain files first; then stylesheets that point at them (fonts, images).
     for(var i=0;i<files.length;i++){
       var f=files[i];
-      if(!f||typeof f.ph!=="string"||!f.ph)continue;
-      var url=URL.createObjectURL(new Blob([f.bytes],{type:String(f.mime||"application/octet-stream")}));
-      html=html.split(f.ph).join(url);
+      if(!f||typeof f.ph!=="string"||!f.ph||f.rewrite)continue;
+      mint(f,f.bytes);
     }
+    for(var j=0;j<files.length;j++){
+      var g=files[j];
+      if(!g||typeof g.ph!=="string"||!g.ph||!g.rewrite)continue;
+      var text=new TextDecoder().decode(g.bytes);
+      for(var ph in urls){if(text.indexOf(ph)!==-1)text=text.split(ph).join(urls[ph]);}
+      mint(g,new TextEncoder().encode(text));
+    }
+    for(var k in urls){html=html.split(k).join(urls[k]);}
     port.postMessage({t:"loaded"});
     window.__skPort=port;
     window.__skLocalSeed=d.localSeed||null;
