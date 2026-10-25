@@ -3323,6 +3323,11 @@ enum AppCommands {
         /// Token symbol for pricing (e.g., ASTRA)
         #[arg(long, default_value = "ASTRA")]
         token: String,
+
+        /// Short link to claim, kit.space/app/<NAME> (default with --publish: the
+        /// app name as lowercase-with-dashes). Needs `spacekit login`.
+        #[arg(long, value_name = "NAME")]
+        short_name: Option<String>,
     },
 
     /// Remove a deployed app (manifest, bundles, marketplace listing, index entry)
@@ -14807,6 +14812,7 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
             publish,
             pricing,
             token,
+            short_name,
         } => {
             println!("🚀 Deploying app...");
             println!("   Package: {}", package.green());
@@ -15054,6 +15060,14 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
             println!("\n✅ App deployed successfully!");
             println!("   App ID: {}", hex::encode(app_package.app_id).green());
             println!("   Files uploaded: {}", uploaded_fact_ids.len());
+
+            let wanted_name = short_name
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| publish.then(|| slugify_app_name(&app_package.manifest.name)));
+            if let Some(name) = wanted_name.filter(|n| !n.is_empty()) {
+                claim_app_short_name(&config, &name, &hex::encode(app_package.app_id)).await;
+            }
 
             if *publish {
                 println!("\n📱 Publishing to marketplace...");
@@ -15832,6 +15846,54 @@ fn inject_app_run_shim(html: &[u8]) -> Vec<u8> {
     out.push_str(APP_RUN_DEV_SHIM);
     out.push_str(&text[at..]);
     out.into_bytes()
+}
+
+/// "My Cool App!" → "my-cool-app" (the API's rule for short app names).
+fn slugify_app_name(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_end_matches('-').chars().take(32).collect();
+    out.trim_end_matches('-').to_string()
+}
+
+/// Claims kit.space/app/<name> for a deployed app. Never fails the deploy:
+/// problems are printed with what to do next.
+async fn claim_app_short_name(config: &CLIConfig, name: &str, app_id: &str) {
+    let Some(auth) = config.identity.website_auth.as_ref() else {
+        println!(
+            "   {} sign in with `spacekit login` and deploy again to claim kit.space/app/{name}",
+            "Short link:".yellow()
+        );
+        return;
+    };
+    let url = format!("{}/api/apps/names", auth.api_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&auth.session_token)
+        .json(&serde_json::json!({ "name": name, "app_id": app_id }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            println!("   Short link: {}", format!("https://kit.space/app/{name}").green());
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            println!(
+                "   {} kit.space/app/{name} not claimed ({status}: {why}). Pick another with --short-name.",
+                "Short link:".yellow()
+            );
+        }
+        Err(e) => println!("   {} couldn't reach {url}: {e}", "Short link:".yellow()),
+    }
 }
 
 async fn handle_app_http(
