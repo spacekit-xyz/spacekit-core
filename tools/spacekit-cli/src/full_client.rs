@@ -15763,6 +15763,77 @@ async fn handle_app_command(app_command: &AppCommands) -> Result<(), Box<dyn std
 
 use spacekit_primitives::v1::fact::FactContent;
 
+/// `window.spacekit` for `spacekit app run`: a local stand-in for the host
+/// frame so apps work outside kit.space/SpaceKit Desktop. Storage and
+/// documents live in this browser's localStorage; payments always succeed;
+/// the viewer is a fixed local DID. Apps that already ship their own shim
+/// keep theirs (it is only installed when `window.spacekit` is missing).
+const APP_RUN_DEV_SHIM: &str = r#"<script>
+(function () {
+  if (window.spacekit) return;
+  var did = "did:key:local-dev";
+  var ns = "spacekit-dev:" + location.port + ":";
+  function read(k) { try { var v = localStorage.getItem(ns + k); return v === null ? null : JSON.parse(v); } catch (e) { return null; } }
+  function write(k, v) { try { localStorage.setItem(ns + k, JSON.stringify(v)); } catch (e) {} return true; }
+  function keys(prefix) { var out = []; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(ns + prefix) === 0) out.push(k.slice(ns.length)); } return out; }
+  var subs = {};
+  var ok = function (v) { return Promise.resolve(v); };
+  window.spacekit = {
+    appId: "local-dev",
+    __dev: true,
+    call: function (m, f) { return Promise.reject(new Error("spacekit app run: " + m + "." + f + " is not available locally")); },
+    app: { ready: function () { return ok({ ready: true, appId: "local-dev" }); }, isOwner: function () { return ok(true); }, ownerDid: function () { return ok(did); } },
+    identity: {
+      did: function () { return ok(did); },
+      getState: function () { return ok({ myDid: did, displayName: "local dev", publicOptIn: false, didRegistered: false }); },
+      setState: function (s) { return ok(Object.assign({ myDid: did, displayName: "local dev", publicOptIn: false, didRegistered: false }, s)); }
+    },
+    storage: {
+      get: function (k) { return ok(read("s:" + k)); },
+      set: function (k, v) { return ok(write("s:" + k, v)); },
+      list: function (p) { return ok(keys("s:" + (p || "")).map(function (k) { return k.slice(2); })); },
+      delete: function (k) { localStorage.removeItem(ns + "s:" + k); return ok(true); },
+      ready: function () { return ok({ ready: true, appId: "local-dev" }); }
+    },
+    documents: {
+      get: function (c, id) { return ok(read("d:" + c + "/" + id)); },
+      put: function (c, id, d) { write("d:" + c + "/" + id, d); return ok({ id: id }); },
+      list: function (c) { return ok(keys("d:" + c + "/").map(function (k) { return { id: k.slice(("d:" + c + "/").length), data: read(k) }; })); },
+      delete: function (c, id) { localStorage.removeItem(ns + "d:" + c + "/" + id); return ok(true); }
+    },
+    payments: {
+      config: function () { return ok({ publisherDid: did, currency: "ASTRA", decimals: 18, model: "local-dev" }); },
+      status: function () { return ok({ active: true, expiresAt: null, viewerDid: did }); },
+      subscribe: function () { return ok({ active: true, expiresAt: null, viewerDid: did }); }
+    },
+    messaging: {
+      publish: function (t, m) { (subs[t] || []).forEach(function (cb) { cb(m); }); return ok(true); },
+      subscribe: function (t, cb) { (subs[t] = subs[t] || []).push(cb); return function () { subs[t] = (subs[t] || []).filter(function (x) { return x !== cb; }); }; },
+      send: function () { return ok(null); },
+      list: function () { return ok([]); }
+    },
+    http: { fetch: function (u, i) { return fetch(u, i); }, sseSubscribe: function () { return ok(""); }, sseClose: function () { return ok(true); } },
+    plugins: { call: function () { return Promise.reject(new Error("no plugins locally")); }, list: function () { return ok([]); }, config: function () { return ok({}); }, serve: function () { return function () {}; } }
+  };
+  console.info("[spacekit app run] window.spacekit is a local stand-in: data stays in this browser. Use SpaceKit Desktop's Preview for the real frame.");
+})();
+</script>"#;
+
+/// Puts the dev shim first in `<head>` (or at the top) of an HTML page.
+fn inject_app_run_shim(html: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(html);
+    let lower = text.to_ascii_lowercase();
+    let at = lower
+        .find("<head")
+        .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(text.len() + APP_RUN_DEV_SHIM.len());
+    out.push_str(&text[..at]);
+    out.push_str(APP_RUN_DEV_SHIM);
+    out.push_str(&text[at..]);
+    out.into_bytes()
+}
+
 async fn handle_app_http(
     stream: tokio::net::TcpStream,
     dir: &std::path::Path,
@@ -15779,6 +15850,9 @@ async fn handle_app_http(
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
+    // Drop ?query/#hash, and never serve outside the app folder.
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let path = if path.split('/').any(|seg| seg == "..") { "/" } else { path };
 
     let file_path = if path == "/" || path.is_empty() {
         dir.join("index.html")
@@ -15801,6 +15875,7 @@ async fn handle_app_http(
                 Some("md") => "text/markdown; charset=utf-8",
                 _ => "application/octet-stream",
             };
+            let data = if ct.starts_with("text/html") { inject_app_run_shim(&data) } else { data };
             ("200 OK", ct, data)
         }
         Err(_) => ("404 Not Found", "text/plain", b"Not found".to_vec()),
