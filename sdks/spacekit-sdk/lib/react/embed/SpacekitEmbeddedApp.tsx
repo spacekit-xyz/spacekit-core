@@ -71,6 +71,8 @@ export interface SpacekitEmbeddedAppProps {
   embedded?: boolean;
   active?: boolean;
   contentFit?: "fill" | "contain";
+  /** The host's light/dark theme, passed to the app live. */
+  colorScheme?: "light" | "dark";
   loadingLabel?: string;
 }
 
@@ -114,6 +116,7 @@ export const SpacekitEmbeddedApp: FC<SpacekitEmbeddedAppProps> = ({
   embedded,
   active = true,
   contentFit = "fill",
+  colorScheme,
   loadingLabel,
 }) => {
   const [storageOrigin, setStorageOrigin] = useState<string | null>(null);
@@ -212,6 +215,7 @@ export const SpacekitEmbeddedApp: FC<SpacekitEmbeddedAppProps> = ({
       embedded={embedded}
       active={active}
       contentFit={contentFit}
+      colorScheme={colorScheme}
       acquireBridge={bridgeFactory}
       loadPackage={loadPackage}
       loadFiles={loadFiles}

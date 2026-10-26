@@ -90,6 +90,12 @@ export interface SpacekitGuestApi {
     /** Inside a service plugin: answer calls to `method`. Returns an unregister function. */
     serve(method: string, handler: (params: Record<string, unknown>) => unknown | Promise<unknown>): () => void;
   };
+  /** The host page's look. Also on `<html data-spacekit-theme="light|dark">`. */
+  ui: {
+    theme(): Promise<"light" | "dark">;
+    /** Called with the new theme when the host switches. Returns an unsubscribe function. */
+    onTheme(cb: (theme: "light" | "dark") => void): () => void;
+  };
   app: {
     ready(): Promise<{ ready: boolean; appId: string }>;
     isOwner(): Promise<boolean>;

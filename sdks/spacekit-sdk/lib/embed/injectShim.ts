@@ -138,6 +138,7 @@ export function injectSdkBridgeIntoHtml(
 ): string {
   html = rewriteAssetRefs(html, assetUrls);
   const { appId, parentOrigin, endpoints, identityDid, kyberWasmBase64, contentFit, sameOriginPassthrough } = config;
+  const theme = config.theme === "light" ? "light" : "dark";
   const packagedWasm = packagedWasmBlobUrl(assetUrls);
   const embedConfig = {
     parentOrigin,
@@ -151,7 +152,14 @@ export function injectSdkBridgeIntoHtml(
     assetUrls: Object.fromEntries(assetUrls),
   };
   const embedApiBaseJson = JSON.stringify((endpoints.apiBase ?? "").trim().replace(/\/$/, ""));
-  const heightFix = `<style>html,body,#root{height:100%;margin:0;overflow:hidden;background:#0c1020;color:#eef0f7;touch-action:manipulation;-webkit-text-size-adjust:100%}</style>`;
+  // The host's theme is on <html data-spacekit-theme> and in color-scheme, so
+  // apps can style with [data-spacekit-theme="light"] or prefers-color-scheme-like
+  // CSS; the default page colors follow it too.
+  const heightFix =
+    `<style>html,body,#root{height:100%;margin:0;overflow:hidden;touch-action:manipulation;-webkit-text-size-adjust:100%}` +
+    `html[data-spacekit-theme="dark"],html[data-spacekit-theme="dark"] body{background:#0c1020;color:#eef0f7;color-scheme:dark}` +
+    `html[data-spacekit-theme="light"],html[data-spacekit-theme="light"] body{background:#f6f8fb;color:#0d1b2a;color-scheme:light}</style>` +
+    `<script>document.documentElement.setAttribute("data-spacekit-theme",${JSON.stringify(theme)});</script>`;
   const containFix = contentFit === "contain" ? buildEmbedContainStyle() : "";
   const audioUnlock = buildMobileAudioUnlockPatch();
   const script = `<script>
@@ -333,6 +341,16 @@ export function injectSdkBridgeIntoHtml(
         return function(){if(window.__skPluginHandlers[method]===handler)delete window.__skPluginHandlers[method]};
       },
     },
+    ui:{
+      /** "light" or "dark": the host page's theme. */
+      theme:function(){return Promise.resolve(document.documentElement.getAttribute("data-spacekit-theme")||"dark")},
+      /** Calls cb with the new theme whenever the host switches; returns an unsubscribe function. */
+      onTheme:function(cb){
+        if(!window.__skThemeSubs)window.__skThemeSubs=[];
+        window.__skThemeSubs.push(cb);
+        return function(){window.__skThemeSubs=(window.__skThemeSubs||[]).filter(function(x){return x!==cb})};
+      },
+    },
     app:{
       ready:function(){return window.spacekit.call("app","ready",{})},
       isOwner:function(){return window.spacekit.call("app","isOwner",{})},
@@ -347,6 +365,12 @@ export function injectSdkBridgeIntoHtml(
   };
   function skOnHostMessage(d){
     if(!d)return;
+    if(d.t==="theme"&&(d.theme==="light"||d.theme==="dark")){
+      document.documentElement.setAttribute("data-spacekit-theme",d.theme);
+      (window.__skThemeSubs||[]).forEach(function(cb){try{cb(d.theme)}catch(_e){}});
+      try{window.dispatchEvent(new CustomEvent("spacekit:theme",{detail:d.theme}))}catch(_e){}
+      return;
+    }
     if(d.t==="res"&&pending[d.id]){
       var p=pending[d.id];delete pending[d.id];
       if(d.error)p.reject(new Error(d.error));else p.resolve(d.result);

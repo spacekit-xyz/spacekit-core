@@ -226,6 +226,8 @@ export interface EmbedShimConfig {
   identityDid: string | null;
   kyberWasmBase64?: string;
   contentFit?: "fill" | "contain";
+  /** Starting theme for the app; the host updates it live over the bridge. */
+  theme?: "light" | "dark";
   /**
    * When true, the app's own same-origin `fetch()` calls pass straight through
    * instead of being proxied to the host API. Set by the service-worker runtime,

@@ -17,6 +17,7 @@ export interface FramePayloadOptions {
   endpoints: EmbedEndpoints;
   identityDid: string | null;
   contentFit?: "fill" | "contain";
+  theme?: "light" | "dark";
 }
 
 export interface FramePayload {
@@ -87,6 +88,7 @@ export function buildFramePayload(
     identityDid: options.identityDid,
     kyberWasmBase64,
     contentFit: options.contentFit,
+    theme: options.theme,
   });
 
   return { html, files, entryPath };

@@ -67,7 +67,12 @@ export interface PortCallMessage {
 
 export type PortHostMessage =
   | { t: "res"; id: number; result?: unknown; error?: string }
-  | { t: "event"; topic: string; msg: unknown };
+  | { t: "event"; topic: string; msg: unknown }
+  /** The host's light/dark theme changed. */
+  | { t: "theme"; theme: SpacekitTheme };
+
+/** The host page's color theme, passed to apps (`window.spacekit.ui.theme()`). */
+export type SpacekitTheme = "light" | "dark";
 
 /** Storage-module key prefix used by the guest `localStorage` shim. */
 export const LOCAL_STORAGE_SHIM_PREFIX = "__ls:";

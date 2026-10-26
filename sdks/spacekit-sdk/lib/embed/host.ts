@@ -130,6 +130,8 @@ export interface MountSpacekitAppOptions {
   /** Origin reported to the app in its embed config. Defaults to the host page origin. */
   parentOrigin?: string;
   contentFit?: "fill" | "contain";
+  /** The host's light/dark theme; change it later with `handle.setTheme()`. */
+  theme?: "light" | "dark";
   /** Defaults to `"origin"` when `appOrigin` is set, otherwise `"opaque"`. */
   isolation?: IsolationMode;
   /**
@@ -172,6 +174,8 @@ export interface SpacekitAppHandle {
   readonly iframe: HTMLIFrameElement | null;
   /** Resolves once the app is running, rejects if it fails to start. */
   readonly ready: Promise<void>;
+  /** Tells the running app the host's theme changed. */
+  setTheme(theme: "light" | "dark"): void;
   unmount(): void;
 }
 
@@ -226,6 +230,7 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
   let state: AppMountState = { status: "loading" };
   let iframe: HTMLIFrameElement | null = null;
   let port: MessagePort | null = null;
+  let currentTheme: "light" | "dark" | undefined = options.theme;
   let bridge: EmbeddedSdkBridge | null = null;
   let bootstrapUrl: string | null = null;
   let onWindowMessage: ((e: MessageEvent) => void) | null = null;
@@ -348,6 +353,7 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
       endpoints,
       identityDid: options.services.getIdentityDid(),
       contentFit: options.contentFit,
+      theme: currentTheme,
     });
     const localSeed = isolation === "origin" ? null : await collectLocalSeed(bridge);
     if (disposed) return;
@@ -498,6 +504,14 @@ export function mountSpacekitApp(container: HTMLElement, options: MountSpacekitA
       return iframe;
     },
     ready,
+    setTheme(theme: "light" | "dark") {
+      currentTheme = theme;
+      try {
+        port?.postMessage({ t: "theme", theme } satisfies PortHostMessage);
+      } catch {
+        /* frame gone */
+      }
+    },
     unmount() {
       if (disposed) return;
       teardownFrame();

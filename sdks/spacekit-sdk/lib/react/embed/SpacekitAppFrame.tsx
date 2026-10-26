@@ -73,6 +73,8 @@ export interface SpacekitAppFrameProps {
   embedded?: boolean;
   active?: boolean;
   contentFit?: "fill" | "contain";
+  /** The host's light/dark theme, passed to the app live (`window.spacekit.ui`). */
+  colorScheme?: "light" | "dark";
   acquireBridge: (appId: string, storageOrigin: string, manifestName: string) => EmbeddedSdkBridge;
   /**
    * How the app is isolated from this page. Defaults to `"origin"` when
@@ -111,6 +113,7 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
   embedded,
   active = true,
   contentFit = "fill",
+  colorScheme,
   acquireBridge,
   isolation,
   appOrigin,
@@ -147,6 +150,13 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
   const stableEndpoints = useMemo(() => endpoints, [endpointsKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const stableCapabilities = useMemo(() => capabilities, [capabilitiesKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const colorSchemeRef = useRef(colorScheme);
+  colorSchemeRef.current = colorScheme;
+  const handleRef = useRef<ReturnType<typeof mountSpacekitApp> | null>(null);
+  useEffect(() => {
+    if (colorScheme) handleRef.current?.setTheme(colorScheme);
+  }, [colorScheme]);
+
   useEffect(() => {
     if (embedded && !active) return;
     const el = containerRef.current;
@@ -161,6 +171,7 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
       endpoints: stableEndpoints,
       parentOrigin,
       contentFit,
+      theme: colorSchemeRef.current,
       isolation,
       appOrigin,
       frameHostPath,
@@ -185,7 +196,9 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
         },
       },
     });
+    handleRef.current = handle;
     return () => {
+      handleRef.current = null;
       handle.unmount();
       setConsent((prev) => {
         prev?.resolve(false);
