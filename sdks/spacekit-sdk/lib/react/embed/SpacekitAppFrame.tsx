@@ -34,7 +34,20 @@ export interface SpacekitFrameTheme {
   fontFamily: string;
 }
 
-function defaultTheme(embedded: boolean | undefined): SpacekitFrameTheme {
+const LIGHT_THEME: SpacekitFrameTheme = {
+  background: "#f6f8fb",
+  text: "#0d1b2a",
+  muted: "#5b6478",
+  accent: "linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)",
+  accentText: "#ffffff",
+  panelBackground: "#ffffff",
+  panelBorder: "rgba(15,23,42,0.12)",
+  error: "#dc2626",
+  fontFamily: "'DM Sans', sans-serif",
+};
+
+function defaultTheme(embedded: boolean | undefined, colorScheme?: "light" | "dark"): SpacekitFrameTheme {
+  if (colorScheme === "light") return LIGHT_THEME;
   return embedded
     ? {
         background: "#0c1020",
@@ -133,7 +146,7 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
   const [consent, setConsent] = useState<{ request: PermissionRequest; resolve: (allow: boolean) => void } | null>(
     null,
   );
-  const theme = { ...defaultTheme(embedded), ...themeOverrides };
+  const theme = { ...defaultTheme(embedded, colorScheme), ...themeOverrides };
 
   if (loadPackage && !warnedLoadPackage) {
     warnedLoadPackage = true;
@@ -155,6 +168,10 @@ export const SpacekitAppFrame: FC<SpacekitAppFrameProps> = ({
   const handleRef = useRef<ReturnType<typeof mountSpacekitApp> | null>(null);
   useEffect(() => {
     if (colorScheme) handleRef.current?.setTheme(colorScheme);
+    // The frame's own background shows before the app paints; keep it matching.
+    const frameEl = containerRef.current?.querySelector("iframe");
+    if (frameEl) frameEl.style.background = theme.background;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [colorScheme]);
 
   useEffect(() => {
