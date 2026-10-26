@@ -32,6 +32,17 @@ pub enum IdentityCommands {
         #[arg(long)]
         api_url: Option<String>,
     },
+    /// Link this CLI identity to your kit.space account. Get the code on
+    /// kit.space → Settings → Linked identities, then run this while signed in
+    /// (`spacekit login`). Your posts and apps then show on one profile.
+    LinkAccount {
+        /// One-time code from kit.space, e.g. ABCD-2345
+        #[arg(value_name = "CODE")]
+        code: String,
+        /// Website API base URL
+        #[arg(long)]
+        api_url: Option<String>,
+    },
     /// Show linked website identity and session status
     Status,
     /// Sign out (clear saved website session)
@@ -51,9 +62,41 @@ pub async fn handle_identity_command(
         IdentityCommands::Link { username, api_url } => {
             handle_identity_link(username, api_url.as_deref()).await
         }
+        IdentityCommands::LinkAccount { code, api_url } => {
+            handle_identity_link_account(code, api_url.as_deref()).await
+        }
         IdentityCommands::Status => handle_identity_status(),
         IdentityCommands::Logout => handle_identity_logout().await,
     }
+}
+
+async fn handle_identity_link_account(
+    code: &str,
+    api_url: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_cli_config().await?;
+    let Some(auth) = config.identity.website_auth.as_ref() else {
+        return Err("Sign in first: spacekit login --username <name> --email <email>".into());
+    };
+    let api = api_url.map(|u| resolve_website_api_url(Some(u))).unwrap_or_else(|| auth.api_url.clone());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/identity/links", api.trim_end_matches('/')))
+        .bearer_auth(&auth.session_token)
+        .json(&serde_json::json!({ "code": code.trim() }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        return Err(format!("Link failed ({status}): {why}").into());
+    }
+    let primary = body.get("primary_did").and_then(|v| v.as_str()).unwrap_or("?");
+    println!("{}", "Linked.".green());
+    println!("  This identity: {}", config.identity.did.cyan());
+    println!("  Account:       {}", primary.cyan());
+    println!("Your posts and apps from both now show on one kit.space profile.");
+    Ok(())
 }
 
 pub fn resolve_website_api_url(explicit: Option<&str>) -> String {
