@@ -23,7 +23,8 @@ use super::{AppModel, Capability};
 
 /// The encoder bridge, embedded so installed binaries do not depend on a
 /// source checkout of growformer.
-const ENCODER_PY: &str = include_str!("../../scripts/mpnet_encode_stdin.py");
+/// TODO remove mpnet encode entirely
+/// const ENCODER_PY: &str = include_str!("../../scripts/mpnet_encode_stdin.py");
 
 pub(crate) struct CertifiedProject {
     pub name: String,
@@ -96,7 +97,7 @@ pub(crate) fn ensure_encoder() -> Result<(), String> {
         let dir = std::env::temp_dir().join("spacekit-growformer");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let script = dir.join("mpnet_encode_stdin.py");
-        std::fs::write(&script, ENCODER_PY).map_err(|e| e.to_string())?;
+        // std::fs::write(&script, ENCODER_PY).map_err(|e| e.to_string())?;
         std::env::set_var("GROWFORMER_MPNET_ENCODE_SCRIPT", &script);
     }
     Ok(())

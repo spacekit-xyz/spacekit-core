@@ -35,6 +35,7 @@ exclude = [
   # separate build graphs with their own lockfiles. Build with -p from inside.
   "identity/spacekit-did-onchain",
   "infra/spacekit-keymaster",
+  "infra/aws",
   "sdks/spacekit-contract-sdk",
   "sdks/spacekit-standard-library",
 
